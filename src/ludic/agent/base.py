@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from ludic.types import Message
+from ludic.types import Message, SamplingArgs
 from typing import Any, Optional, List
 
 class Agent(ABC):
@@ -16,8 +16,8 @@ class Agent(ABC):
     async def act(
         self,
         messages: List[Message],
+        sampling_args: SamplingArgs,
         *,
-        temperature: float = 0.0,
         max_tokens: int = 256,
         seed: Optional[int] = None,
         **kwargs: Any,
@@ -29,7 +29,7 @@ class Agent(ABC):
         self,
         messages: List[Message],
         *,
-        temperature: float = 0.0,
+        sampling_args:SamplingArgs,
         max_tokens: int = 256,
         seed: Optional[int] = None,
         timeout_s: Optional[float] = None,
@@ -42,7 +42,7 @@ class Agent(ABC):
         if timeout_s is None:
             return await self.act(
                 messages,
-                temperature=temperature,
+                sampling_args=sampling_args,
                 max_tokens=max_tokens,
                 seed=seed,
                 **kwargs,
@@ -50,7 +50,7 @@ class Agent(ABC):
         return await asyncio.wait_for(
             self.act(
                 messages,
-                temperature=temperature,
+                sampling_args=sampling_args,
                 max_tokens=max_tokens,
                 seed=seed,
                 **kwargs,

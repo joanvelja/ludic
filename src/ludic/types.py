@@ -1,12 +1,21 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Union, Optional
+from typing import Any, Dict, List, Union, Optional, TypedDict
 import time, uuid, json
 
 JSON = Union[str, int, float, bool, None, Dict[str, Any], List[Any]]
 
 
 # ----- Agent level types -----
+
+class SamplingArgs(TypedDict, total=False):
+    temperature: float
+    top_p: float
+    max_tokens: int
+    frequency_penalty: float
+    presence_penalty: float
+    stop: Union[str, List[str]]
+    seed: int
 
 # Chat-style message schema
 Message = Dict[str, str]  # {"role": "system|user|assistant", "content": "..."}
