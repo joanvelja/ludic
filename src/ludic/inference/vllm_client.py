@@ -85,24 +85,53 @@ class VLLMChatClient(ChatClient):
     async def complete(
         self,
         interrupt_thinking: Optional[int] = None,
+        return_token_ids: bool = False,
         *,
         model: str,
         messages: List[Message],
         sampling: SamplingConfig,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         """
-        interrupt_thinking → extra_body["vllm_xargs"]["max_think"]
+        High-level LLM invocation with vLLM extensions.
 
-        This activates server-side GlobalThinkProcessor logic:
-          max_think = N means the model is forced to emit the token
-          sequence for </think> starting after N generated tokens.
+        Args:
+            interrupt_thinking:
+                If set to an integer N, injects:
+                    extra_body["vllm_xargs"]["max_think"] = N
+                This activates the custom GlobalThinkProcessor, forcing the
+                model to emit the '</think>' token sequence after N generated
+                tokens. Purely a vLLM-side feature.
 
-        Everything else in the sampling config is passed directly to
-        the OpenAI-compatible API without modification.
+            return_token_ids:
+                If True, injects:
+                    extra_body["return_token_ids"] = True
+                The vLLM OpenAI-compatible API (>= v0.10.2) will return:
+                    - resp.prompt_token_ids
+                    - resp.choices[*].token_ids
+                allowing drift-free RL training by exposing the *exact* tokens
+                the model consumed and produced.
+
+            model, messages, sampling:
+                Standard OpenAI-compatible chat completion fields. Sampling
+                options are created from SamplingConfig and passed through
+                untouched.
+
+        Returns:
+            (ChatResponse, info):
+                ChatResponse contains:
+                    .text
+                    .token_ids (may be None)
+                    .prompt_token_ids (may be None)
+                    .finish_reason
+                'info' contains raw transport details and args actually sent.
         """
 
-        # Convert SamplingConfig → OpenAI API keyword arguments
-        request_kwargs: Dict[str, Any] = dict(model=model, messages=messages)
+
+        # Sampling → OpenAI kwargs
+        request_kwargs: Dict[str, Any] = dict(
+            model=model,
+            messages=messages,
+        )
         request_kwargs.update(sampling.to_openai_kwargs())
 
         # ----------------------------------------------------------
@@ -112,44 +141,59 @@ class VLLMChatClient(ChatClient):
         # ----------------------------------------------------------
         extra_body: Dict[str, Any] = {}
 
-        # Merge any extra_body already provided by SamplingConfig
+        # Merge any existing extras (SamplingConfig.extras → extra_body)
         existing_extra_body = request_kwargs.pop("extra_body", None)
         if isinstance(existing_extra_body, dict):
             extra_body.update(existing_extra_body)
 
-        # Extract or create vllm_xargs section
-        # (this is how the server exposes non-standard features)
+        # Extract or create vllm_xargs
         vllm_xargs = extra_body.get("vllm_xargs", {})
 
-        # Thinking-limit support
+        # Think forcing
         if interrupt_thinking is not None:
             if not isinstance(interrupt_thinking, int) or interrupt_thinking <= 0:
                 raise ValueError("interrupt_thinking must be a positive integer")
             vllm_xargs["max_think"] = interrupt_thinking
 
-        # Persist vllm_xargs if present
         if vllm_xargs:
             extra_body["vllm_xargs"] = vllm_xargs
 
-        # Attach to request if non-empty
+        # ---- NEW: token IDs ----
+        if return_token_ids:
+            extra_body["return_token_ids"] = True
+
         if extra_body:
             request_kwargs["extra_body"] = extra_body
 
-        # Perform the inference request
+        # ----------------------------------------------------------
+        # Perform inference
+        # ----------------------------------------------------------
         resp = await self._async_client.chat.completions.create(**request_kwargs)
 
         choice = resp.choices[0]
         text = choice.message.content or ""
         finish_reason = choice.finish_reason
 
-        # vLLM may return additional metadata in extras;
-        # we keep the raw response for debugging/introspection.
-        chat_resp = ChatResponse(text=text, finish_reason=finish_reason)
+        # ---- Extract token IDs if present ----
+        prompt_token_ids = getattr(resp, "prompt_token_ids", None)
+        completion_token_ids = getattr(choice, "token_ids", None)
+
+        # Build ChatResponse with token data filled in
+        chat_resp = ChatResponse(
+            text=text,
+            finish_reason=finish_reason,
+            token_ids=completion_token_ids,
+            prompt_token_ids=prompt_token_ids,
+        )
+
+        # Record raw dump for debugging
         info: Dict[str, Any] = {
             "raw_response": resp.model_dump(exclude_none=True),
             "used_args": request_kwargs,
         }
+
         return chat_resp, info
+
 
     # ---- ChatClient.push_update_atomic --------------------------
 
