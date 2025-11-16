@@ -105,11 +105,17 @@ async def run_episode(
         # Total reward = env reward + parser reward
         total_reward = outcome.reward + parser_reward
 
+        # For logging: terminal/truncated steps have no next_obs
+        if outcome.terminated or outcome.truncated:
+            logged_next_obs = None
+        else:
+            logged_next_obs = outcome.obs
+
         rollout.steps.append(Step(
             index=t,
             prev_obs=obs,
             action=raw_action,
-            next_obs=outcome.obs,
+            next_obs=logged_next_obs,
             reward=total_reward,
             truncated=outcome.truncated,
             terminated=outcome.terminated,

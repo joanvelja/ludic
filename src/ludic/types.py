@@ -58,7 +58,7 @@ class Step:
     index: int
     prev_obs: Observation
     action: str
-    next_obs: Observation
+    next_obs: Optional[Observation]  # may be None on terminal steps
     reward: float
     truncated: bool
     terminated: bool
