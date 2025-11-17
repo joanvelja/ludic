@@ -15,7 +15,7 @@ from ludic.inference.sampling import (
     SamplingConfig,
 )
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
 # ---------------------------------------------------------------------------
 # Server fixture: launch ludic.inference.vllm_server end-to-end
