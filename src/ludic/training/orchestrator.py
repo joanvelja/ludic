@@ -3,13 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
-from typing import (
-    Callable,
-    List,
-    Optional,
-)
+from typing import Callable, List, Optional
 
 from ludic.agent import Agent
 from ludic.context.base import ContextStrategy
@@ -19,8 +14,6 @@ from ludic.interaction import run_episode
 from ludic.types import Rollout, SamplingArgs, Step
 
 from ludic.training.types import (
-    RolloutRequest,
-    RolloutPolicy,
     WeightingStrategy,
     SAWItem,
     SAWBatch,
@@ -29,49 +22,25 @@ from ludic.training.types import (
     StateFromStepFn,
 )
 
-
 # ---------------------------------------------------------------------------
 # Factory aliases
 # ---------------------------------------------------------------------------
 
-# Build a fresh Env each episode
-EnvFactory = Callable[..., Env]
+EnvFactory = Callable[..., Env]          # Build a fresh Env each episode
 CtxFactory = Callable[[], ContextStrategy]
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class OrchestratorConfig:
-    episodes: int
-    max_steps: int = 64
-    sampling_args: Optional[SamplingArgs] = None
-    concurrency: int = 8
-    timeout_s: Optional[float] = None
-    system_prompt: Optional[str] = None
-    jsonl_path: Optional[str] = None  # if set, append each rollout as JSONL
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
 
 
 class Orchestrator:
     """
-    Dumb, reliable orchestrator:
+    Dumb, stateless orchestrator:
 
-      - spawns N episodes
+      - spawns N envs
       - runs them with an asyncio.Semaphore
       - returns List[Rollout]
       - optionally writes each rollout to JSONL
 
     Extended variant:
 
-      - can use a RolloutPolicy to control per-episode env/ctx/sampling/meta
       - can build State–Action–Weight batches via `generate_batch`, using:
           * a WeightingStrategy for credit assignment
           * model token IDs from Step.info when available
@@ -83,69 +52,63 @@ class Orchestrator:
         env_factory: EnvFactory,
         agent: Agent,
         *,
-        cfg: OrchestratorConfig,
         ctx_factory: Optional[CtxFactory] = None,
-        rollout_policy: Optional[RolloutPolicy] = None,
+        jsonl_path: Optional[str] = None,
     ) -> None:
         self.env_factory = env_factory
         self.agent = agent
-        self.cfg = cfg
         self.ctx_factory = ctx_factory or (lambda: FullDialog())
-        self.rollout_policy = rollout_policy
+        self.jsonl_path = jsonl_path
 
-        if self.cfg.jsonl_path:
-            Path(os.path.dirname(self.cfg.jsonl_path) or ".").mkdir(
+        if self.jsonl_path:
+            Path(os.path.dirname(self.jsonl_path) or ".").mkdir(
                 parents=True, exist_ok=True
             )
 
     # ---- internal helpers ------------------------------------------------
 
-    def _default_request(self, idx: int) -> RolloutRequest:
-        """
-        Backwards-compatible per-episode config if no RolloutPolicy is provided.
-        """
-        env = self.env_factory()
-        ctx = self.ctx_factory()
-        sampling_args: SamplingArgs = self.cfg.sampling_args or {}
-        return RolloutRequest(
-            env=env,
-            ctx=ctx,
-            sampling_args=sampling_args,
-            system_prompt=self.cfg.system_prompt,
-            meta={"episode_idx": idx},
-        )
-
-    async def _run_one(self, idx: int, sem: asyncio.Semaphore) -> Rollout:
+    async def _run_one(
+        self,
+        idx: int,
+        sem: asyncio.Semaphore,
+        *,
+        max_steps: int,
+        sampling_args: Optional[SamplingArgs],
+        system_prompt: Optional[str],
+        timeout_s: Optional[float],
+    ) -> Rollout:
         async with sem:
-            if self.rollout_policy is not None:
-                req = self.rollout_policy.make_rollout(idx)
-            else:
-                req = self._default_request(idx)
+            env = self.env_factory()
+            ctx = self.ctx_factory()
+            sargs: SamplingArgs = sampling_args or {}
 
             rollout = await run_episode(
-                env=req.env,
+                env=env,
                 agent=self.agent,
-                max_steps=self.cfg.max_steps,
-                sampling_args=req.sampling_args,
-                ctx=req.ctx,
-                system_prompt=req.system_prompt,
-                timeout_s=self.cfg.timeout_s,
+                max_steps=max_steps,
+                sampling_args=sargs,
+                ctx=ctx,
+                system_prompt=system_prompt,
+                timeout_s=timeout_s,
             )
 
-            # Attach orchestrator + policy metadata
-            rollout.meta["orchestrator_cfg"] = {
-                "max_steps": self.cfg.max_steps,
-                "timeout_s": self.cfg.timeout_s,
-            }
-            rollout.meta.update(req.meta)
+            # basic metadata; purely for logging / debugging
+            rollout.meta.setdefault("episode_idx", idx)
+            rollout.meta.setdefault("orchestrator", {})
+            rollout.meta["orchestrator"].update(
+                {
+                    "max_steps": max_steps,
+                    "timeout_s": timeout_s,
+                }
+            )
 
-            if self.cfg.jsonl_path:
+            if self.jsonl_path:
                 self._append_jsonl(rollout)
 
             return rollout
 
     def _append_jsonl(self, rollout: Rollout) -> None:
-        assert self.cfg.jsonl_path is not None
+        assert self.jsonl_path is not None
         payload = {
             "id": rollout.id,
             "meta": rollout.meta,
@@ -167,35 +130,81 @@ class Orchestrator:
             "length": rollout.length,
             "duration_ns": rollout.duration_ns,
         }
-        with open(self.cfg.jsonl_path, "a", encoding="utf-8") as f:
+        with open(self.jsonl_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     # ---- rollout generation ----------------------------------------------
 
-    async def generate(self) -> List[Rollout]:
+    async def generate(
+        self,
+        *,
+        batch_size: int,
+        max_steps: int,
+        sampling_args: Optional[SamplingArgs] = None,
+        system_prompt: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        concurrency: int = 8,
+    ) -> List[Rollout]:
         """
-        Run `cfg.episodes` episodes and return the resulting rollouts.
+        Run `batch_size` independent rollouts and return them.
         """
-        sem = asyncio.Semaphore(max(1, self.cfg.concurrency))
-        tasks = [self._run_one(i, sem) for i in range(self.cfg.episodes)]
+        if batch_size <= 0:
+            return []
+
+        sem = asyncio.Semaphore(max(1, concurrency))
+        tasks = [
+            self._run_one(
+                i,
+                sem,
+                max_steps=max_steps,
+                sampling_args=sampling_args,
+                system_prompt=system_prompt,
+                timeout_s=timeout_s,
+            )
+            for i in range(batch_size)
+        ]
         return await asyncio.gather(*tasks)
 
-    def generate_sync(self) -> List[Rollout]:
-        """
-        Synchronous wrapper around `generate()`.
 
-        Intended for scripts/CLIs without an existing event loop.
-        If you're in a notebook or async app, call `await generate()` instead.
+    def generate_sync(
+        self,
+        *,
+        batch_size: int,
+        max_steps: int,
+        sampling_args: Optional[SamplingArgs] = None,
+        system_prompt: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        concurrency: int = 8,
+    ) -> List[Rollout]:
         """
-        return asyncio.run(self.generate())
+        Synchronous wrapper around `generate()` for scripts/CLIs.
+
+        If you're in an async env, call `await generate(...)` directly.
+        """
+        return asyncio.run(
+            self.generate(
+                batch_size=batch_size,
+                max_steps=max_steps,
+                sampling_args=sampling_args,
+                system_prompt=system_prompt,
+                timeout_s=timeout_s,
+                concurrency=concurrency,
+            )
+        )
 
     # ---- SAW batch generation --------------------------------------------
 
     async def generate_batch(
         self,
         *,
+        batch_size: int,
+        max_steps: int,
         weighting: WeightingStrategy,
         tokenize: TokenizeFn,
+        sampling_args: Optional[SamplingArgs] = None,
+        system_prompt: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        concurrency: int = 8,
         state_from_step: Optional[StateFromStepFn] = None,
         use_model_token_ids: bool = True,
         retokenize: bool = False,
@@ -203,7 +212,7 @@ class Orchestrator:
         """
         High-level entrypoint for RL-style training:
 
-        - runs episodes (via `generate`)
+        - runs batch_size many rollouts (via `generate`)
         - computes weights per (rollout, step) via WeightingStrategy
         - builds a State–Action–Weight batch, including:
             * tokenized input_ids (state + action)
@@ -216,7 +225,7 @@ class Orchestrator:
 
         - If `use_model_token_ids=True`, this looks for stored model token IDs:
                 step.info["prompt_token_ids"]
-                step.info["token_ids"]      # TODO: naming inconsistent; fix later
+                step.info["token_ids"]      # TODO: actually: completion ids
           These must be populated by the Agent or run_episode.
           If present, they are always used.
 
@@ -225,21 +234,29 @@ class Orchestrator:
                 * If `retokenize=True`, we fall back to the provided `tokenize(text)`
                   function for both state and action.
 
-                * If `retokenize=False`, we raise an error.
-                  This avoids silent misalignment between model tokenization and
-                  post-hoc text tokenization.
+                * If `retokenize=False`, we raise an error to avoid silent
+                  mismatch between model vs. post-hoc tokenization.
 
         `state_from_step` default:
         - If not provided, the “state” is the observation before the action:
                 state_text = step.prev_obs
         """
 
-        rollouts = await self.generate()
+        rollouts = await self.generate(
+            batch_size=batch_size,
+            max_steps=max_steps,
+            sampling_args=sampling_args,
+            system_prompt=system_prompt,
+            timeout_s=timeout_s,
+            concurrency=concurrency,
+        )
         weights = weighting.compute(rollouts)
 
         if state_from_step is None:
+
             def default_state_from_step(r: Rollout, i: int, step: Step) -> str:
                 return step.prev_obs
+
             state_fn: StateFromStepFn = default_state_from_step
         else:
             state_fn = state_from_step
@@ -261,7 +278,6 @@ class Orchestrator:
                     ) from exc
 
                 w = float(w_raw)
-
                 info = step.info or {}
 
                 # Try model token IDs
@@ -338,7 +354,7 @@ class Orchestrator:
         # ---- Build batch-level metadata -----------------------------------
         # TODO: Add more metrics for logging
         meta = {
-            "episodes": len(rollouts),
+            "batch_size": len(rollouts),
             "total_items": len(items),
             "avg_total_reward": (
                 float(sum(r.total_reward for r in rollouts) / len(rollouts))

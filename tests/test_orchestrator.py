@@ -1,24 +1,41 @@
 from __future__ import annotations
 
 import pytest
-from ludic.training.orchestrator import Orchestrator, OrchestratorConfig
-from tests._mocks import MockEnv, MockAgent
+
+from ludic.training.orchestrator import Orchestrator
 from ludic.training.types import RolloutStepKey, WeightingStrategy, SAWBatch
 from ludic.types import Rollout
+from tests._mocks import MockEnv, MockAgent
+
 
 @pytest.mark.asyncio
-async def test_generate_async_n_rollouts():
-    o = Orchestrator(lambda: MockEnv(max_steps=2), MockAgent(),
-                     cfg=OrchestratorConfig(episodes=4, max_steps=3, concurrency=2))
-    rs = await o.generate()
+async def test_generate_async_n_rollouts() -> None:
+    o = Orchestrator(env_factory=lambda: MockEnv(max_steps=2), agent=MockAgent())
+
+    rs = await o.generate(
+        batch_size=4,
+        max_steps=2,
+        timeout_s=1.0,
+        concurrency=2,
+    )
+
     assert len(rs) == 4
     assert all(r.length >= 1 for r in rs)
 
-def test_generate_sync_n_rollouts():
-    o = Orchestrator(lambda: MockEnv(max_steps=2), MockAgent(),
-                     cfg=OrchestratorConfig(episodes=3, max_steps=3, concurrency=1))
-    rs = o.generate_sync()
+
+def test_generate_sync_n_rollouts() -> None:
+    o = Orchestrator(env_factory=lambda: MockEnv(max_steps=2), agent=MockAgent())
+
+    rs = o.generate_sync(
+        batch_size=3,
+        max_steps=3,
+        timeout_s=1.0,
+        concurrency=1,
+    )
+
     assert len(rs) == 3
+    assert all(r.length >= 1 for r in rs)
+
 
 class RewardWeighting(WeightingStrategy):
     """
@@ -29,7 +46,7 @@ class RewardWeighting(WeightingStrategy):
         out: dict[RolloutStepKey, float] = {}
         for r in rollouts:
             for s in r.steps:
-                out[(r.id, s.index)] = s.reward
+                out[(r.id, s.index)] = float(s.reward)
         return out
 
 
@@ -50,18 +67,19 @@ async def test_generate_batch_builds_sawbatch_with_weights_and_masks() -> None:
     env_factory = lambda: MockEnv(max_steps=4, target="1")
     agent = MockAgent()
 
-    cfg = OrchestratorConfig(
-        episodes=3,
-        max_steps=4,
-        timeout_s=1.0,
-    )
-    orch = Orchestrator(env_factory=env_factory, agent=agent, cfg=cfg)
+    batch_size = 3
+    max_steps = 4
+    timeout_s = 1.0
 
+    orch = Orchestrator(env_factory=env_factory, agent=agent)
     weighting = RewardWeighting()
 
     saw_batch: SAWBatch = await orch.generate_batch(
+        batch_size=batch_size,
+        max_steps=max_steps,
         weighting=weighting,
         tokenize=simple_tokenize,
+        timeout_s=timeout_s,
         use_model_token_ids=False,  # force retokenize path
         retokenize=True,
     )
@@ -69,13 +87,13 @@ async def test_generate_batch_builds_sawbatch_with_weights_and_masks() -> None:
     # ---- batch-level checks ------------------------------------------
 
     # We expect one step per episode (MockAgent hits the target immediately).
-    assert saw_batch.meta["episodes"] == cfg.episodes
-    assert saw_batch.meta["total_items"] == cfg.episodes
+    assert saw_batch.meta["batch_size"] == batch_size
+    assert saw_batch.meta["total_items"] == batch_size
 
     # With reward=1.0 per episode, avg_total_reward should be ~1.0.
     assert pytest.approx(saw_batch.meta["avg_total_reward"], rel=1e-6) == 1.0
 
-    assert len(saw_batch.items) == cfg.episodes
+    assert len(saw_batch.items) == batch_size
 
     # ---- item-level checks -------------------------------------------
 
