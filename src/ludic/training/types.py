@@ -3,9 +3,31 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
-from ludic.env import Env
-from ludic.context.base import ContextStrategy
 from ludic.types import JSON, Rollout, SamplingArgs, Step
+
+
+@dataclass
+class EnvSpec:
+    """
+    Serializable description of an environment to instantiate.
+
+    - kind: string key into an env registry
+    - kwargs: JSON-serializable constructor/config kwargs
+    """
+    kind: str
+    kwargs: Dict[str, JSON] = field(default_factory=dict)
+
+
+@dataclass
+class CtxSpec:
+    """
+    Serializable description of a context strategy.
+
+    - kind: string key into a ctx registry
+    - kwargs: JSON-serializable constructor/config kwargs
+    """
+    kind: str
+    kwargs: Dict[str, JSON] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -15,29 +37,39 @@ from ludic.types import JSON, Rollout, SamplingArgs, Step
 # (rollout_id, step_index)
 RolloutStepKey = Tuple[str, int]
 
-
 @dataclass
 class RolloutRequest:
     """
-    Configuration for a single rollout.
+    Template for one or more rollouts.
 
-    Produced by a RolloutPolicy and consumed by the Orchestrator.
+    This is *pure data*; Orchestrator will:
+
+        - resolve env/ctx via registries from (env.kind, ctx.kind)
+        - call the factories with env.kwargs / ctx.kwargs
+        - run `num_episodes` independent episodes with this config
+
+    Fields:
+      - env / ctx:
+            EnvSpec / CtxSpec, resolved via env_registry / ctx_registry.
+
+      - sampling_args:
+            Passed directly to Agent via run_episode (temperature, top_p, etc.).
+
+      - system_prompt:
+            Optional system message for each episode.
+
+      - num_episodes:
+            How many episodes to run with this configuration.
+
+      - meta:
+            Arbitrary JSON metadata that gets merged into Rollout.meta["request_meta"].
     """
-    env: Env
-    ctx: ContextStrategy
-    sampling_args: SamplingArgs
-    system_prompt: Optional[str]
-    meta: Dict[str, JSON]
-
-
-class RolloutPolicy(Protocol):
-    """
-    Controls how each rollout is configured (env, context, sampling, meta).
-    """
-
-    def make_rollout(self, episode_idx: int) -> RolloutRequest:
-        ...
-
+    env: EnvSpec
+    ctx: CtxSpec
+    sampling_args: Optional[SamplingArgs] = None
+    system_prompt: Optional[str] = None
+    num_episodes: int = 1
+    meta: Dict[str, JSON] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 # Credit assignment / weighting
@@ -67,7 +99,7 @@ class SAWItem:
     State–Action–Weight sample with masks.
 
     - input_ids: tokenized [state || action]
-    - attention_mask: 1/0 attention mask
+    - attention_mask: 1/0 attention mask to tell tokens from padding
     - action_mask: 1 on action tokens, 0 on state tokens
     - weight: scalar credit for this sample
     - meta: arbitrary rollout/step metadata
@@ -88,6 +120,22 @@ class SAWBatch:
     """
     items: list[SAWItem]
     meta: dict[str, JSON] = field(default_factory=dict)
+
+# ---------------------------------------------------------------------------
+# Batch source abstraction
+# ---------------------------------------------------------------------------
+
+
+class BatchSource(Protocol):
+    """
+    Abstract source of SAWBatch samples.
+
+    Trainer only depends on this interface and does not care where the
+    data comes from (online rollouts, replay buffer, branching search, etc.).
+    """
+
+    async def next_batch(self) -> SAWBatch:
+        ...
 
 # ---------------------------------------------------------------------------
 # Helper aliases
