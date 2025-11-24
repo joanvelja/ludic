@@ -5,7 +5,7 @@ from typing import Any, Dict, Mapping
 
 from torch import nn, Tensor
 
-from ludic.training.types import WeightingStrategy
+from ludic.training.types import CreditAssigner
 from ludic.training.loss import (
     Loss,
     ReinforceLoss,
@@ -22,7 +22,7 @@ class RLAlgorithm:
     """
     Full RL algorithm = credit assignment + loss.
 
-    - weighting: maps Rollouts -> per-step scalar credits
+    - credit_assigner: maps Rollouts -> per-step scalar credits
                  (e.g. discounted returns / advantages)
     - loss:      consumes a collated batch (built from SAWBatch) and produces
                  a scalar loss and stats.
@@ -30,7 +30,7 @@ class RLAlgorithm:
     """
 
     name: str
-    weighting: WeightingStrategy
+    credit_assigner: CreditAssigner
     loss: Loss
 
     def compute_loss(
@@ -62,16 +62,16 @@ def make_reinforce(
           G_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + ...
     - Loss:              ReinforceLoss using `batch["weight"]` as the return
 
-    The orchestrator will use this algorithm's `weighting` (MonteCarloReturn)
+    The orchestrator will use this algorithm's `credit_assigner` (MonteCarloReturn)
     to compute G_t per step, store it in SAWItem.weight, and collate that
     into `batch["weight"]` for the loss.
     """
-    weighting: WeightingStrategy = MonteCarloReturn(gamma=gamma)
+    credit_assigner: CreditAssigner = MonteCarloReturn(gamma=gamma)
     loss: Loss = ReinforceLoss()
 
     return RLAlgorithm(
         name=name,
-        weighting=weighting,
+        credit_assigner=credit_assigner,
         loss=loss,
     )
 
@@ -97,13 +97,13 @@ def make_reinforce_baseline(
     If `normalize_adv=True`, A_t is additionally normalized to zero mean /
     unit variance within the batch before being used in the loss.
     """
-    weighting: WeightingStrategy = MonteCarloReturn(gamma=gamma)
+    credit_assigner: CreditAssigner = MonteCarloReturn(gamma=gamma)
     loss: Loss = ReinforceBaselineLoss(
         normalize=normalize_adv,
     )
 
     return RLAlgorithm(
         name=name,
-        weighting=weighting,
+        credit_assigner=credit_assigner,
         loss=loss,
     )

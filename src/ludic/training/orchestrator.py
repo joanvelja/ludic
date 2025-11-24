@@ -14,7 +14,7 @@ from ludic.interaction import run_episode
 from ludic.types import Rollout, SamplingArgs
 
 from ludic.training.types import (
-    WeightingStrategy,   # TODO: change name to credit assign something
+    CreditAssigner,   # TODO: change name to credit assign something
     SAWItem,
     SAWBatch,
     RolloutStepKey,
@@ -48,7 +48,7 @@ class Orchestrator:
     Extended variant:
 
       - can build State–Action–Weight batches via `generate_batch`, using:
-          * a WeightingStrategy for credit assignment
+          * a CreditAssigner for credit assignment
           * model token IDs from Step.info when available
           * a fallback tokenizer otherwise
 
@@ -229,7 +229,7 @@ class Orchestrator:
         *,
         requests: List[RolloutRequest],
         max_steps: int,
-        weighting: WeightingStrategy,  # TODO: change name to credit assign something
+        credit_assigner: CreditAssigner,
         timeout_s: Optional[float] = None,
         concurrency: int = 8,
         retokenize: bool = False,
@@ -239,7 +239,7 @@ class Orchestrator:
         High-level entrypoint for RL-style training:
 
         - runs all requested rollouts (via `generate_rollouts`)
-        - computes weights per (rollout, step) via WeightingStrategy
+        - computes weights per (rollout, step) via CreditAssigner
         - builds a State–Action–Weight batch, including:
             * tokenized input_ids (state + action)
             * attention_mask
@@ -277,7 +277,7 @@ class Orchestrator:
             timeout_s=timeout_s,
             concurrency=concurrency,
         )
-        weights = weighting.compute(rollouts)
+        weights = credit_assigner.compute(rollouts)
 
         items: List[SAWItem] = []
 
@@ -290,7 +290,7 @@ class Orchestrator:
                     w_raw = weights[key]
                 except KeyError as exc:
                     raise KeyError(
-                        f"WeightingStrategy did not provide a weight for "
+                        f"CreditAssigner did not provide a weight for "
                         f"(rollout_id={r.id!r}, step_index={step.index}). "
                         "All steps must be covered."
                     ) from exc
@@ -409,7 +409,7 @@ class RolloutBatchSource:
         self,
         *,
         orchestrator: Orchestrator,
-        weighting: WeightingStrategy,
+        credit_assigner: CreditAssigner,
         requests_fn: Callable[[], List[RolloutRequest]],
         max_steps: int,
         timeout_s: Optional[float] = None,
@@ -422,7 +422,7 @@ class RolloutBatchSource:
             orchestrator:
                 Orchestrator that knows how to execute RolloutRequests.
 
-            weighting:
+            credit_assigner:
                 Credit assignment strategy (e.g. MonteCarloReturn).
 
             requests_fn:
@@ -441,7 +441,7 @@ class RolloutBatchSource:
             )
 
         self._orchestrator = orchestrator
-        self._weighting = weighting
+        self._credit_assigner = credit_assigner
         self._requests_fn = requests_fn
         self._max_steps = max_steps
         self._timeout_s = timeout_s
@@ -458,7 +458,7 @@ class RolloutBatchSource:
         return await self._orchestrator.generate_batch(
             requests=requests,
             max_steps=self._max_steps,
-            weighting=self._weighting,
+            credit_assigner=self._credit_assigner,
             timeout_s=self._timeout_s,
             concurrency=self._concurrency,
             retokenize=self._retokenize,

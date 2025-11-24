@@ -72,11 +72,11 @@ class RolloutRequest:
     meta: Dict[str, JSON] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
-# Credit assignment / weighting
+# Credit assignment
 # ---------------------------------------------------------------------------
 
 
-class WeightingStrategy(Protocol):
+class CreditAssigner(Protocol):
     """
     Computes a scalar weight for each (rollout, step) in a batch.
     """

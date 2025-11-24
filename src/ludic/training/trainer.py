@@ -140,7 +140,7 @@ class Trainer:
                 May be wrapped in FSDP/FSDP2.
 
             algo:
-                RLAlgorithm = (WeightingStrategy + Loss).
+                RLAlgorithm = (CreditAssigner + Loss).
 
             batch_source:
                 Any object implementing BatchSource.next_batch() -> SAWBatch.
