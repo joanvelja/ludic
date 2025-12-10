@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from typing import Callable, Dict, List, Optional
 
 import torch
 from torch import nn, optim, Tensor
 import torch.distributed as dist
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    StateDictType,
-    FullStateDictConfig,
+
+# FSDP2 imports (replaces deprecated FSDP1)
+from torch.distributed.fsdp import fully_shard, FSDPModule, MixedPrecisionPolicy
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    StateDictOptions,
 )
 
 from ludic.distributed.interfaces import PolicyPublisher
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Collation: SAWItems -> tensor batch
 # ---------------------------------------------------------------------------
+
 
 def _collate_saw_items(
     items: List[SAWItem],
@@ -98,7 +100,7 @@ class Trainer:
               ↓
             RLAlgorithm.compute_loss(model, batch)
               ↓
-            scaled_loss.backward() (with FSDP.no_sync())
+            scaled_loss.backward() (with gradient sync control)
           ↓
         optimizer.step()
           ↓
@@ -108,13 +110,17 @@ class Trainer:
 
     Trainer is agnostic to envs, contexts, rollouts, and tokenization.
 
-    This variant is FSDP-aware:
+    FSDP2 Support:
 
-      - If `model` is wrapped in FSDP, it will:
-          * on rank 0 only:
-                - switch to FULL_STATE_DICT
-                - gather a full state dict (no CPU offload by default)
-                - push the full (unsharded) params to the runtime
+      - If `cfg.fsdp_enabled=True`, Trainer applies `fully_shard()` internally
+        during initialization, using the sharding function from `cfg.fsdp_shard_fn`
+        or a default strategy.
+
+      - Gradient sync is controlled via `set_requires_gradient_sync()` during
+        gradient accumulation.
+
+      - State dicts use the DCP (Distributed Checkpoint) API for efficient
+        gathering when pushing weights to the runtime.
 
       - On non-FSDP models, it just uses `named_parameters()` as before.
     """
@@ -135,7 +141,8 @@ class Trainer:
             model:
                 Trainable policy model (typically a HF CausalLM-like module).
                 Must accept (input_ids, attention_mask) and expose .logits.
-                May be wrapped in FSDP.
+                If `cfg.fsdp_enabled=True`, the model will be wrapped with FSDP2
+                internally; otherwise pass the unwrapped model.
 
             algo:
                 RLAlgorithm = (CreditAssigner + Loss).
@@ -149,7 +156,7 @@ class Trainer:
 
             cfg:
                 TrainerConfig for device, optimizer hyperparams, pad_token_id,
-                grad_accum_steps, and sync_every_steps.
+                grad_accum_steps, sync_every_steps, and FSDP2 options.
 
             param_filter:
                 Optional predicate (name, Tensor) -> bool deciding which
@@ -161,9 +168,13 @@ class Trainer:
         """
         self.cfg = cfg
 
-        # Assume caller has already done any FSDP wrapping / device placement.
-        # We do NOT unconditionally .to(device) for FSDP; that’s the caller’s job.
-        self.model = model.to(cfg.model_device) if not isinstance(model, FSDP) else model  # type: ignore[arg-type]
+        # ---- FSDP2 Wrapping (Internal) --------------------------------
+        if cfg.fsdp_enabled:
+            model = self._apply_fsdp2(model)
+            self.model = model  # already on correct device via fully_shard
+        else:
+            # Non-FSDP: move to device if not already an FSDPModule
+            self.model = model.to(cfg.model_device)  # type: ignore[arg-type]
 
         self.algo = algo
         self.publisher = publisher
@@ -174,13 +185,17 @@ class Trainer:
 
         # ---- Gradient Checkpointing Setup ----------------------------
         if enable_gradient_checkpointing:
-            logger.info("🛡️ Enabling Gradient Checkpointing (Activation Checkpointing)...")
-            
+            logger.info(
+                "🛡️ Enabling Gradient Checkpointing (Activation Checkpointing)..."
+            )
+
             # 1. Enable on the model (HuggingFace standard API)
             if hasattr(self.model, "gradient_checkpointing_enable"):
                 self.model.gradient_checkpointing_enable()
             else:
-                logger.warning("⚠️ Model does not have 'gradient_checkpointing_enable' method.")
+                logger.warning(
+                    "⚠️ Model does not have 'gradient_checkpointing_enable' method."
+                )
 
             # 2. Disable KV Cache (incompatible with checkpointing + training)
             if hasattr(self.model, "config"):
@@ -195,11 +210,112 @@ class Trainer:
                 pass
         # --------------------------------------------------------------
 
-        # Initialize optimizer
+        # Initialize optimizer (AFTER FSDP wrapping)
         self.optimizer = self.initialize_optimizer()
 
         # Assume gradients are zeroed at init
         self.optimizer.zero_grad(set_to_none=True)
+
+    # ------------------------------------------------------------------
+    # FSDP2 Internal Wrapping
+    # ------------------------------------------------------------------
+
+    def _apply_fsdp2(self, model: nn.Module) -> nn.Module:
+        """
+        Apply FSDP2 (`fully_shard()`) to the model.
+
+        Uses `cfg.fsdp_shard_fn` if provided, otherwise applies a default
+        sharding strategy that shards transformer layers and the root model.
+
+        Args:
+            model: The unwrapped model to shard.
+
+        Returns:
+            The model with FSDP2 applied (same object, mutated in-place).
+        """
+        # Build mixed precision policy from config
+        mp_policy = None
+        if self.cfg.fsdp_param_dtype or self.cfg.fsdp_reduce_dtype:
+            param_dtype = None
+            reduce_dtype = None
+
+            if self.cfg.fsdp_param_dtype:
+                param_dtype = getattr(torch, self.cfg.fsdp_param_dtype, None)
+                if param_dtype is None:
+                    raise ValueError(
+                        f"Invalid fsdp_param_dtype: {self.cfg.fsdp_param_dtype}"
+                    )
+
+            if self.cfg.fsdp_reduce_dtype:
+                reduce_dtype = getattr(torch, self.cfg.fsdp_reduce_dtype, None)
+                if reduce_dtype is None:
+                    raise ValueError(
+                        f"Invalid fsdp_reduce_dtype: {self.cfg.fsdp_reduce_dtype}"
+                    )
+
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=param_dtype,
+                reduce_dtype=reduce_dtype,
+            )
+
+        # FSDP2 kwargs
+        fsdp_kwargs = {
+            "reshard_after_forward": self.cfg.fsdp_reshard_after_forward,
+        }
+        if mp_policy is not None:
+            fsdp_kwargs["mp_policy"] = mp_policy
+
+        # Apply sharding
+        if self.cfg.fsdp_shard_fn is not None:
+            # User-provided sharding function
+            logger.info("🔧 Applying user-provided FSDP2 sharding function...")
+            model = self.cfg.fsdp_shard_fn(model)
+        else:
+            # Default sharding strategy: shard transformer layers + root
+            logger.info("🔧 Applying default FSDP2 sharding strategy...")
+            self._default_fsdp2_shard(model, fsdp_kwargs)
+
+        logger.info(
+            f"✅ FSDP2 applied. Model is now FSDPModule: {isinstance(model, FSDPModule)}"
+        )
+        return model
+
+    def _default_fsdp2_shard(self, model: nn.Module, fsdp_kwargs: dict) -> None:
+        """
+        Default FSDP2 sharding strategy.
+
+        Shards:
+        1. Each transformer layer (looks for common layer container names)
+        2. The root model
+
+        This handles common HuggingFace model architectures.
+        """
+        # Look for transformer layers in common locations
+        layers = None
+        for attr in ("model.layers", "transformer.h", "layers", "encoder.layer"):
+            parts = attr.split(".")
+            obj = model
+            try:
+                for part in parts:
+                    obj = getattr(obj, part)
+                if hasattr(obj, "__iter__"):
+                    layers = obj
+                    break
+            except AttributeError:
+                continue
+
+        if layers is not None:
+            for layer in layers:
+                fully_shard(layer, **fsdp_kwargs)
+            logger.info(f"  → Sharded {len(list(layers))} transformer layers")
+        else:
+            logger.warning(
+                "⚠️ Could not find transformer layers to shard. "
+                "Only root model will be sharded."
+            )
+
+        # Shard the root model
+        fully_shard(model, **fsdp_kwargs)
 
     # ------------------------------------------------------------------
     # Optimizer initialization
@@ -256,25 +372,24 @@ class Trainer:
         self.model.train()
 
         for micro_step_idx in range(grad_accum_steps):
-            
             # ---- 1a) Sample Valid Micro-batch (with Rejection Loop) ----
             # For PipelineRL, we might receive stale data from the queue.
             # We loop until we get a batch containing at least one fresh item.
             while True:
                 saw_batch: SAWBatch = await self._batch_source.next_batch()
-                
+
                 # If configured, filter out items that exceed max_lag.
                 if self.cfg.max_lag is not None:
                     current_time = self._train_step_idx
                     limit = self.cfg.max_lag
-                    
+
                     fresh_items = []
                     for item in saw_batch.items:
                         # Default to current_time (0 lag) if tag is missing
                         item_ver = item.meta.get("policy_version", current_time)
                         if (current_time - item_ver) <= limit:
                             fresh_items.append(item)
-                    
+
                     # Update the batch with only fresh items
                     saw_batch.items = fresh_items
 
@@ -290,7 +405,7 @@ class Trainer:
             # Debug: Check batch size before collation to diagnose OOM or filtering impact
             item_count = len(saw_batch.items)
             logger.info(
-                f"[Micro-step {micro_step_idx+1}/{grad_accum_steps}] "
+                f"[Micro-step {micro_step_idx + 1}/{grad_accum_steps}] "
                 f"Processing {item_count} SAWItems."
             )
 
@@ -308,36 +423,30 @@ class Trainer:
                 f"(Batch={input_shape[0]}, SeqLen={input_shape[1]})"
             )
 
-            # ---- 1c) FSDP: context for no_sync -------------------------
+            # ---- 1c) FSDP2: gradient sync control -------------------------
             # We only sync (all-reduce) gradients on the *last* micro-batch
-            is_last_micro = (micro_step_idx == grad_accum_steps - 1)
-            no_sync_context = (
-                self.model.no_sync()
-                if (isinstance(self.model, FSDP) and not is_last_micro)
-                else contextlib.nullcontext()
-            )
+            is_last_micro = micro_step_idx == grad_accum_steps - 1
+
+            # FSDP2: use set_requires_gradient_sync() instead of no_sync()
+            if isinstance(self.model, FSDPModule):
+                self.model.set_requires_gradient_sync(is_last_micro)
 
             # ---- 1d) Loss + backward (scaled) --------------------------
-            with no_sync_context:
-                loss, stats = self.algo.compute_loss(self.model, batch_tensors)
+            loss, stats = self.algo.compute_loss(self.model, batch_tensors)
 
-                # Scale loss for accumulation
-                scaled_loss = loss / grad_accum_steps
-                scaled_loss.backward()
+            # Scale loss for accumulation
+            scaled_loss = loss / grad_accum_steps
+            scaled_loss.backward()
 
             all_micro_stats.append(stats)
 
         # ---- 2) Gradient Clipping (after loop) -------------------------
         if self.cfg.max_grad_norm is not None:
-            # FSDP requires calling clip_grad_norm_ *on the model*
-            # to handle unsharding grads before clipping.
-            if isinstance(self.model, FSDP):
-                self.model.clip_grad_norm_(self.cfg.max_grad_norm)
-            else:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.cfg.max_grad_norm,
-                )
+            # FSDP2: DTensor parameters work with standard PyTorch clipping
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.cfg.max_grad_norm,
+            )
 
         # ---- 3) Optimizer Step (one step for the macro-batch) ----------
         self.optimizer.step()
@@ -384,19 +493,25 @@ class Trainer:
         # 2. Batch Metadata Stats (Reward, Size)
         total_items = 0.0
         total_episodes = 0.0
-        total_reward_sum = 0.0 
+        total_reward_sum = 0.0
 
         # 3. Custom Counters (Syntax, Semantics, Outcomes)
-        counts = {"syntax_err": 0.0, "semantic_err": 0.0, "win": 0.0, "loss": 0.0, "draw": 0.0}
+        counts = {
+            "syntax_err": 0.0,
+            "semantic_err": 0.0,
+            "win": 0.0,
+            "loss": 0.0,
+            "draw": 0.0,
+        }
 
         for batch in saw_batches:
             num_items = float(len(batch.items))
             total_items += num_items
-            
+
             # Each batch has N episodes
             batch_eps = float(batch.meta.get("batch_size", 0.0))
             total_episodes += batch_eps
-            
+
             # Weighted reward average
             avg_reward = float(batch.meta.get("avg_total_reward", 0.0))
             total_reward_sum += avg_reward * num_items
@@ -406,13 +521,13 @@ class Trainer:
                 # Syntax Error (Agent output invalid XML)
                 if item.meta.get("parse_error"):
                     counts["syntax_err"] += 1.0
-                
+
                 # Semantic Error (Agent output valid XML but invalid move)
                 if item.meta.get("illegal_move"):
                     counts["semantic_err"] += 1.0
-                
+
                 # Outcomes (usually only present on the final step)
-                res = item.meta.get("result") # "win", "loss", "draw"
+                res = item.meta.get("result")  # "win", "loss", "draw"
                 if res in counts:
                     counts[res] += 1.0
 
@@ -488,20 +603,19 @@ class Trainer:
         asyncio.run(self.train(num_steps, log_every=log_every, log_fn=log_fn))
 
     # ------------------------------------------------------------------
-    # Weight sync into runtime via Agent (FSDP-aware + LoRA-aware)
+    # Weight sync into runtime via Agent (FSDP2-aware + LoRA-aware)
     # ------------------------------------------------------------------
 
     def _push_weights_to_runtime(self) -> None:
         """
-        Gather weights (handling FSDP if needed) and publish them.
+        Gather weights (handling FSDP2 if needed) and publish them.
 
         If the model is a PEFT/LoRA model, we strictly follow the
         Merge -> Publish -> Unmerge pattern so vLLM receives dense weights
         but training continues on adapters.
         """
-        # Helper to get the underlying model if wrapped in FSDP
-        # FSDP wraps the actual model in .module
-        inner_model = self.model.module if isinstance(self.model, FSDP) else self.model
+        # FSDP2: Model identity is preserved (no .module wrapper)
+        inner_model = self.model
 
         # 1. Check if this is a LoRA/PEFT model
         #    (We use getattr so we don't need to import peft here)
@@ -538,29 +652,29 @@ class Trainer:
                 # Strip the PEFT prefix so vLLM sees standard keys
                 # base_model.model.model.layers... -> model.layers...
                 return k.replace("base_model.model.", "")
+
             # ---------------------------------------------
 
-            # ---------------- FSDP path ----------------
-            if isinstance(self.model, FSDP):
-                # Gather full, unsharded state dict on the model device.
-                full_cfg = FullStateDictConfig(
-                    offload_to_cpu=False,  # full model stays on GPU; rollouts dominate anyway
-                    rank0_only=True,
+            # ---------------- FSDP2 path ----------------
+            if isinstance(self.model, FSDPModule):
+                # FSDP2: Use DCP API for full state dict gathering
+                full_state = get_model_state_dict(
+                    model=self.model,
+                    options=StateDictOptions(
+                        full_state_dict=True,
+                        cpu_offload=False,  # Keep on GPU for weight sync
+                    ),
                 )
-                with FSDP.state_dict_type(
-                    self.model,
-                    StateDictType.FULL_STATE_DICT,
-                    full_cfg,
-                ):
-                    full_state = self.model.state_dict()
 
                 params: Dict[str, Tensor] = {}
                 for name, tensor in full_state.items():
                     if not should_publish(name):
                         continue
-                    if self.param_filter is not None and not self.param_filter(name, tensor):
+                    if self.param_filter is not None and not self.param_filter(
+                        name, tensor
+                    ):
                         continue
-                    
+
                     # Clean key and move to device
                     clean_k = clean_name(name)
                     params[clean_k] = tensor.detach().to(runtime_device)

@@ -35,7 +35,7 @@ ProtocolRegistry = Dict[str, ProtocolFactory]
 class RolloutEngine:
     """
     Stateless rollout executor.
-    
+
     Responsibilities:
       1. Instantiating Envs and Protocols from Requests.
       2. Executing Episodes (generate_rollouts).
@@ -103,41 +103,46 @@ class RolloutEngine:
             is_forced_seed = request.seed is not None
 
             # 4. Run the episode using the fresh protocol and env
-            rollouts = await protocol.run(
-                env=env,
-                max_steps=max_steps,
-                seed=run_seed,
-                sampling_args=sargs,
-                timeout_s=timeout_s,
-            )
-
-            # 5. Log metadata for ALL returned rollouts
-            for r in rollouts:
-                r.meta.setdefault("episode_idx", episode_idx)
-                
-                # We flatten the request metadata into the rollout metadata
-                # so keys like 'policy_version' are accessible at the top level.
-                if request.meta:
-                    r.meta.update(request.meta)
-
-                r.meta.setdefault("request_meta", {})
-                r.meta["request_meta"].update(request.meta)
-                r.meta.setdefault("engine", {})
-                r.meta["engine"].update(
-                    {
-                        "max_steps": max_steps,
-                        "timeout_s": timeout_s,
-                        "env_kind": request.env.kind,
-                        "protocol_kind": request.protocol.kind,
-                        "used_seed": run_seed,
-                        "forced_seed": is_forced_seed,
-                    }
+            try:
+                rollouts = await protocol.run(
+                    env=env,
+                    max_steps=max_steps,
+                    seed=run_seed,
+                    sampling_args=sargs,
+                    timeout_s=timeout_s,
                 )
 
-                if self.jsonl_path:
-                    self._append_jsonl(r)
+                # 5. Log metadata for ALL returned rollouts
+                for r in rollouts:
+                    r.meta.setdefault("episode_idx", episode_idx)
 
-            return rollouts
+                    # We flatten the request metadata into the rollout metadata
+                    # so keys like 'policy_version' are accessible at the top level.
+                    if request.meta:
+                        r.meta.update(request.meta)
+
+                    r.meta.setdefault("request_meta", {})
+                    r.meta["request_meta"].update(request.meta)
+                    r.meta.setdefault("engine", {})
+                    r.meta["engine"].update(
+                        {
+                            "max_steps": max_steps,
+                            "timeout_s": timeout_s,
+                            "env_kind": request.env.kind,
+                            "protocol_kind": request.protocol.kind,
+                            "used_seed": run_seed,
+                            "forced_seed": is_forced_seed,
+                        }
+                    )
+
+                    if self.jsonl_path:
+                        self._append_jsonl(r)
+
+                return rollouts
+            finally:
+                # 6. (Optional) Clean up resources
+                if hasattr(env, "close"):
+                    env.close()
 
     def _append_jsonl(self, rollout: Rollout) -> None:
         assert self.jsonl_path is not None
@@ -219,11 +224,11 @@ class RolloutEngine:
     ) -> SAWBatch:
         """
         High-level entrypoint for RL-style training:
-        
+
         1. Generates rollouts.
         2. Computes credit (advantages/rewards).
         3. Collates into SAWItems (handling tokenization/masking).
-        
+
         Tokenization strategy:
         - If Step.info contains `prompt_token_ids` and `completion_token_ids`,
           those are used *unless* retokenize=True.
@@ -342,7 +347,8 @@ class RolloutEngine:
             "total_items": len(items),
             "avg_total_reward": (
                 float(sum(r.total_reward for r in rollouts) / len(rollouts))
-                if rollouts else 0.0
+                if rollouts
+                else 0.0
             ),
         }
 
