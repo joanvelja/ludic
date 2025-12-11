@@ -40,6 +40,7 @@ from ludic.training.credit_assignment import GroupNormalizedReturn
 from ludic.training.loss import ReinforceLoss
 from ludic.training.trainer import Trainer
 from ludic.training.config import TrainerConfig
+from ludic.training.checkpoint import CheckpointConfig
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
 from rich.console import Console
 from rich.table import Table
@@ -219,12 +220,20 @@ def main():
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
     )
+    # Checkpoint every 25 steps into ./checkpoints_gsm8k
+    checkpoint_cfg = CheckpointConfig(
+        output_dir="checkpoints_gsm8k",
+        every_n_steps=25,
+        max_to_keep=2,
+        save_optimizer=True,
+    )
     trainer = Trainer(
         model=model,
         algo=algo,
         batch_source=batch_source,
         publisher=publisher,
         cfg=cfg,
+        checkpoint_config=checkpoint_cfg,
     )
 
     console = Console()

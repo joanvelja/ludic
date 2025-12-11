@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -15,6 +16,7 @@ from torch.distributed.fsdp import (
 )
 
 from ludic.distributed.interfaces import PolicyPublisher
+from ludic.training.checkpoint import CheckpointConfig, CheckpointManager
 from ludic.training.algorithm import RLAlgorithm
 from ludic.training.config import TrainerConfig
 from ludic.training.types import SAWBatch, SAWItem, BatchSource
@@ -129,6 +131,9 @@ class Trainer:
         cfg: TrainerConfig = TrainerConfig(),
         param_filter: Optional[Callable[[str, Tensor], bool]] = None,
         enable_gradient_checkpointing: bool = False,
+        checkpointer: Optional[CheckpointManager] = None,
+        checkpoint_config: Optional[CheckpointConfig] = None,
+        resume_from: Optional[int | str] = None,
     ) -> None:
         """
         Args:
@@ -158,6 +163,20 @@ class Trainer:
             enable_gradient_checkpointing:
                 If True, enables activation checkpointing on the model to save VRAM.
                 Also automatically disables KV cache and enables input gradients.
+
+            checkpointer:
+                Optional CheckpointManager for periodic HF-format saves. If not
+                provided, one will be constructed from `checkpoint_config`.
+                Prefer `checkpoint_config` for standard usage; `checkpointer`
+                is an escape hatch to inject a custom implementation.
+
+            checkpoint_config:
+                Convenience config to build a default CheckpointManager.
+
+            resume_from:
+                Optional checkpoint to load on startup. Accepts a step number
+                or an explicit checkpoint directory path. Requires a
+                checkpointer (explicit or via checkpoint_config).
         """
         self.cfg = cfg
 
@@ -171,6 +190,9 @@ class Trainer:
         self.sync_every_steps = self.cfg.sync_every_steps
         self.param_filter = param_filter
         self._train_step_idx = 0
+        self._checkpointer = checkpointer or (
+            CheckpointManager(checkpoint_config) if checkpoint_config is not None else None
+        )
 
         # ---- Gradient Checkpointing Setup ----------------------------
         if enable_gradient_checkpointing:
@@ -200,6 +222,29 @@ class Trainer:
 
         # Assume gradients are zeroed at init
         self.optimizer.zero_grad(set_to_none=True)
+
+        # Optionally resume from a checkpoint (weights + optimizer)
+        if resume_from is not None:
+            if self._checkpointer is None:
+                raise ValueError("resume_from requires a CheckpointManager or checkpoint_config")
+            load_kwargs: Dict[str, Optional[object]] = {}
+            if isinstance(resume_from, int):
+                load_kwargs["step"] = resume_from
+            elif isinstance(resume_from, str):
+                # Prefer treating a real path as explicit target; fall back to int-like strings
+                if Path(resume_from).exists():
+                    load_kwargs["path"] = resume_from
+                elif resume_from.isdigit():
+                    load_kwargs["step"] = int(resume_from)
+            meta = self._checkpointer.load(
+                self.model,
+                optimizer=self.optimizer,
+                step=load_kwargs.get("step"),  # type: ignore[arg-type]
+                path=load_kwargs.get("path"),  # type: ignore[arg-type]
+            )
+            # Default to the saved step, else keep current.
+            self._train_step_idx = int(meta.get("step", self._train_step_idx))
+            logger.info("✅ Resumed from checkpoint at step %s", self._train_step_idx)
 
     # ------------------------------------------------------------------
     # Optimizer initialization
@@ -355,6 +400,15 @@ class Trainer:
         # ---- 6) Enrich stats -------------------------------------------
         final_stats = self._aggregate_stats(all_micro_stats, all_saw_batches)
         final_stats["train_step"] = float(self._train_step_idx)
+
+        # ---- 7) Optional Checkpoint ------------------------------------
+        if self._checkpointer is not None:
+            self._checkpointer.maybe_save(
+                self.model,
+                optimizer=self.optimizer,
+                step=self._train_step_idx,
+                metadata={"algorithm": self.algo.name},
+            )
 
         return final_stats
 
