@@ -3,7 +3,7 @@ import asyncio
 from typing import Optional, Dict, List
 
 from ludic.envs.env import LudicEnv
-from ludic.agent import Agent
+from ludic.agents.base_agent import Agent
 from ludic.types import Rollout, Step, StepOutcome, SamplingArgs
 from .base import InteractionProtocol
 from .step_collector import TraceCollector

@@ -16,11 +16,12 @@ from rich.live import Live
 from rich import box
 
 # Ludic Imports
-from ludic.agent import Agent
+from ludic.agents.base_agent import Agent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.parsers import xml_move_parser
-from ludic.training.rollout_engine import RolloutEngine, RolloutBatchSource
+from ludic.training.batching.rollout_engine import RolloutEngine
+from ludic.training.batching.synced_batching import RolloutBatchSource
 from ludic.training.types import EnvSpec, ProtocolSpec, RolloutRequest
 from ludic.training.algorithm import make_reinforce
 from ludic.training.trainer import Trainer
@@ -168,7 +169,7 @@ def main():
         inference_mode=False, 
         r=16,           # Rank: 16 is a good balance for 7B
         lora_alpha=32,  # Alpha usually 2x Rank
-        lora_dropout=0.05,
+        lora_dropout=0,
         bias="none",
         # Target all linear projection layers for best performance
         target_modules=[

@@ -65,5 +65,8 @@ class TrainerConfig:
     sync_every_steps: int = 1
     mixed_precision_dtype: Optional[str] = "bf16"
 
+    # PipelineRL specific settings
+    max_lag: Optional[int] = None  # Drop batches older than N steps
+
     # ----- collation ------------------------------
     pad_token_id: int = 0

@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import pytest
 
-from ludic.agent import Agent
+from ludic.agents.base_agent import Agent
 from ludic.inference.client import ChatResponse
 from ludic.interaction.base import InteractionProtocol
 from ludic.interaction.single_agent import SingleAgentSyncProtocol

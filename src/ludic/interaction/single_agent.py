@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Optional, List
 
 from ludic.envs.env import LudicEnv
-from ludic.agent import Agent
+from ludic.agents.base_agent import Agent
 from ludic.types import Rollout, Step, StepOutcome, SamplingArgs
 from .base import InteractionProtocol
 

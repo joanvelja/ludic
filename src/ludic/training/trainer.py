@@ -264,7 +264,7 @@ class Trainer:
                 saw_batch: SAWBatch = await self._batch_source.next_batch()
                 
                 # If configured, filter out items that exceed max_lag.
-                if self.cfg.max_lag is not None:
+                if getattr(self.cfg, "max_lag", None) is not None:
                     current_time = self._train_step_idx
                     limit = self.cfg.max_lag
                     
@@ -526,21 +526,9 @@ class Trainer:
             # We use the current training step as the authoritative version for PipelineRL
             current_version = self._train_step_idx
 
-            # --- Helpers to clean/filter keys for vLLM ---
-            def should_publish(k: str) -> bool:
-                # Filter out pure adapter weights (lora_A, lora_B, etc.)
-                # vLLM (dense mode) won't recognize them.
-                if "lora_" in k or "lora." in k:
-                    return False
-                return True
+            raw_params: Dict[str, Tensor] = {}
 
-            def clean_name(k: str) -> str:
-                # Strip the PEFT prefix so vLLM sees standard keys
-                # base_model.model.model.layers... -> model.layers...
-                return k.replace("base_model.model.", "")
-            # ---------------------------------------------
-
-            # ---------------- FSDP path ----------------
+            # --- Gather Raw Params (FSDP or Standard) ---
             if isinstance(self.model, FSDP):
                 # Gather full, unsharded state dict on the model device.
                 full_cfg = FullStateDictConfig(
@@ -553,51 +541,35 @@ class Trainer:
                     full_cfg,
                 ):
                     full_state = self.model.state_dict()
-
-                params: Dict[str, Tensor] = {}
-                for name, tensor in full_state.items():
-                    if not should_publish(name):
-                        continue
-                    if self.param_filter is not None and not self.param_filter(name, tensor):
-                        continue
+                    for k, v in full_state.items():
+                        if self.param_filter is not None and not self.param_filter(k, v):
+                            continue
+                        raw_params[k] = v.detach().to(runtime_device)
+            else:
+                # Standard model
+                for name, p in self.model.named_parameters():
+                    # Optimization: In LoRA, only send what we touched (plus what needs fusion)
+                    # If not PEFT, only send requires_grad.
+                    # If PEFT (merged), we theoretically need to send the whole base layer 
+                    # because it changed.
                     
-                    # Clean key and move to device
-                    clean_k = clean_name(name)
-                    params[clean_k] = tensor.detach().to(runtime_device)
-
-                if not params:
-                    return
-
-                self.publisher.publish(params, version=current_version)
-                return
-
-            # ---------------- non-FSDP path ----------------
-            params: Dict[str, Tensor] = {}
-            for name, p in self.model.named_parameters():
-                if not should_publish(name):
-                    continue
-
-                if self.param_filter is not None:
-                    if not self.param_filter(name, p):
-                        continue
-                else:
-                    # In LoRA mode, non-adapter weights usually have requires_grad=False.
-                    # HOWEVER, because we just called merge_adapter(), the base weights
-                    # now theoretically contain the signal.
-                    # We publish everything that matches our requirements.
-
                     # If standard training: send only requires_grad=True
                     # If LoRA (merged): send everything (because base weights need updating in vLLM)
                     if not is_peft and not p.requires_grad:
                         continue
+                        
+                    if self.param_filter is not None:
+                        if not self.param_filter(name, p):
+                            continue
 
-                clean_k = clean_name(name)
-                params[clean_k] = p.detach().to(runtime_device)
+                    raw_params[name] = p.detach().to(runtime_device)
 
-            if not params:
+            if not raw_params:
                 return
 
-            self.publisher.publish(params, version=current_version)
+            # --- Publish ---
+            # NOTE: We simply hand off the raw state dict and rely on the Publisher to handle fusion and renaming.
+            self.publisher.publish(raw_params, version=current_version)
 
         finally:
             # 3. CRITICAL: Unmerge adapters immediately after publishing.

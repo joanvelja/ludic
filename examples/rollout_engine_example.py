@@ -4,11 +4,11 @@ import asyncio
 from pathlib import Path
 from typing import List
 
-from ludic.agent import Agent
+from ludic.agents.base_agent import Agent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.parsers import xml_move_parser
-from ludic.training.rollout_engine import (
+from ludic.training.batching.rollout_engine import (
     RolloutEngine,
     EnvRegistry,
     CtxRegistry,

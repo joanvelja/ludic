@@ -433,6 +433,19 @@ async def run_server(args: Namespace) -> None:
         data = await request.json()
         metadata = data.get("metadata", [])  # List of {name, dtype, shape}
         
+        # --- DEBUG: Verify what the server received ---
+        print("\n" + "="*80)
+        print(f"📥 [SERVER DEBUG] Received Batch Metadata (Total: {len(metadata)})")
+        print("="*80)
+        for i, m in enumerate(metadata):
+            # Print only first 10 to avoid spamming logs, or all if short
+            if i < 10:
+                print(f"  • {m.get('name')} | {m.get('shape')}")
+        if len(metadata) > 10:
+            print(f"  ... (+{len(metadata)-10} more)")
+        print("="*80 + "\n")
+        # ----------------------------------------------
+
         # Check if an explicit version was provided by the Trainer
         forced_version = data.get("version")
 
