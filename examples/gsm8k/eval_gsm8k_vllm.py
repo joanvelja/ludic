@@ -17,18 +17,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import signal
 import subprocess
-import sys
-import time
 from typing import List, Sequence, Dict
-
-import requests
 
 from ludic.agents.base_agent import Agent
 from ludic.context.full_dialog import FullDialog
 from ludic.inference.vllm_client import VLLMChatClient
+from ludic.inference.vllm_utils import start_vllm_server, wait_for_vllm_health
 from ludic.interaction.single_agent import SingleAgentSyncProtocol
 from ludic.parsers import ParseResult, cot_prefix_parser
 from ludic.types import SamplingArgs
@@ -70,70 +66,6 @@ def optional_cot_parser(raw: str) -> ParseResult:
     if result.action is None:
         return ParseResult(action=raw.strip(), reward=0.0, obs=None)
     return result
-
-
-def start_vllm_server(model: str, host: str, port: int) -> subprocess.Popen:
-    env = os.environ.copy()
-    env.setdefault("VLLM_USE_V1", "1")
-    env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "ludic.inference.vllm_server",
-        "--model",
-        model,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        "--gpu_memory_utilization",
-        "0.7",
-        "--max-model-len",
-        "4096",
-        "--max-num-seqs",
-        "4",
-        "--max-num-batched-tokens",
-        "4096",
-        "--enforce-eager",
-    ]
-
-    return subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-
-def wait_for_health(host: str, port: int, proc: subprocess.Popen, timeout_s: float = 180.0) -> None:
-    health_url = f"http://{host}:{port}/health"
-    deadline = time.time() + timeout_s
-    last_err = None
-    while time.time() < deadline:
-        try:
-            r = requests.get(health_url, timeout=2.0)
-            if r.status_code == 200:
-                return
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-
-        if proc.poll() is not None:
-            stdout, stderr = proc.communicate()
-            raise RuntimeError(
-                f"vLLM server exited early with code {proc.returncode}\n"
-                f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-            )
-        time.sleep(2.0)
-
-    proc.terminate()
-    stdout, stderr = proc.communicate(timeout=10)
-    raise RuntimeError(
-        f"vLLM server failed to become healthy at {health_url}\n"
-        f"Last error: {last_err}\n"
-        f"STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    )
 
 
 async def eval_dataset(
@@ -287,9 +219,13 @@ def main() -> None:
     proc = None
     if args.start_server:
         print("Starting local vLLM server...")
-        proc = start_vllm_server(args.model, args.host, args.port)
+        proc = start_vllm_server(
+            args.model,
+            args.host,
+            args.port,
+        )
         try:
-            wait_for_health(args.host, args.port, proc)
+            wait_for_vllm_health(args.host, args.port, proc)
             print("vLLM server is healthy.")
         except Exception:
             proc.kill()
