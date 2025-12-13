@@ -31,6 +31,7 @@ pipelinerl = [
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests",
-    "gpu: marks tests as needing a GPU"
+    "gpu: marks tests as needing a GPU",
+    "report: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
 ]
 testpaths = ["tests"]
