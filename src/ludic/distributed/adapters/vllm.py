@@ -10,6 +10,7 @@ from ludic.distributed.interfaces import (
 )
 from ludic.inference.vllm_client import VLLMChatClient
 from ludic.distributed.publisher import BroadcastPolicyPublisher
+from ludic.distributed.publisher import Rank0OnlyPublisher
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -168,10 +169,21 @@ def create_vllm_publisher(
     client: VLLMChatClient,
     *,
     debug: bool = False,
+    rank0_only: bool = False,
 ) -> PolicyPublisher:
-    control = VllmControlPlane(client)
-    comm = VllmTensorCommunicator(client)
-    broadcaster = BroadcastPolicyPublisher(control, comm, src_rank=comm.rank)
+    """
+    Create a PolicyPublisher that pushes weights into a vLLM runtime.
 
-    # Return the adapter that knows how to translate HF -> vLLM
-    return VllmPublisherAdapter(broadcaster, debug=debug)
+    If rank0_only=True, returns a Rank0OnlyPublisher wrapper that constructs the
+    underlying publisher lazily and only publishes on distributed rank 0.
+    """
+
+    def _make() -> PolicyPublisher:
+        control = VllmControlPlane(client)
+        comm = VllmTensorCommunicator(client)
+        broadcaster = BroadcastPolicyPublisher(control, comm, src_rank=comm.rank)
+        return VllmPublisherAdapter(broadcaster, debug=debug)
+
+    if rank0_only:
+        return Rank0OnlyPublisher(_make)
+    return _make()

@@ -31,7 +31,7 @@ from ludic.agent import Agent
 from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
-from ludic.distributed.adapters import create_vllm_publisher
+from ludic.distributed import create_vllm_publisher
 from ludic.parsers import boxed_parser, compose_parsers, cot_prefix_parser, extract_last_boxed_content
 from ludic.training import (
     RLAlgorithm,
@@ -45,11 +45,6 @@ from ludic.training import (
     ReinforceLoss,
 )
 from ludic.training import Reducer, RichLiveLogger
-
-
-class _NoopPublisher:
-    def publish(self, state_dict, version=None) -> None:  # type: ignore[no-untyped-def]
-        return
 
 
 async def run_eval(
@@ -308,7 +303,7 @@ def main() -> None:
         enable_weight_updates=(rank == 0),
         device=str(device),
     )
-    publisher = create_vllm_publisher(client) if rank == 0 else _NoopPublisher()
+    publisher = create_vllm_publisher(client, rank0_only=True)
 
     env_registry = {"math": lambda sample: MATHEnv(sample=sample, system_prompt=args.system_prompt)}
 
