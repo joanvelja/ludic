@@ -12,7 +12,6 @@ This wires together:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
 from typing import List, Dict, Any
 
@@ -27,6 +26,7 @@ from ludic.inference import VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
+from ludic.eval import EngineEvaluator
 from ludic.training import (
     RLAlgorithm,
     RolloutEngine,
@@ -38,61 +38,13 @@ from ludic.training import (
     ProtocolSpec,
     RolloutRequest,
     GroupNormalizedReturn,
+    GRPORequestStrategy,
     ReinforceLoss,
 )
 from ludic.training import Reducer, RichLiveLogger
 
 # STRICT: require <think>...</think> then exactly one <move>...</move>.
 TICTACTOE_PARSER = compose_parsers(think_prefix_parser, xml_tag_parser("move", exact=True))
-
-async def run_eval(
-    *,
-    seeds: List[int],
-    client: VLLMChatClient,
-    model: str,
-    concurrency: int,
-    max_tokens: int,
-    temperature: float,
-    max_steps: int,
-) -> float:
-    """
-    Run a batch of Tic-Tac-Toe episodes and report win rate (%).
-    """
-    sem = asyncio.Semaphore(max(1, concurrency))
-
-    async def _run_one(seed: int) -> bool:
-        async with sem:
-            env = TicTacToeEnv(agent_starts=True)
-            base_prompt = env.suggested_sysprompt or ""
-            sys_prompt = (
-                base_prompt
-                + "\n\nThink through the board in <think>...</think>. After </think>, output exactly one XML tag of the form <move>A1</move> and nothing else."
-            )
-            protocol = SingleAgentSyncProtocol(
-                agent=Agent(
-                    client=client,
-                    model=model,
-                    ctx=FullDialog(),
-                    parser=TICTACTOE_PARSER,
-                ),
-                prompt=sys_prompt,
-            )
-            rollouts = await protocol.run(
-                env=env,
-                max_steps=max_steps,
-                seed=seed,
-                sampling_args={
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "extras": {"extra_body": {"return_token_ids": True}},
-                },
-            )
-            info = rollouts[0].steps[-1].info
-            return info.get("result") == "win"
-
-    results = await asyncio.gather(*[_run_one(s) for s in seeds])
-    wins = sum(1 for r in results if r)
-    return 100.0 * wins / len(seeds) if seeds else 0.0
 
 
 def build_requests_fn(
@@ -125,9 +77,10 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed for sampling episode seeds.")
     parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch source call.")
-    parser.add_argument("--train-steps", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=1, help="Rollout requests per batch source call.")
+    parser.add_argument("--train-steps", type=int, default=100, help="Number of trainer steps.")
     parser.add_argument("--max-steps-per-episode", type=int, default=5)
+    parser.add_argument("--group-size", type=int, default=8, help="Group size for grouped advantages (GRPO-style).")
     parser.add_argument("--lora-rank", type=int, default=16, help="LoRA rank (RL-friendly defaults from LoRA best-practice guides).")
     parser.add_argument(
         "--lora-alpha-mult",
@@ -206,7 +159,7 @@ def main():
     # Algorithm
     algo = RLAlgorithm(
         name="grpo",
-        credit_assigner=GroupNormalizedReturn(normalize_adv=True),
+        credit_assigner=GroupNormalizedReturn(group_size=args.group_size, normalize_adv=True),
         loss=ReinforceLoss(length_normalize=True),
     )
 
@@ -219,9 +172,13 @@ def main():
     sampling_args = {
         "temperature": args.train_temperature,
         "max_tokens": 250,
-        "extras": {"extra_body": {"return_token_ids": True}},
+        # Ask vLLM for token IDs + sampled logprobs so we can use rollout-time behavior logprobs.
+        "extras": {"extra_body": {"return_token_ids": True, "return_logprobs": True}},
     }
-    requests_fn = build_requests_fn(rng, args.batch_size, sampling_args)
+    base_requests_fn = build_requests_fn(rng, args.batch_size, sampling_args)
+    # Expand each logical request into a group with shared env seed and diverse sampling seeds.
+    def requests_fn() -> List[RolloutRequest]:
+        return GRPORequestStrategy(group_size=args.group_size).expand(base_requests_fn())
     batch_source = RolloutBatchSource(
         orchestrator=engine,
         credit_assigner=algo.credit_assigner,
@@ -234,10 +191,14 @@ def main():
     # Trainer
     cfg = TrainerConfig(
         model_device="cuda" if torch.cuda.is_available() else "cpu",
-        grad_accum_steps=4,
+        grad_accum_steps=8,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         lr=5e-5,
+        eval_at_start=bool(args.eval_before_start and args.eval_episodes and args.eval_episodes > 0),
+        eval_every_n_steps=(args.eval_every if args.eval_every and args.eval_every > 0 else None),
+        eval_concurrency=args.eval_concurrency,
+        eval_max_steps=args.max_steps_per_episode,
     )
     checkpoint_cfg = CheckpointConfig(
         output_dir="checkpoints_tictactoe",
@@ -267,7 +228,7 @@ def main():
         "illegal_rate": Reducer(
             kind="count_true",
             source="illegal_move",
-            normalize_by="samples",
+            normalize_by="rollouts",
         ),
         "total_completion_tokens": Reducer(
             kind="sum",
@@ -285,6 +246,12 @@ def main():
             "illegal_rate",
             "avg_completion_length",
             "total_completion_tokens",
+            "eval_win_rate",
+            "eval_loss_rate",
+            "eval_draw_rate",
+            "eval_illegal_rate",
+            "eval_parse_error_rate",
+            "eval_avg_completion_tokens",
             "num_rollouts",
             "num_samples",
         ],
@@ -292,6 +259,15 @@ def main():
         history=100,
         precision=4,
     )
+
+    eval_reducers = {
+        "win_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "win", normalize_by="rollouts", as_percent=True),
+        "loss_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "loss", normalize_by="rollouts", as_percent=True),
+        "draw_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "draw", normalize_by="rollouts", as_percent=True),
+        "illegal_rate": Reducer(kind="count_true", source="illegal_move", normalize_by="rollouts", as_percent=True),
+        "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples", as_percent=True),
+        "avg_completion_tokens": Reducer(kind="mean", source="completion_length"),
+    }
 
     trainer = Trainer(
         model=model,
@@ -303,39 +279,34 @@ def main():
         checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,
         reducers=reducers,
-    )
-
-    async def train_loop():
-        train_step = 0
-        eval_seeds = list(range(args.eval_episodes))
-        if args.eval_before_start and eval_seeds:
-            acc = await run_eval(
-                seeds=eval_seeds,
-                client=client,
-                model=args.model,
-                concurrency=args.eval_concurrency,
-                max_tokens=250,
-                temperature=args.eval_temperature,
-                max_steps=args.max_steps_per_episode,
+        evaluator=(
+            None
+            if not args.eval_episodes or args.eval_episodes <= 0
+            else EngineEvaluator(
+                engine=RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry),
+                requests_fn=lambda: [
+                    RolloutRequest(
+                        env=EnvSpec(kind="tictactoe", kwargs={"agent_starts": True}),
+                        protocol=ProtocolSpec(kind="single_agent", kwargs={}),
+                        num_episodes=1,
+                        seed=int(seed),
+                        sampling_args={
+                            "temperature": args.eval_temperature,
+                            "max_tokens": 250,
+                            "extras": {"extra_body": {"return_token_ids": True}},
+                        },
+                        meta={"eval_seed": seed},
+                    )
+                    for seed in range(args.eval_episodes)
+                ],
+                reducers=eval_reducers,
+                max_steps=cfg.eval_max_steps,
+                timeout_s=cfg.eval_timeout_s,
+                concurrency=cfg.eval_concurrency,
             )
-            print(f"[eval @ step 0] win_rate={acc:.2f}% on {len(eval_seeds)} episodes")
-
-        for _ in range(args.train_steps):
-            stats = await trainer.train_step()
-            train_step = int(stats["train_step"])
-            if args.eval_every > 0 and train_step % args.eval_every == 0 and eval_seeds:
-                acc = await run_eval(
-                    seeds=eval_seeds,
-                    client=client,
-                    model=args.model,
-                    concurrency=args.eval_concurrency,
-                    max_tokens=250,
-                    temperature=args.eval_temperature,
-                    max_steps=args.max_steps_per_episode,
-                )
-                print(f"[eval @ step {train_step}] win_rate={acc:.2f}% on {len(eval_seeds)} episodes")
-
-    asyncio.run(train_loop())
+        ),
+    )
+    trainer.train_sync(args.train_steps)
 
 
 if __name__ == "__main__":

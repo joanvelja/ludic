@@ -33,6 +33,7 @@ from ludic.inference import VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.distributed import create_vllm_publisher
 from ludic.parsers import boxed_parser, compose_parsers, think_prefix_parser, extract_last_boxed_content
+from ludic.eval import EngineEvaluator
 from ludic.training import (
     RLAlgorithm,
     RolloutEngine,
@@ -43,48 +44,11 @@ from ludic.training import (
     make_dataset_queue_requests_fn,
     GroupNormalizedReturn,
     ReinforceLoss,
+    RolloutRequest,
+    EnvSpec,
+    ProtocolSpec,
 )
 from ludic.training import Reducer, RichLiveLogger
-
-
-async def run_eval(
-    *,
-    samples: List[Dict[str, Any]],
-    client: VLLMChatClient,
-    model: str,
-    system_prompt: str | None,
-    concurrency: int,
-    max_tokens: int,
-    temperature: float,
-    parser,
-) -> float:
-    """
-    Simple eval loop: run each sample once and report accuracy (% correct).
-    """
-    sem = asyncio.Semaphore(max(1, concurrency))
-
-    async def _run_one(sample: Dict[str, Any]) -> bool:
-        async with sem:
-            env = MATHEnv(sample=sample, system_prompt=system_prompt)
-            protocol = SingleAgentSyncProtocol(
-                agent=Agent(
-                    client=client,
-                    model=model,
-                    ctx=FullDialog(),
-                    parser=parser,
-                )
-            )
-            rollouts = await protocol.run(
-                env=env,
-                max_steps=1,
-                sampling_args={"temperature": temperature, "max_tokens": max_tokens},
-            )
-            info = rollouts[0].steps[-1].info
-            return bool(info.get("correct"))
-
-    results = await asyncio.gather(*[_run_one(s) for s in samples])
-    correct = sum(1 for r in results if r)
-    return 100.0 * correct / len(samples) if samples else 0.0
 
 
 def configure_logging(*, rank: int, level: str) -> None:
@@ -200,8 +164,8 @@ def main() -> None:
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--vllm-host", default="127.0.0.1")
     parser.add_argument("--vllm-port", type=int, default=8000)
-    parser.add_argument("--limit", type=int, default=2048)
-    parser.add_argument("--train-steps", type=int, default=50)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--train-steps", type=int, default=100, help="Number of trainer steps.")
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=11)
@@ -366,6 +330,11 @@ def main() -> None:
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         reduce_stats_across_ranks=True,
+        eval_at_start=bool(args.eval_before_start and do_eval),
+        eval_every_n_steps=(int(args.eval_every) if args.eval_every and args.eval_every > 0 and do_eval else None),
+        eval_concurrency=int(args.eval_concurrency),
+        eval_max_steps=1,
+        eval_timeout_s=None,
     )
     checkpoint_cfg = CheckpointConfig(
         output_dir=args.checkpoint_dir,
@@ -399,6 +368,9 @@ def main() -> None:
                     "avg_total_reward",
                     "correct_rate",
                     "parse_err_rate",
+                    "eval_accuracy",
+                    "eval_parse_error_rate",
+                    "eval_avg_completion_tokens",
                     "num_rollouts",
                     "num_samples",
                 ],
@@ -411,6 +383,9 @@ def main() -> None:
                     "avg_total_reward",
                     "correct_rate",
                     "parse_err_rate",
+                    "eval_accuracy",
+                    "eval_parse_error_rate",
+                    "eval_avg_completion_tokens",
                     "num_rollouts",
                     "num_samples",
                 ],
@@ -429,24 +404,41 @@ def main() -> None:
         checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,
         reducers=reducers,
+        evaluator=(
+            None
+            if not do_eval
+            else EngineEvaluator(
+                engine=RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry),
+                requests_fn=lambda: [
+                    RolloutRequest(
+                        env=EnvSpec(kind="math", kwargs={"sample": sample}),
+                        protocol=ProtocolSpec(kind="single_agent", kwargs={}),
+                        num_episodes=1,
+                        seed=int(idx),
+                        sampling_args={
+                            "temperature": float(args.eval_temperature),
+                            "max_tokens": int(args.max_tokens),
+                            "extras": {"extra_body": {"return_token_ids": True}},
+                        },
+                        meta={"eval_sample_index": idx, "problem_id": sample.get("id", idx)},
+                    )
+                    for idx, sample in enumerate(eval_samples)
+                ],
+                reducers={
+                    "accuracy": Reducer(kind="count_true", source="correct", normalize_by="rollouts", as_percent=True),
+                    "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples", as_percent=True),
+                    "avg_completion_tokens": Reducer(kind="mean", source="completion_length"),
+                },
+                max_steps=cfg.eval_max_steps,
+                timeout_s=cfg.eval_timeout_s,
+                concurrency=cfg.eval_concurrency,
+            )
+        ),
     )
 
     async def train_loop():
-        if args.eval_before_start and do_eval:
-            if rank == 0:
-                acc = await run_eval(
-                    samples=eval_samples,
-                    client=client,
-                    model=args.model,
-                    system_prompt=args.system_prompt,
-                    concurrency=args.eval_concurrency,
-                    max_tokens=args.max_tokens,
-                    temperature=args.eval_temperature,
-                    parser=action_parser,
-                )
-                print(f"[eval @ step 0] accuracy={acc:.2f}% on {len(eval_samples)} samples", flush=True)
-            if dist.is_initialized():
-                dist.barrier()
+        if cfg.eval_at_start:
+            await trainer.eval()
 
         for _ in range(args.train_steps):
             local_done = 1 if samples_q.empty() else 0
@@ -467,28 +459,10 @@ def main() -> None:
                     flush=True,
                 )
 
-            if args.eval_every and args.eval_every > 0 and do_eval:
+            if cfg.eval_every_n_steps:
                 step = int(stats["train_step"])
-                if step % args.eval_every == 0:
-                    if dist.is_initialized():
-                        dist.barrier()
-                    if rank == 0:
-                        acc = await run_eval(
-                            samples=eval_samples,
-                            client=client,
-                            model=args.model,
-                            system_prompt=args.system_prompt,
-                            concurrency=args.eval_concurrency,
-                            max_tokens=args.max_tokens,
-                            temperature=args.eval_temperature,
-                            parser=action_parser,
-                        )
-                        print(
-                            f"[eval @ step {step}] accuracy={acc:.2f}% on {len(eval_samples)} samples",
-                            flush=True,
-                        )
-                    if dist.is_initialized():
-                        dist.barrier()
+                if step % int(cfg.eval_every_n_steps) == 0:
+                    await trainer.eval()
 
     asyncio.run(train_loop())
 

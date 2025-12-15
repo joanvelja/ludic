@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, List, Callable, Protocol
+from typing import Any, Dict, Mapping, Optional, List, Protocol
 
 from torch import nn, Tensor
 import torch

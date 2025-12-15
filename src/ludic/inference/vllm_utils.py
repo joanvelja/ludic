@@ -24,8 +24,10 @@ def start_vllm_server(
     port: int,
     *,
     gpu_memory_utilization: float = 0.7,
+    max_model_len: int | None = None,
     enforce_eager: bool = True,
     stream_output: bool = True,
+    extra_args: list[str] | None = None,
 ) -> subprocess.Popen[str]:
     """
     Launch a local vLLM server using ludic.inference.vllm_server.
@@ -33,6 +35,7 @@ def start_vllm_server(
     Set stream_output=False if the caller needs to capture stdout/stderr;
     otherwise logs stream to the parent to avoid pipe backpressure.
     """
+    extra_args = extra_args or []
     cmd = [
         sys.executable,
         "-m",
@@ -46,6 +49,11 @@ def start_vllm_server(
         "--gpu_memory_utilization",
         str(gpu_memory_utilization),
     ]
+
+    if max_model_len is not None:
+        cmd.extend(["--max-model-len", str(max_model_len)])
+
+    cmd.extend(extra_args)
 
     if enforce_eager:
         cmd.append("--enforce-eager")

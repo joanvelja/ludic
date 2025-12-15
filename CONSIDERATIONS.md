@@ -71,3 +71,38 @@ Not universally; it depends on what `truncated` means in the environment and the
 `finish_reason=="length"` typically means the model hit `max_tokens` and produced an incomplete completion/action.
 
 In Ludic (by default), these incomplete completions are rejected at the `Agent` level and treated like parse failures (see above), so they can be tracked and filtered separately from env/protocol truncation.
+
+## Future: First-Class Evaluation + Better Layering
+
+Right now, evaluation utilities and examples often live near the training stack because they reuse `RolloutEngine` and reducers. This is convenient, but it muddies the conceptual layering:
+
+- Rollout execution is not inherently “training”.
+- Evaluation is not inherently “training” (especially in disaggregated inference setups where eval is “send requests to inference GPUs”).
+
+Potential future refactor (larger change):
+
+- Promote rollout execution to a non-training namespace (e.g. `ludic.rollouts` / `ludic.execution`) by moving `RolloutEngine` out of `ludic.training.*`.
+- Create a first-class `ludic.eval` module that depends on rollout execution and produces:
+  - step/episode outputs suitable for analysis
+  - aggregated metrics via reducers
+  - optional CLI helpers for examples
+- Make `Trainer.eval()` a thin consumer of `ludic.eval` (rather than owning eval logic/config), keeping Trainer focused on optimization.
+
+This would make evaluation a first-class citizen, reduce duplicated example code, and keep the training module’s surface area smaller/cleaner.
+
+## Future: Remove `RolloutRequest.num_episodes`
+
+`RolloutRequest` currently supports `num_episodes > 1`, which makes one “request” behave like a small workload (“run this template N times”).
+
+This is convenient in a few places, but it is conceptually awkward and has practical downsides:
+
+- It conflates **one execution spec** with **many executions**, making progress reporting and per-episode metadata harder to reason about.
+- It complicates algorithms that already treat requests as “one execution trace” (e.g., GRPO-style request expansion).
+
+Planned refactor (breaking change):
+
+- Remove `RolloutRequest.num_episodes` and any engine code that expands it internally.
+- Define the semantics as: **1 `RolloutRequest` ⇒ 1 episode** (which may still yield multiple `Rollout`s for multi-agent protocols).
+- Handle multiplicity at a higher layer by explicitly generating more requests, e.g. via:
+  - `RequestStrategy.expand(...)` (one-to-many request transforms), and/or
+  - a small helper to “repeat” a request with deterministic seeding.

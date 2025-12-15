@@ -14,7 +14,6 @@ This is a skeleton; adjust hyperparameters, batching, and model loading to your 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
 import queue
 from typing import List, Dict, Any
@@ -30,6 +29,7 @@ from ludic.inference import VLLMChatClient
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import boxed_parser
 from ludic.distributed.adapters import create_vllm_publisher
+from ludic.eval import EngineEvaluator
 from ludic.training import (
     RolloutEngine,
     RolloutBatchSource,
@@ -38,6 +38,10 @@ from ludic.training import (
     CheckpointConfig,
     make_dataset_queue_requests_fn,
     make_grpo,
+    RequestsExhausted,
+    RolloutRequest,
+    EnvSpec,
+    ProtocolSpec,
 )
 from ludic.training import Reducer, RichLiveLogger
 
@@ -58,67 +62,28 @@ def load_gsm8k(split: str, limit: int | None) -> List[Dict[str, Any]]:
     return samples
 
 
-async def run_eval(
-    *,
-    samples: List[Dict[str, Any]],
-    client: VLLMChatClient,
-    model: str,
-    system_prompt: str | None,
-    concurrency: int,
-    max_tokens: int,
-    temperature: float,
-) -> float:
-    """
-    Simple eval loop: run each sample once and report accuracy (% correct).
-    """
-    sem = asyncio.Semaphore(max(1, concurrency))
-
-    async def _run_one(sample: Dict[str, Any]) -> bool:
-        async with sem:
-            env = GSM8KEnv(sample=sample, system_prompt=system_prompt)
-            protocol = SingleAgentSyncProtocol(
-                agent=Agent(
-                    client=client,
-                    model=model,
-                    ctx=FullDialog(),
-                    parser=boxed_parser,
-                )
-            )
-            rollouts = await protocol.run(
-                env=env,
-                max_steps=1,
-                sampling_args={"temperature": temperature, "max_tokens": max_tokens},
-            )
-            info = rollouts[0].steps[-1].info
-            return bool(info.get("correct"))
-
-    results = await asyncio.gather(*[_run_one(s) for s in samples])
-    correct = sum(1 for r in results if r)
-    return 100.0 * correct / len(samples) if samples else 0.0
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--split", default="train")
-    parser.add_argument("--limit", type=int, default=256)
-    parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=8, help="Rollout requests per batch source call")
-    parser.add_argument("--train-steps", type=int, default=100)
-    parser.add_argument("--group-size", type=int, default=8, help="GRPO group size per prompt")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--concurrency", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch source call")
+    parser.add_argument("--train-steps", type=int, default=20, help="Number of trainer steps; 0 = run until samples are exhausted.")
+    parser.add_argument("--group-size", type=int, default=8, help="Group size for grouped advantages.")
     parser.add_argument(
         "--system-prompt",
         type=str,
-        default="",
+        default="First, think step by step. Then put your final answer inside \\boxed{...}.",
         help="Optional system prompt for GSM8K env; set to '' to use the model default.",
     )
     parser.add_argument("--train-temperature", type=float, default=1.0, help="Sampling temperature for training rollouts.")
     parser.add_argument("--eval-every", type=int, default=10, help="Eval every N train steps.")
     parser.add_argument("--eval-before-start", action="store_true", default=True, help="Run eval once before training begins.")
-    parser.add_argument("--eval-limit", type=int, default=500, help="Number of test samples for eval.")
-    parser.add_argument("--eval-concurrency", type=int, default=32)
+    parser.add_argument("--eval-limit", type=int, default=750, help="Number of test samples for eval.")
+    parser.add_argument("--eval-concurrency", type=int, default=64)
     parser.add_argument("--eval-temperature", type=float, default=0.0, help="Sampling temperature for eval passes.")
     parser.add_argument("--rollout-log", type=str, default="gsm8k_train_rollouts.jsonl")
     args = parser.parse_args()
@@ -169,7 +134,7 @@ def main():
         name="grpo",
         group_size=args.group_size,
         group_normalize_adv=True,
-        clip_eps=0.2,
+        clip_eps=0.1,
         length_normalize=True,
     )
 
@@ -182,7 +147,9 @@ def main():
     sampling_args = {
         "temperature": args.train_temperature,
         "max_tokens": 512,
-        "extras": {"extra_body": {"return_token_ids": True}},
+        # Ask vLLM for token IDs + sampled logprobs so GRPO can use rollout-time
+        # behavior logprobs instead of backfilling them on the trainer side.
+        "extras": {"extra_body": {"return_token_ids": True, "return_logprobs": True}},
     }
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
@@ -210,9 +177,13 @@ def main():
     # Trainer
     cfg = TrainerConfig(
         model_device="cuda" if torch.cuda.is_available() else "cpu",
-        grad_accum_steps=4,
+        grad_accum_steps=8,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
+        eval_at_start=bool(args.eval_before_start and eval_samples),
+        eval_every_n_steps=(args.eval_every if args.eval_every and args.eval_every > 0 and eval_samples else None),
+        eval_concurrency=args.eval_concurrency,
+        eval_max_steps=1,
     )
     # Checkpoint every 25 steps into ./checkpoints_gsm8k
     checkpoint_cfg = CheckpointConfig(
@@ -247,6 +218,9 @@ def main():
             "parse_err_rate",
             "avg_completion_length",
             "total_completion_tokens",
+            "eval_accuracy",
+            "eval_parse_error_rate",
+            "eval_avg_completion_tokens",
             "num_rollouts",
             "num_samples",
         ],
@@ -254,6 +228,12 @@ def main():
         history=100,
         precision=4,
     )
+
+    eval_reducers = {
+        "accuracy": Reducer(kind="count_true", source="correct", normalize_by="samples", as_percent=True),
+        "parse_error_rate": Reducer(kind="count_true", source="parse_error", normalize_by="samples", as_percent=True),
+        "avg_completion_tokens": Reducer(kind="mean", source="completion_length"),
+    }
 
     trainer = Trainer(
         model=model,
@@ -265,41 +245,41 @@ def main():
         checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,
         reducers=reducers,
+        evaluator=(
+            None
+            if not eval_samples
+            else EngineEvaluator(
+                engine=RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry),
+                requests_fn=lambda: [
+                    RolloutRequest(
+                        env=EnvSpec(
+                            kind="gsm8k",
+                            kwargs={"sample": sample},
+                        ),
+                        protocol=ProtocolSpec(kind="single_agent"),
+                        sampling_args={
+                            "temperature": args.eval_temperature,
+                            "max_tokens": 512,
+                            "extras": {"extra_body": {"return_token_ids": True}},
+                        },
+                        num_episodes=1,
+                        seed=idx,
+                        meta={"eval_sample_index": idx, "question_id": sample.get("id", idx)},
+                    )
+                    for idx, sample in enumerate(eval_samples)
+                ],
+                reducers=eval_reducers,
+                max_steps=1,
+                timeout_s=cfg.eval_timeout_s,
+                concurrency=cfg.eval_concurrency,
+            )
+        ),
     )
 
-    async def train_loop():
-        train_step = 0
-        if args.eval_before_start and eval_samples:
-            acc = await run_eval(
-                samples=eval_samples,
-                client=client,
-                model=args.model,
-                system_prompt=args.system_prompt,
-                concurrency=args.eval_concurrency,
-                max_tokens=512,
-                temperature=args.eval_temperature,
-            )
-            print(f"[eval @ step 0] accuracy={acc:.2f}% on {len(eval_samples)} samples")
-
-        for _ in range(args.train_steps):
-            if samples_q.empty():
-                print("No more samples; stopping training loop.")
-                break
-            stats = await trainer.train_step()
-            train_step = int(stats["train_step"])
-            if args.eval_every > 0 and train_step % args.eval_every == 0 and eval_samples:
-                acc = await run_eval(
-                    samples=eval_samples,
-                    client=client,
-                    model=args.model,
-                    system_prompt=args.system_prompt,
-                    concurrency=args.eval_concurrency,
-                    max_tokens=512,
-                    temperature=args.eval_temperature,
-                )
-                print(f"[eval @ step {train_step}] accuracy={acc:.2f}% on {len(eval_samples)} samples")
-
-    asyncio.run(train_loop())
+    try:
+        trainer.train_sync(args.train_steps)
+    except RequestsExhausted:
+        print("No more training samples; stopping.")
 
 
 if __name__ == "__main__":

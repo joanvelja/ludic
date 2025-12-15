@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Mapping
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import torch
 from torch import nn, optim, Tensor
@@ -20,9 +20,11 @@ from ludic.training.algorithm import RLAlgorithm
 from ludic.training.loggers import TrainingLogger
 from ludic.training.config import TrainerConfig
 from ludic.training.stats import aggregate_stats, Reducer
+from ludic.eval.evaluator import Evaluator
 from ludic.training.types import SAWBatch, SAWItem, BatchSource
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Collation: SAWItems -> tensor batch
@@ -159,6 +161,7 @@ class Trainer:
         resume_from: Optional[int | str] = None,
         train_logger: Optional[TrainingLogger] = None,
         reducers: Optional[Mapping[str, Reducer]] = None,
+        evaluator: Optional[Evaluator] = None,
     ) -> None:
         """
         Args:
@@ -210,6 +213,9 @@ class Trainer:
             reducers:
                 Optional aggregation reducers passed to aggregate_stats to
                 compute custom metrics from SAWItem meta.
+
+            evaluator:
+                Optional evaluator object used for periodic evaluation runs.
         """
         self.cfg = cfg
         self.train_logger = train_logger
@@ -225,9 +231,12 @@ class Trainer:
         self.sync_every_steps = self.cfg.sync_every_steps
         self.param_filter = param_filter
         self._train_step_idx = 0
+        self._last_train_stats: Dict[str, float] = {}
+        self._last_eval_stats: Dict[str, float] = {}
         self._checkpointer = checkpointer or (
             CheckpointManager(checkpoint_config) if checkpoint_config is not None else None
         )
+        self.evaluator = evaluator
 
         # ---- Gradient Checkpointing Setup ----------------------------
         if enable_gradient_checkpointing:
@@ -606,9 +615,12 @@ class Trainer:
             )
 
         # ---- 8) Optional logging ---------------------------------------
+        self._last_train_stats = dict(final_stats)
+        log_stats = dict(final_stats)
+        log_stats.update(self._last_eval_stats)
         if self.train_logger is not None:
             try:
-                self.train_logger.log(self._train_step_idx, final_stats)
+                self.train_logger.log(self._train_step_idx, log_stats)
             except Exception:
                 logger.exception("Stats logger failed at step %s", self._train_step_idx)
 
@@ -633,6 +645,7 @@ class Trainer:
         *,
         log_every: int = 1,
         log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
+        eval_log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
     ) -> None:
         """
         Run `num_steps` training iterations.
@@ -646,11 +659,25 @@ class Trainer:
 
             log_fn:
                 Optional callback(stats_dict) for logging / progress reporting.
+
+            eval_log_fn:
+                Optional callback for eval metrics.
+
         """
+        if self.cfg.eval_at_start:
+            await self.eval(
+                log_fn=eval_log_fn,
+            )
+
         for _ in range(num_steps):
             stats = await self.train_step()
             if log_fn is not None and (self._train_step_idx % log_every == 0):
                 log_fn(stats)
+
+            if self.cfg.eval_every_n_steps and (self._train_step_idx % self.cfg.eval_every_n_steps == 0):
+                await self.eval(
+                    log_fn=eval_log_fn,
+                )
 
     def train_sync(
         self,
@@ -658,11 +685,96 @@ class Trainer:
         *,
         log_every: int = 1,
         log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
+        eval_log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
     ) -> None:
         """
         Synchronous wrapper around `train(...)`.
         """
-        asyncio.run(self.train(num_steps, log_every=log_every, log_fn=log_fn))
+        asyncio.run(
+            self.train(
+                num_steps,
+                log_every=log_every,
+                log_fn=log_fn,
+                eval_log_fn=eval_log_fn,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    async def eval(
+        self,
+        *,
+        reducers: Optional[Mapping[str, Reducer]] = None,
+        max_steps: Optional[int] = None,
+        timeout_s: Optional[float] = None,
+        concurrency: Optional[int] = None,
+        log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run evaluation using the configured evaluator.
+        """
+        if self.evaluator is None:
+            raise ValueError("Trainer.eval requires evaluator to be set.")
+
+        is_distributed = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if is_distributed else 0
+
+        if is_distributed:
+            # Only rank 0 performs eval; other ranks wait at barriers.
+            dist.barrier()
+            if rank != 0:
+                dist.barrier()
+                return {"records": [], "metrics": {}}
+
+        records, metrics = await self.evaluator.eval(
+            reducers=reducers,
+            max_steps=max_steps or self.cfg.eval_max_steps,
+            timeout_s=timeout_s if timeout_s is not None else self.cfg.eval_timeout_s,
+            concurrency=concurrency or self.cfg.eval_concurrency,
+        )
+
+        if log_fn is not None:
+            try:
+                log_fn(metrics)
+            except Exception:
+                logger.exception("Eval log_fn failed")
+
+        self._last_eval_stats = {"eval_step": float(self._train_step_idx)}
+        self._last_eval_stats.update({f"eval_{k}": float(v) for k, v in metrics.items()})
+        if self.train_logger is not None and (not is_distributed or rank == 0):
+            try:
+                merged = dict(self._last_train_stats)
+                merged.update(self._last_eval_stats)
+                self.train_logger.log(self._train_step_idx, merged)
+            except Exception:
+                logger.exception("Train logger failed while logging eval metrics")
+
+        if is_distributed:
+            dist.barrier()
+
+        return {"records": records, "metrics": metrics}
+
+    def eval_sync(
+        self,
+        *,
+        reducers: Optional[Mapping[str, Reducer]] = None,
+        max_steps: Optional[int] = None,
+        timeout_s: Optional[float] = None,
+        concurrency: Optional[int] = None,
+        log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Synchronous wrapper around eval()."""
+        return asyncio.run(
+            self.eval(
+                reducers=reducers,
+                max_steps=max_steps,
+                timeout_s=timeout_s,
+                concurrency=concurrency,
+                log_fn=log_fn,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Weight sync into runtime via Agent (FSDP-aware + LoRA-aware)

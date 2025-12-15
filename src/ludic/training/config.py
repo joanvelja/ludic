@@ -55,6 +55,26 @@ class TrainerConfig:
     - reduce_stats_across_ranks:
           If True (and torch.distributed is initialized), Trainer will all-reduce
           the per-rank stats dict before logging/returning it.
+
+    ==========================
+    Evaluation
+    ==========================
+
+    - eval_at_start:
+          If True, run eval before the first training step when using
+          Trainer.train(). Requires Trainer(evaluator=...).
+
+    - eval_every_n_steps:
+          Run eval every N training steps. None disables periodic eval.
+
+    - eval_concurrency:
+          Number of concurrent episodes during eval rollout generation.
+
+    - eval_max_steps:
+          Maximum steps per eval episode.
+
+    - eval_timeout_s:
+          Optional per-call timeout for eval rollouts.
     """
 
     # ----- model / optimization -------------------
@@ -79,3 +99,10 @@ class TrainerConfig:
 
     # ----- collation ------------------------------
     pad_token_id: int = 0
+
+    # ----- evaluation -----------------------------
+    eval_at_start: bool = False
+    eval_every_n_steps: Optional[int] = None
+    eval_concurrency: int = 32
+    eval_max_steps: int = 1
+    eval_timeout_s: Optional[float] = None

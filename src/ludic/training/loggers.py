@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any, Dict, Protocol, Sequence
 
 from rich.console import Console
-from rich.columns import Columns
 from rich.live import Live
+from rich.layout import Layout
 from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
@@ -76,6 +76,7 @@ class RichLiveLogger:
         keys: Sequence[str] | None = None,
         spark_key: str = "avg_total_reward",
         history: int = 100,
+        spark_window: int = 50,
         precision: int = 4,
         console: Console | None = None,
         live: Live | None = None,
@@ -83,10 +84,12 @@ class RichLiveLogger:
         self.keys = list(keys) if keys is not None else None
         self.spark_key = spark_key
         self.history = history
+        self.spark_window = spark_window
         self.precision = precision
         self.console = console or Console()
         self.live = live or Live(console=self.console, refresh_per_second=4, transient=False)
         self.history_vals: list[float] = []
+        self._last_eval_step: int | None = None
         self._own_live = live is None
         self._started = False
 
@@ -107,10 +110,15 @@ class RichLiveLogger:
             return str(v)
         return str(v)
 
-    def _sparkline(self) -> tuple[str, float, float]:
+    def _sparkline(self, max_len: int | None = None) -> tuple[str, float, float]:
         if not self.history_vals:
             return "", 0.0, 0.0
         vals = self.history_vals[-self.history :]
+        # Always keep a moving window of the most recent spark_window points
+        if self.spark_window and self.spark_window > 0:
+            vals = vals[-self.spark_window :]
+        if max_len is not None and max_len > 0:
+            vals = vals[-max_len:]
         lo, hi = min(vals), max(vals)
         if hi == lo:
             return "▁" * len(vals), lo, hi
@@ -122,49 +130,95 @@ class RichLiveLogger:
         return "".join(scaled), lo, hi
 
     def _render(self, step: int, stats: Dict[str, float]):
-        table = Table(show_header=False, box=None, padding=(0, 1))
-        table.add_column("metric", style="cyan", no_wrap=True)
-        table.add_column("value", style="magenta", overflow="fold")
+
+        def _make_table(items):
+            table = Table(show_header=False, box=None, padding=(0, 1))
+            table.add_column("metric", style="cyan", no_wrap=True)
+            table.add_column("value", style="magenta", overflow="fold")
+            for name, value in items:
+                table.add_row(name, self._fmt_val(value))
+            return table
 
         if self.keys is not None:
-            keys = [k for k in self.keys if k in stats]
+            allowed_keys = set(self.keys)
         else:
-            keys = sorted(stats.keys())
+            allowed_keys = None
 
-        for k in keys:
-            table.add_row(k, self._fmt_val(stats[k]))
+        train_items = []
+        eval_items = []
+        for k, v in sorted(stats.items()):
+            if k in {"phase", "train_step", "eval_step"}:
+                continue
+            if allowed_keys is not None and k not in allowed_keys:
+                continue
+            if k.startswith("eval_"):
+                eval_items.append((k.replace("eval_", "", 1), v))
+            else:
+                train_items.append((k, v))
 
-        spark, lo, hi = self._sparkline()
+        train_table = _make_table(train_items) if train_items else Text("no train stats")
+        eval_table = _make_table(eval_items) if eval_items else Text("no eval stats")
+
+        train_title = "train"
+        train_step = stats.get("train_step")
+        if train_step is None:
+            train_step = step
+        try:
+            train_title = f"train (@ step {int(train_step)})"
+        except Exception:
+            pass
+
+        eval_title = "eval"
+        if self._last_eval_step is not None:
+            eval_title = f"eval (@ step {self._last_eval_step})"
+
+        # Try to size the sparkline to the available column width to avoid ellipsis
+        col_width = max(10, (self.console.width or 80) // 3 - 6)
+        spark, lo, hi = self._sparkline(max_len=col_width)
         if spark:
             spark_panel = Panel(
-                Text(spark, style="magenta"),
+                Text(spark, style="magenta", overflow="crop", no_wrap=True),
                 title=f"{self.spark_key}",
-                subtitle=f"{lo:.{self.precision}f} – {hi:.{self.precision}f}",
+                subtitle=f"step {step} | {lo:.{self.precision}f} – {hi:.{self.precision}f}",
                 padding=(0, 1),
             )
-            step_label = Table(show_header=False, box=None, padding=(0, 0))
-            step_label.add_column("step", style="cyan", no_wrap=True)
-            step_label.add_column("val", style="magenta", no_wrap=True)
-            step_label.add_row("step", str(step))
+        else:
+            spark_panel = Panel(
+                Text("-", style="magenta"),
+                title=self.spark_key,
+                subtitle=f"step {step}",
+                padding=(0, 1),
+            )
 
-            table_with_step = Table.grid(padding=(0, 0))
-            table_with_step.add_row(table)
-            table_with_step.add_row(step_label)
-
-            return Columns([table_with_step, spark_panel], expand=True, equal=True)
-
-        # No spark: still show step
-        step_label = Table(show_header=False, box=None, padding=(0, 0))
-        step_label.add_column("step", style="cyan", no_wrap=True)
-        step_label.add_column("val", style="magenta", no_wrap=True)
-        step_label.add_row("step", str(step))
-
-        table_with_step = Table.grid(padding=(0, 0))
-        table_with_step.add_row(table)
-        table_with_step.add_row(step_label)
-        return table_with_step
+        root = Layout()
+        top = Layout(name="top", ratio=3)
+        top.split_row(
+            Layout(
+                Panel(train_table, title=train_title, padding=(0, 0), expand=True),
+                name="train",
+                ratio=1,
+            ),
+            Layout(
+                Panel(eval_table, title=eval_title, padding=(0, 0), expand=True),
+                name="eval",
+                ratio=1,
+            ),
+        )
+        bottom = Layout(
+            Panel(spark_panel, padding=(0, 0), expand=True),
+            name="spark",
+            ratio=1,
+        )
+        root.split_column(top, bottom)
+        return root
 
     def log(self, step: int, stats: Dict[str, float]) -> None:
+        if "eval_step" in stats:
+            try:
+                self._last_eval_step = int(stats["eval_step"])
+            except Exception:
+                self._last_eval_step = step
+
         spark_val = stats.get(self.spark_key)
         if isinstance(spark_val, (int, float)):
             self.history_vals.append(float(spark_val))

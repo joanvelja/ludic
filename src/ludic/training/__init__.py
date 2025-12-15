@@ -5,6 +5,8 @@ from __future__ import annotations
 # Ludic is meant to be hackable, so everything remains reachable via the internal
 # module paths. This file provides a curated "short path" API for common usage.
 
+from typing import TYPE_CHECKING, Any
+
 from .types import (
     EnvSpec,
     ProtocolSpec,
@@ -40,7 +42,6 @@ from .loss import (
     selective_log_softmax,
 )
 from .filters import drop_truncated, drop_parse_errors, drop_incomplete_completions
-from .trainer import Trainer
 from .config import TrainerConfig
 from .checkpoint import CheckpointConfig
 from .batching import (
@@ -58,6 +59,9 @@ from .batching import (
 )
 from .stats import Reducer, apply_reducers_to_records
 from .loggers import TrainingLogger, PrintLogger, RichLiveLogger
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .trainer import Trainer as Trainer
 
 __all__ = [
     # Core training loop
@@ -117,3 +121,11 @@ __all__ = [
     "PrintLogger",
     "RichLiveLogger",
 ]
+
+
+def __getattr__(name: str) -> Any:  # pragma: no cover
+    if name == "Trainer":
+        from .trainer import Trainer as _Trainer
+
+        return _Trainer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

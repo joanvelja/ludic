@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch
 from ludic.types import Rollout
