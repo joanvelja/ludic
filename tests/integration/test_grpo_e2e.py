@@ -193,8 +193,8 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
         rollouts[rollout_id]["reward"] = item.meta["reward"]
         rollouts[rollout_id]["weight"] = item.weight
 
-        assert "prompt_token_ids" in item.meta
-        assert "completion_token_ids" in item.meta
+        assert "prompt_length" in item.meta
+        assert "completion_length" in item.meta
         assert item.meta["engine"]["protocol_kind"] == "grpo_protocol"
 
     rollout_list = list(rollouts.values())

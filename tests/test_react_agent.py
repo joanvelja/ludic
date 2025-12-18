@@ -110,7 +110,7 @@ async def test_react_agent_happy_path_single_tool():
         tools=[calculator_tool]
     )
 
-    parse_result, raw_text, _ = await agent.act()
+    parse_result, raw_text, _, _ = await agent.act()
 
     # Assert Final Output
     assert parse_result.action == "4"
@@ -173,7 +173,7 @@ async def test_react_agent_shot_clock_fallback():
         max_react_steps=2 # Strict limit
     )
 
-    result, _, _ = await agent.act()
+    result, _, _, _ = await agent.act()
 
     # 1. Did it finish?
     assert result.action == "Sunny"
@@ -284,7 +284,7 @@ async def test_react_agent_records_bad_json_tool_arguments():
         max_react_steps=3,
     )
 
-    result, _, _ = await agent.act()
+    result, _, _, _ = await agent.act()
     assert result.action == "ok"
 
     final_history = client.last_messages
@@ -328,7 +328,7 @@ async def test_react_agent_records_tool_execution_exception():
         max_react_steps=3,
     )
 
-    result, _, _ = await agent.act()
+    result, _, _, _ = await agent.act()
     assert result.action == "ok"
 
     final_history = client.last_messages
@@ -375,7 +375,7 @@ async def test_react_agent_handles_multiple_tool_calls_in_one_turn():
         max_react_steps=3,
     )
 
-    result, _, _ = await agent.act()
+    result, _, _, _ = await agent.act()
     assert result.action == "4 and Sunny in NYC"
 
     final_history = client.last_messages
@@ -429,7 +429,7 @@ async def test_react_agent_multi_tool_calls_continue_on_error():
         max_react_steps=3,
     )
 
-    result, _, _ = await agent.act()
+    result, _, _, _ = await agent.act()
     assert result.action == "ok"
 
     final_history = client.last_messages
