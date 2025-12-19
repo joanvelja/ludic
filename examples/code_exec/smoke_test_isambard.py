@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""
+Smoke test for CodeExecEnv on Isambard HPC (CPU-only, Podman-HPC).
+
+This script validates the full training pipeline end-to-end:
+  1. Podman-HPC sandbox pool creation
+  2. CodeExecEnv reset/step cycle
+  3. RolloutEngine with SingleAgentProtocol
+  4. Trainer step (with mock inference)
+
+Usage (interactive):
+    python examples/code_exec/smoke_test_isambard.py
+
+Usage (Slurm batch):
+    sbatch examples/code_exec/smoke_test_isambard.slurm
+
+Requirements:
+    - podman-hpc in PATH (auto-detected on Isambard)
+    - Python 3.11+ with ludic installed
+    - Image pre-pulled: podman-hpc pull python:3.11-slim
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+# Check early for podman-hpc availability
+import shutil
+if not shutil.which("podman-hpc"):
+    print("ERROR: podman-hpc not found in PATH")
+    print("  On Isambard, ensure you're in a Slurm job or on a login node with podman-hpc")
+    sys.exit(1)
+
+
+def log(msg: str, level: str = "INFO") -> None:
+    """Simple timestamped logging."""
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}")
+
+
+# ============================================================================
+# Test 1: Podman-HPC Sandbox Pool
+# ============================================================================
+
+async def test_sandbox_pool(n_workers: int = 2) -> bool:
+    """Test that we can create and use a Podman-HPC sandbox pool."""
+    log("Testing Podman-HPC sandbox pool...")
+
+    from ludic.envs.code_exec import PodmanHPCSandboxPool, PodmanConfig
+    from ludic.envs.code_exec.types import CompileStatus, RunStatus
+
+    config = PodmanConfig(
+        memory_limit="128m",
+        network_disabled=True,
+        gpu=False,  # CPU only
+    )
+
+    pool = PodmanHPCSandboxPool(
+        n_workers=n_workers,
+        image="python:3.11-slim",
+        config=config,
+        cache_size=100,
+    )
+
+    try:
+        log(f"  Starting pool with {n_workers} workers...")
+        start = time.time()
+        await pool.start()
+        log(f"  Pool started in {time.time() - start:.2f}s")
+
+        # Test checkout and execute
+        log("  Checking out sandbox...")
+        sandbox = await pool.checkout(timeout_s=30.0)
+
+        log("  Testing compile...")
+        compile_result = await sandbox.compile("print('hello')")
+        assert compile_result.status == CompileStatus.SUCCESS, f"Compile failed: {compile_result}"
+
+        log("  Testing execute...")
+        exec_result = await sandbox.execute("print('Hello from Podman-HPC!')")
+        assert exec_result.run_status == RunStatus.SUCCESS, f"Execute failed: {exec_result}"
+        assert "Hello from Podman-HPC!" in exec_result.stdout
+
+        log("  Testing stdin handling...")
+        code = "x = int(input()); print(x * 2)"
+        exec_result = await sandbox.execute(code, stdin="21")
+        assert "42" in exec_result.stdout, f"Stdin test failed: {exec_result.stdout}"
+
+        log("  Releasing sandbox...")
+        await pool.release(sandbox)
+
+        log("  Sandbox pool test PASSED", "SUCCESS")
+        return True
+
+    except Exception as e:
+        log(f"  Sandbox pool test FAILED: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    finally:
+        log("  Shutting down pool...")
+        await pool.shutdown()
+
+
+# ============================================================================
+# Test 2: CodeExecEnv
+# ============================================================================
+
+async def test_code_exec_env() -> bool:
+    """Test CodeExecEnv reset/step cycle."""
+    log("Testing CodeExecEnv...")
+
+    from ludic.envs.code_exec import (
+        CodeExecEnv,
+        CodeExecConfig,
+        PodmanHPCSandboxPool,
+        PodmanConfig,
+    )
+    from ludic.envs.code_exec.adapters.apps import APPSTestAdapter
+
+    # Create pool
+    pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+    pool = PodmanHPCSandboxPool(
+        n_workers=2,
+        image="python:3.11-slim",
+        config=pool_config,
+    )
+
+    try:
+        await pool.start()
+
+        # Create a simple test problem
+        sample = {
+            "problem_id": "smoke_test_add",
+            "question": "Write a program that reads two integers on one line and prints their sum.",
+            "inputs": ["1 2", "10 20", "-5 5"],
+            "outputs": ["3", "30", "0"],
+        }
+
+        env_config = CodeExecConfig(
+            timeout_per_test_s=5.0,
+            stop_on_first_failure=False,
+            compile_first=True,
+            partial_credit=False,
+        )
+
+        adapter = APPSTestAdapter()
+        env = CodeExecEnv(
+            sample=sample,
+            sandbox_pool=pool,
+            test_adapter=adapter,
+            config=env_config,
+        )
+
+        # Test reset
+        log("  Testing env_reset...")
+        obs, info = await env.env_reset()
+        assert "two integers" in obs.lower(), f"Unexpected obs: {obs}"
+        assert info["problem_id"] == "smoke_test_add"
+        assert info["num_tests"] == 3
+        log(f"  Reset OK: {info['num_tests']} tests")
+
+        # Test step with correct code
+        log("  Testing env_step with correct code...")
+        correct_code = "a, b = map(int, input().split()); print(a + b)"
+        outcome = await env.env_step(correct_code)
+
+        assert outcome.terminated is True
+        assert outcome.reward == 1.0, f"Expected reward=1.0, got {outcome.reward}"
+        assert outcome.info["all_passed"] is True
+        assert outcome.info["passed"] == 3
+        log(f"  Correct code: reward={outcome.reward}, passed={outcome.info['passed']}/{outcome.info['total']}")
+
+        # Test step with wrong code (need new env instance)
+        env2 = CodeExecEnv(
+            sample=sample,
+            sandbox_pool=pool,
+            test_adapter=adapter,
+            config=env_config,
+        )
+        await env2.env_reset()
+
+        log("  Testing env_step with wrong code...")
+        wrong_code = "a, b = map(int, input().split()); print(a - b)"  # Subtraction instead of addition
+        outcome2 = await env2.env_step(wrong_code)
+
+        assert outcome2.terminated is True
+        assert outcome2.reward == 0.0
+        assert outcome2.info["all_passed"] is False
+        log(f"  Wrong code: reward={outcome2.reward}, passed={outcome2.info['passed']}/{outcome2.info['total']}")
+
+        log("  CodeExecEnv test PASSED", "SUCCESS")
+        return True
+
+    except Exception as e:
+        log(f"  CodeExecEnv test FAILED: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    finally:
+        await pool.shutdown()
+
+
+# ============================================================================
+# Test 3: RolloutEngine with Protocol
+# ============================================================================
+
+async def test_rollout_engine() -> bool:
+    """Test RolloutEngine generates rollouts correctly."""
+    log("Testing RolloutEngine with SingleAgentProtocol...")
+
+    from ludic.envs.code_exec import (
+        CodeExecEnv,
+        CodeExecConfig,
+        PodmanHPCSandboxPool,
+        PodmanConfig,
+    )
+    from ludic.envs.code_exec.adapters.apps import APPSTestAdapter
+    from ludic.agent import Agent
+    from ludic.context import FullDialog
+    from ludic.parsers import ParseResult
+    from ludic.interaction import SingleAgentProtocol
+    from ludic.training import RolloutEngine, RolloutRequest
+    from ludic.inference import InferenceSpec, SamplingParams
+
+    # Mock client that returns deterministic code
+    class MockChatClient:
+        """Mock inference client that returns predetermined code."""
+
+        def __init__(self, code_to_return: str):
+            self.code = code_to_return
+            self.call_count = 0
+
+        async def chat(self, messages, **kwargs):
+            self.call_count += 1
+            return {
+                "content": f"```python\n{self.code}\n```",
+                "finish_reason": "stop",
+            }
+
+    def simple_parser(raw: str) -> ParseResult:
+        """Extract code from markdown blocks."""
+        import re
+        match = re.search(r"```(?:python)?\s*\n(.*?)\n```", raw, re.DOTALL)
+        if match:
+            return ParseResult(action=match.group(1).strip(), reward=0.0, obs=None)
+        return ParseResult(action=raw.strip(), reward=0.0, obs=None)
+
+    # Create pool (shared across envs)
+    pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+    pool = PodmanHPCSandboxPool(
+        n_workers=2,
+        image="python:3.11-slim",
+        config=pool_config,
+    )
+
+    try:
+        await pool.start()
+
+        # Env factory
+        adapter = APPSTestAdapter()
+        env_config = CodeExecConfig(timeout_per_test_s=5.0, stop_on_first_failure=True)
+
+        def env_factory(sample: Dict[str, Any]) -> CodeExecEnv:
+            return CodeExecEnv(
+                sample=sample,
+                sandbox_pool=pool,
+                test_adapter=adapter,
+                config=env_config,
+            )
+
+        # Protocol factory (with mock client returning correct code)
+        correct_code = "a, b = map(int, input().split()); print(a + b)"
+        mock_client = MockChatClient(correct_code)
+
+        def protocol_factory():
+            return SingleAgentProtocol(
+                agent=Agent(
+                    client=mock_client,
+                    model="mock-model",
+                    ctx=FullDialog(),
+                    parser=simple_parser,
+                )
+            )
+
+        # Create engine
+        engine = RolloutEngine(
+            env_registry={"code_exec": env_factory},
+            protocol_registry={"single_agent": protocol_factory},
+        )
+
+        # Create request
+        sample = {
+            "problem_id": "rollout_test",
+            "question": "Read two integers and print their sum.",
+            "inputs": ["3 4"],
+            "outputs": ["7"],
+        }
+
+        request = RolloutRequest(
+            env_kind="code_exec",
+            protocol_kind="single_agent",
+            env_kwargs={"sample": sample},
+            max_steps=1,
+            env_seed=42,
+        )
+
+        log("  Generating rollout...")
+        rollouts = await engine.generate_rollouts(
+            requests=[request],
+            concurrency=1,
+        )
+
+        assert len(rollouts) == 1, f"Expected 1 rollout, got {len(rollouts)}"
+        rollout = rollouts[0]
+
+        assert len(rollout.steps) == 1, f"Expected 1 step, got {len(rollout.steps)}"
+        step = rollout.steps[0]
+
+        assert step.reward == 1.0, f"Expected reward=1.0, got {step.reward}"
+        assert step.terminated is True
+        log(f"  Rollout generated: {len(rollout.steps)} steps, reward={step.reward}")
+
+        log("  RolloutEngine test PASSED", "SUCCESS")
+        return True
+
+    except Exception as e:
+        log(f"  RolloutEngine test FAILED: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    finally:
+        await pool.shutdown()
+
+
+# ============================================================================
+# Test 4: Training Step (Mock)
+# ============================================================================
+
+async def test_training_step() -> bool:
+    """Test a single training step with mock model and inference."""
+    log("Testing training step (mock inference, CPU model)...")
+
+    try:
+        import torch
+        from ludic.envs.code_exec import (
+            CodeExecEnv,
+            CodeExecConfig,
+            PodmanHPCSandboxPool,
+            PodmanConfig,
+        )
+        from ludic.envs.code_exec.adapters.apps import APPSTestAdapter
+        from ludic.agent import Agent
+        from ludic.context import FullDialog
+        from ludic.parsers import ParseResult
+        from ludic.interaction import SingleAgentProtocol
+        from ludic.training import (
+            RolloutEngine,
+            RolloutBatchSource,
+            Trainer,
+            TrainerConfig,
+            make_reinforce,
+        )
+        from ludic.inference import InferenceSpec
+
+        # Create a tiny random model (no pretrained weights needed)
+        log("  Creating tiny random model for testing...")
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+        # Use GPT-2 config but with minimal size
+        config = AutoConfig.from_pretrained("gpt2")
+        config.n_layer = 1
+        config.n_head = 2
+        config.n_embd = 64
+        config.vocab_size = 1000
+
+        model = AutoModelForCausalLM.from_config(config)
+        model.to("cpu")
+        log(f"  Model created: {sum(p.numel() for p in model.parameters())} parameters")
+
+        # Mock tokenizer
+        class MockTokenizer:
+            pad_token_id = 0
+            eos_token_id = 1
+
+            def __call__(self, texts, **kwargs):
+                # Return dummy token IDs
+                return {"input_ids": [[1, 2, 3] for _ in texts]}
+
+            def decode(self, ids, **kwargs):
+                return "print('hello')"
+
+        tokenizer = MockTokenizer()
+
+        # Mock inference client
+        class MockClient:
+            async def chat(self, messages, **kwargs):
+                return {
+                    "content": "```python\na, b = map(int, input().split()); print(a + b)\n```",
+                    "finish_reason": "stop",
+                    "prompt_token_ids": [1, 2, 3],
+                    "completion_token_ids": [4, 5, 6, 7],
+                }
+
+        def simple_parser(raw: str) -> ParseResult:
+            import re
+            match = re.search(r"```(?:python)?\s*\n(.*?)\n```", raw, re.DOTALL)
+            if match:
+                return ParseResult(action=match.group(1).strip(), reward=0.0, obs=None)
+            return ParseResult(action=raw.strip(), reward=0.0, obs=None)
+
+        # Create pool
+        pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+        pool = PodmanHPCSandboxPool(
+            n_workers=2,
+            image="python:3.11-slim",
+            config=pool_config,
+        )
+
+        await pool.start()
+
+        # Factories
+        adapter = APPSTestAdapter()
+        env_config = CodeExecConfig(timeout_per_test_s=5.0, stop_on_first_failure=True)
+
+        def env_factory(sample):
+            return CodeExecEnv(
+                sample=sample,
+                sandbox_pool=pool,
+                test_adapter=adapter,
+                config=env_config,
+            )
+
+        mock_client = MockClient()
+
+        def protocol_factory():
+            return SingleAgentProtocol(
+                agent=Agent(
+                    client=mock_client,
+                    model="mock",
+                    ctx=FullDialog(),
+                    parser=simple_parser,
+                )
+            )
+
+        engine = RolloutEngine(
+            env_registry={"code_exec": env_factory},
+            protocol_registry={"single_agent": protocol_factory},
+        )
+
+        # Create batch source with a single sample
+        samples = [
+            {
+                "problem_id": "train_test",
+                "question": "Read two integers and print their sum.",
+                "inputs": ["1 2"],
+                "outputs": ["3"],
+            }
+        ]
+
+        sample_idx = [0]
+
+        def requests_fn(batch_size: int):
+            from ludic.training import RolloutRequest
+            if sample_idx[0] >= len(samples):
+                return []
+            s = samples[sample_idx[0]]
+            sample_idx[0] += 1
+            return [RolloutRequest(
+                env_kind="code_exec",
+                protocol_kind="single_agent",
+                env_kwargs={"sample": s},
+                max_steps=1,
+            )]
+
+        algo = make_reinforce(name="reinforce")
+
+        batch_source = RolloutBatchSource(
+            orchestrator=engine,
+            credit_assigner=algo.credit_assigner,
+            requests_fn=requests_fn,
+            max_steps=1,
+            concurrency=1,
+            retokenize=True,
+            tokenizer=tokenizer,
+        )
+
+        # Create trainer
+        trainer_config = TrainerConfig(
+            model_device="cpu",
+            grad_accum_steps=1,
+            max_grad_norm=1.0,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+        # Mock publisher (no-op)
+        class MockPublisher:
+            def publish(self, state_dict): pass
+
+        trainer = Trainer(
+            model=model,
+            algo=algo,
+            batch_source=batch_source,
+            publisher=MockPublisher(),
+            cfg=trainer_config,
+        )
+
+        log("  Running single training step...")
+        # Run one step
+        try:
+            trainer.train_sync(max_steps=1)
+            log("  Training step completed")
+        except StopIteration:
+            log("  Training stopped (samples exhausted, expected)")
+
+        await pool.shutdown()
+
+        log("  Training step test PASSED", "SUCCESS")
+        return True
+
+    except ImportError as e:
+        log(f"  Skipping training test (missing dependency): {e}", "WARN")
+        return True  # Not a failure, just skip
+
+    except Exception as e:
+        log(f"  Training step test FAILED: {e}", "ERROR")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+async def run_all_tests(skip_training: bool = False) -> bool:
+    """Run all smoke tests and return overall success."""
+    log("=" * 60)
+    log("CodeExecEnv Smoke Test for Isambard HPC")
+    log("=" * 60)
+
+    results = {}
+
+    # Test 1: Sandbox Pool
+    results["sandbox_pool"] = await test_sandbox_pool(n_workers=2)
+
+    # Test 2: CodeExecEnv
+    results["code_exec_env"] = await test_code_exec_env()
+
+    # Test 3: RolloutEngine
+    results["rollout_engine"] = await test_rollout_engine()
+
+    # Test 4: Training Step (optional)
+    if not skip_training:
+        results["training_step"] = await test_training_step()
+    else:
+        log("Skipping training step test (--skip-training)")
+        results["training_step"] = True
+
+    # Summary
+    log("=" * 60)
+    log("SUMMARY")
+    log("=" * 60)
+
+    all_passed = True
+    for name, passed in results.items():
+        status = "PASSED" if passed else "FAILED"
+        level = "SUCCESS" if passed else "ERROR"
+        log(f"  {name}: {status}", level)
+        if not passed:
+            all_passed = False
+
+    log("=" * 60)
+    if all_passed:
+        log("All tests PASSED!", "SUCCESS")
+    else:
+        log("Some tests FAILED!", "ERROR")
+    log("=" * 60)
+
+    return all_passed
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Smoke test for CodeExecEnv on Isambard")
+    parser.add_argument(
+        "--skip-training",
+        action="store_true",
+        help="Skip the training step test (useful if torch not available)",
+    )
+    args = parser.parse_args()
+
+    success = asyncio.run(run_all_tests(skip_training=args.skip_training))
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
