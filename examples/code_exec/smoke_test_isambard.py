@@ -47,18 +47,28 @@ def log(msg: str, level: str = "INFO") -> None:
 # Test 1: Podman-HPC Sandbox Pool
 # ============================================================================
 
-async def test_sandbox_pool(n_workers: int = 2) -> bool:
+async def test_sandbox_pool(n_workers: int = 2, minimal_config: bool = True) -> bool:
     """Test that we can create and use a Podman-HPC sandbox pool."""
     log("Testing Podman-HPC sandbox pool...")
 
     from ludic.envs.code_exec import PodmanHPCSandboxPool, PodmanConfig
     from ludic.envs.code_exec.types import CompileStatus, RunStatus
 
-    config = PodmanConfig(
-        memory_limit="128m",
-        network_disabled=True,
-        gpu=False,  # CPU only
-    )
+    # Use minimal config for HPC compatibility (some clusters don't support
+    # --memory or --network none flags)
+    if minimal_config:
+        log("  Using minimal config (no memory/network limits) for HPC compatibility")
+        config = PodmanConfig(
+            memory_limit=None,  # Skip --memory flag
+            network_disabled=False,  # Skip --network none flag
+            gpu=False,
+        )
+    else:
+        config = PodmanConfig(
+            memory_limit="128m",
+            network_disabled=True,
+            gpu=False,
+        )
 
     pool = PodmanHPCSandboxPool(
         n_workers=n_workers,
@@ -112,7 +122,7 @@ async def test_sandbox_pool(n_workers: int = 2) -> bool:
 # Test 2: CodeExecEnv
 # ============================================================================
 
-async def test_code_exec_env() -> bool:
+async def test_code_exec_env(minimal_config: bool = True) -> bool:
     """Test CodeExecEnv reset/step cycle."""
     log("Testing CodeExecEnv...")
 
@@ -124,8 +134,11 @@ async def test_code_exec_env() -> bool:
     )
     from ludic.envs.code_exec.adapters.apps import APPSTestAdapter
 
-    # Create pool
-    pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+    # Use minimal config for HPC compatibility
+    if minimal_config:
+        pool_config = PodmanConfig(memory_limit=None, network_disabled=False, gpu=False)
+    else:
+        pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
     pool = PodmanHPCSandboxPool(
         n_workers=2,
         image="python:3.11-slim",
@@ -212,7 +225,7 @@ async def test_code_exec_env() -> bool:
 # Test 3: RolloutEngine with Protocol
 # ============================================================================
 
-async def test_rollout_engine() -> bool:
+async def test_rollout_engine(minimal_config: bool = True) -> bool:
     """Test RolloutEngine generates rollouts correctly."""
     log("Testing RolloutEngine with SingleAgentProtocol...")
 
@@ -253,8 +266,11 @@ async def test_rollout_engine() -> bool:
             return ParseResult(action=match.group(1).strip(), reward=0.0, obs=None)
         return ParseResult(action=raw.strip(), reward=0.0, obs=None)
 
-    # Create pool (shared across envs)
-    pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+    # Use minimal config for HPC compatibility
+    if minimal_config:
+        pool_config = PodmanConfig(memory_limit=None, network_disabled=False, gpu=False)
+    else:
+        pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
     pool = PodmanHPCSandboxPool(
         n_workers=2,
         image="python:3.11-slim",
@@ -345,7 +361,7 @@ async def test_rollout_engine() -> bool:
 # Test 4: Training Step (Mock)
 # ============================================================================
 
-async def test_training_step() -> bool:
+async def test_training_step(minimal_config: bool = True) -> bool:
     """Test a single training step with mock model and inference."""
     log("Testing training step (mock inference, CPU model)...")
 
@@ -417,8 +433,11 @@ async def test_training_step() -> bool:
                 return ParseResult(action=match.group(1).strip(), reward=0.0, obs=None)
             return ParseResult(action=raw.strip(), reward=0.0, obs=None)
 
-        # Create pool
-        pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+        # Use minimal config for HPC compatibility
+        if minimal_config:
+            pool_config = PodmanConfig(memory_limit=None, network_disabled=False, gpu=False)
+        else:
+            pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
         pool = PodmanHPCSandboxPool(
             n_workers=2,
             image="python:3.11-slim",
@@ -541,26 +560,31 @@ async def test_training_step() -> bool:
 # Main
 # ============================================================================
 
-async def run_all_tests(skip_training: bool = False) -> bool:
+async def run_all_tests(skip_training: bool = False, minimal_config: bool = True) -> bool:
     """Run all smoke tests and return overall success."""
     log("=" * 60)
     log("CodeExecEnv Smoke Test for Isambard HPC")
+    log("=" * 60)
+    if minimal_config:
+        log("Using MINIMAL config (no memory/network limits) for HPC compatibility")
+    else:
+        log("Using FULL config (memory + network limits)")
     log("=" * 60)
 
     results = {}
 
     # Test 1: Sandbox Pool
-    results["sandbox_pool"] = await test_sandbox_pool(n_workers=2)
+    results["sandbox_pool"] = await test_sandbox_pool(n_workers=2, minimal_config=minimal_config)
 
     # Test 2: CodeExecEnv
-    results["code_exec_env"] = await test_code_exec_env()
+    results["code_exec_env"] = await test_code_exec_env(minimal_config=minimal_config)
 
     # Test 3: RolloutEngine
-    results["rollout_engine"] = await test_rollout_engine()
+    results["rollout_engine"] = await test_rollout_engine(minimal_config=minimal_config)
 
     # Test 4: Training Step (optional)
     if not skip_training:
-        results["training_step"] = await test_training_step()
+        results["training_step"] = await test_training_step(minimal_config=minimal_config)
     else:
         log("Skipping training step test (--skip-training)")
         results["training_step"] = True
@@ -595,9 +619,17 @@ def main():
         action="store_true",
         help="Skip the training step test (useful if torch not available)",
     )
+    parser.add_argument(
+        "--full-config",
+        action="store_true",
+        help="Use full config with memory/network limits (may not work on all HPC systems)",
+    )
     args = parser.parse_args()
 
-    success = asyncio.run(run_all_tests(skip_training=args.skip_training))
+    success = asyncio.run(run_all_tests(
+        skip_training=args.skip_training,
+        minimal_config=not args.full_config,
+    ))
     sys.exit(0 if success else 1)
 
 

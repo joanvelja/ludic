@@ -53,28 +53,31 @@ else
     podman-hpc pull python:3.11-slim
 fi
 
-# Activate Python environment if using conda/venv
-# Uncomment and modify as needed for your setup:
-# source /path/to/your/venv/bin/activate
-# conda activate your-env
+# Ensure we're in the repo root
+if [ ! -f "pyproject.toml" ]; then
+    echo "ERROR: Must run from repo root (pyproject.toml not found)"
+    exit 1
+fi
 
 echo ""
-echo "Python: $(which python)"
-echo "Python version: $(python --version)"
+echo "Using uv for Python environment"
+echo "uv version: $(uv --version 2>&1 || echo 'not found')"
 
-# Set PYTHONPATH if running from repo root
-if [ -f "pyproject.toml" ]; then
-    export PYTHONPATH="${PWD}:${PYTHONPATH}"
-    echo "PYTHONPATH set to include ${PWD}"
-fi
+echo ""
+echo "========================================"
+echo "Running diagnostic first..."
+echo "========================================"
+
+# Run diagnostic to check what podman-hpc flags work
+uv run python examples/code_exec/diagnose_podman.py
 
 echo ""
 echo "========================================"
 echo "Running smoke tests..."
 echo "========================================"
 
-# Run the smoke test
-python examples/code_exec/smoke_test_isambard.py
+# Run the smoke test (uses minimal config by default for HPC compatibility)
+uv run python examples/code_exec/smoke_test_isambard.py
 
 EXIT_CODE=$?
 

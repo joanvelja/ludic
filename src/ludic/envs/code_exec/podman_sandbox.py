@@ -130,12 +130,14 @@ class PodmanHPCSandbox:
         # Image and command
         cmd.extend([self._image, "sleep", "infinity"])
 
-        await self._run_podman(*cmd)
+        # Capture stderr to provide useful error messages
+        await self._run_podman(*cmd, capture=True)
 
         # Ensure workspace directory exists
         await self._run_podman(
             "exec", self._container_name,
-            "mkdir", "-p", self._config.working_dir
+            "mkdir", "-p", self._config.working_dir,
+            capture=True,
         )
 
         self._started = True
