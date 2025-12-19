@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import inspect
 from typing import Optional, List
 
 from ludic.envs.env import LudicEnv
@@ -8,14 +10,47 @@ from ludic.inference.request import InferenceSpec
 from .base import InteractionProtocol
 from .info import merge_step_info
 
-class SingleAgentSyncProtocol(InteractionProtocol):
+
+def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
     """
-    Implements the standard single-agent, synchronous interaction loop.
-    
+    Detect if environment has async env_reset/env_step methods.
+
+    WARNING: If this returns (True, True), you MUST use the async methods
+    directly (env.env_reset(), env.env_step()) rather than the sync wrappers
+    (env.reset(), env.step()). Calling sync wrappers on an async env will
+    return coroutine objects instead of results.
+
+    This is used to support envs like CodeExecEnv that have async methods
+    while maintaining backward compatibility with sync envs.
+
+    Returns:
+        Tuple of (has_async_reset, has_async_step)
+    """
+    has_async_reset = (
+        hasattr(env, "env_reset")
+        and inspect.iscoroutinefunction(env.env_reset)
+    )
+    has_async_step = (
+        hasattr(env, "env_step")
+        and inspect.iscoroutinefunction(env.env_step)
+    )
+    return has_async_reset, has_async_step
+
+class SingleAgentProtocol(InteractionProtocol):
+    """
+    Implements the standard single-agent interaction loop.
+
     This protocol consumes a LudicEnv but ASSUMES it has exactly
     one agent and that this agent is active every step.
-    
+
     It works perfectly with any env inheriting from SingleAgentEnv.
+
+    Async env support:
+      This protocol automatically detects envs with async `env_reset` and
+      `env_step` methods (e.g., CodeExecEnv). For such envs, the protocol
+      calls these methods directly and awaits them, bypassing the sync
+      wrappers in SingleAgentEnv. This provides full backward compatibility
+      with sync envs while supporting async envs transparently.
 
     Parser failures:
       If the agent's parser returns ParseResult.action=None, the protocol
@@ -69,15 +104,22 @@ class SingleAgentSyncProtocol(InteractionProtocol):
         agent_ids = env.agent_ids
         if len(agent_ids) != 1:
             raise ValueError(
-                f"SingleAgentSyncProtocol requires a LudicEnv with "
+                f"SingleAgentProtocol requires a LudicEnv with "
                 f"exactly one agent, but found {len(agent_ids)}."
             )
         agent_id = agent_ids[0]
 
+        # Check for async env methods (e.g., CodeExecEnv)
+        has_async_reset, has_async_step = _has_async_env_methods(env)
+
         # 2. --- Reset Env ---
-        # env.reset() returns a dict
-        obs_info_dict = env.reset(seed=env_seed)
-        obs, info = obs_info_dict[agent_id]
+        # For async envs, call env_reset directly and await it.
+        # For sync envs, use the standard reset() wrapper.
+        if has_async_reset:
+            obs, info = await env.env_reset(seed=env_seed)  # type: ignore[union-attr]
+        else:
+            obs_info_dict = env.reset(seed=env_seed)
+            obs, info = obs_info_dict[agent_id]
         
         # 3. --- Reset Agent & Feed First Obs ---
         # Choose system prompt: prefer the context's default if set, else env suggestion.
@@ -147,12 +189,14 @@ class SingleAgentSyncProtocol(InteractionProtocol):
                 parsed_action = parse_result.action
                 parser_reward = parse_result.reward
 
-                # Send action to env in the required dict format
-                actions_dict = {agent_id: parsed_action}
-                outcomes_dict = env.step(actions_dict)
-
-                # Unwrap the outcome for our agent
-                env_outcome = outcomes_dict[agent_id]
+                # For async envs, call env_step directly and await it.
+                # For sync envs, use the standard step() wrapper.
+                if has_async_step:
+                    env_outcome = await env.env_step(parsed_action)  # type: ignore[union-attr]
+                else:
+                    actions_dict = {agent_id: parsed_action}
+                    outcomes_dict = env.step(actions_dict)
+                    env_outcome = outcomes_dict[agent_id]
                 
                 # Combine parser and env rewards
                 total_reward = env_outcome.reward + parser_reward

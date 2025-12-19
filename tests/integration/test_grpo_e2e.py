@@ -22,7 +22,7 @@ from ludic.training.credit_assignment import (
     GroupNormalizedReturn,
 )
 from ludic.interaction.base import InteractionProtocol
-from ludic.interaction.single_agent import SingleAgentSyncProtocol
+from ludic.interaction.single_agent import SingleAgentProtocol
 
 from tests._mocks import SeedableMockAgent
 
@@ -127,7 +127,7 @@ async def test_grpo_e2e_seed_grouping_and_credit() -> None:
     # This creates a new agent worker for each concurrent rollout
     def create_protocol() -> InteractionProtocol:
         agent = SeedableMockAgent(seed_map=seed_to_action_map)
-        return SingleAgentSyncProtocol(agent=agent)
+        return SingleAgentProtocol(agent=agent)
     # -----------------------------------
     
     protocol_registry = {

@@ -22,7 +22,7 @@ from ludic.inference import (
     SamplingParams,
     ReturnSpec,
 )
-from ludic.interaction import SingleAgentSyncProtocol
+from ludic.interaction import SingleAgentProtocol
 from ludic.parsers import ParseResult
 from ludic.training.batching.rollout_engine import RolloutEngine
 
@@ -88,14 +88,14 @@ def build_single_agent_engine(
 ) -> RolloutEngine:
     make_ctx = context_factory or (lambda sp: FullDialog(system_prompt=sp))
 
-    def protocol_factory() -> SingleAgentSyncProtocol:
+    def protocol_factory() -> SingleAgentProtocol:
         agent = Agent(
             client=client,
             model=model,
             ctx=make_ctx(system_prompt),
             parser=parser,
         )
-        return SingleAgentSyncProtocol(
+        return SingleAgentProtocol(
             agent=agent,
             stop_on_parse_error=stop_on_parse_error,
         )
