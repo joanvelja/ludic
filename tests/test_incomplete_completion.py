@@ -27,7 +27,7 @@ async def test_agent_rejects_incomplete_completion_by_default() -> None:
     agent.reset(system_prompt=None)
     agent.on_env_reset("obs", {})
 
-    parse_result, raw, info = await agent.act()
+    parse_result, raw, info, _ = await agent.act()
 
     assert raw == "RAW"
     assert parse_result.action is None
@@ -50,7 +50,7 @@ async def test_agent_can_allow_incomplete_completion() -> None:
     agent.reset(system_prompt=None)
     agent.on_env_reset("obs", {})
 
-    parse_result, raw, info = await agent.act()
+    parse_result, raw, info, _ = await agent.act()
 
     assert raw == "1"
     assert parse_result.action == "1"

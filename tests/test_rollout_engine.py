@@ -445,7 +445,7 @@ async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
         num_episodes=1,
     )
 
-    with pytest.raises(ValueError, match="Missing rollout-time token IDs"):
+    with pytest.raises(ValueError, match="Missing rollout-time token trace"):
         await engine.generate_batch(
             requests=[request],
             max_steps=2,

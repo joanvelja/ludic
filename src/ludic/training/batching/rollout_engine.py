@@ -9,13 +9,15 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ludic.envs.env import LudicEnv
 from ludic.interaction.base import InteractionProtocol
-from ludic.types import Rollout
+from ludic.types import Rollout, Step, TokenTrace
 from ludic.inference.request import InferenceSpec
 
 from ludic.training.types import (
     CreditAssigner,
     SAWItem,
     SAWBatch,
+    ActorTokenLogps,
+    SampleAttachments,
     RolloutRequest,
     ProtocolSpec,
     EnvSpec,
@@ -32,12 +34,11 @@ ProtocolFactory = Callable[..., InteractionProtocol]
 EnvRegistry = Dict[str, EnvFactory]
 ProtocolRegistry = Dict[str, ProtocolFactory]
 
-_TOKEN_TRACE_KEYS = {
+_INFO_TRACE_KEYS = {
     "prompt_token_ids",
     "completion_token_ids",
     "completion_logprobs",
 }
-
 
 def _require_finite(value: float, *, what: str, rollout_id: str, step_index: int) -> None:
     if not math.isfinite(value):
@@ -64,19 +65,20 @@ def _get_credit_weight(
     return w
 
 
-def _extract_model_token_ids(
-    info: Mapping[str, Any],
-) -> Optional[Tuple[List[int], List[int]]]:
-    prompt_ids = info.get("prompt_token_ids")
-    completion_ids = info.get("completion_token_ids")
-    if (
-        isinstance(prompt_ids, list)
-        and isinstance(completion_ids, list)
-        and all(isinstance(t, int) for t in prompt_ids)
-        and all(isinstance(t, int) for t in completion_ids)
-    ):
-        return prompt_ids, completion_ids
-    return None
+def _require_token_trace(
+    step: Step,
+    *,
+    rollout_id: str,
+    step_index: int,
+) -> TokenTrace:
+    trace = step.trace
+    if trace is None:
+        raise ValueError(
+            f"Missing rollout-time token trace for rollout {rollout_id}, step {step_index}. "
+            "Online RL batching requires Step.trace with prompt/completion token IDs "
+            "(and optional completion_logprobs)."
+        )
+    return trace
 
 
 def _coerce_completion_logprobs(
@@ -129,8 +131,11 @@ def _base_item_meta(
         **(rollout.meta),  # Rollout-level meta (includes episode_truncated, truncation_reason)
     }
 
+def _strip_trace_info(info: Mapping[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in info.items() if k not in _INFO_TRACE_KEYS}
 
-def _saw_item_from_model_ids(
+
+def _build_saw_item_from_token_trace(
     *,
     rollout: Rollout,
     step_index: int,
@@ -145,6 +150,19 @@ def _saw_item_from_model_ids(
     truncated: bool,
     terminated: bool,
 ) -> Tuple[SAWItem, int]:
+    """
+    Build one SAWItem from a rollout step + rollout-time token trace.
+
+    This is the canonical “token-in / token-out” collation path for online RL:
+      - `prompt_ids` + `completion_ids` become `input_ids` with a matching
+        `action_mask` that is 1 on completion tokens.
+      - `completion_logprobs` (if provided by the inference client) are attached as
+        typed `attachments.actor_logps`, aligned 1:1 with `completion_ids`.
+      - Step metadata is stored in JSON `meta` for logging/filtering/debugging.
+
+    Returns:
+      - (SAWItem, comp_len) where comp_len is the number of completion tokens.
+    """
     input_ids = list(prompt_ids) + list(completion_ids)
     attention_mask = [1] * len(input_ids)
     action_mask = [0] * len(prompt_ids) + [1] * len(completion_ids)
@@ -161,9 +179,12 @@ def _saw_item_from_model_ids(
         terminated=terminated,
         prompt_len=len(prompt_ids),
     )
-    meta.update(step_info)
+    meta.update(_strip_trace_info(step_info))
+    attachments = SampleAttachments()
     if completion_logprobs is not None:
-        meta["completion_logprobs"] = completion_logprobs
+        attachments = SampleAttachments(
+            actor_logps=ActorTokenLogps(token_logps=completion_logprobs)
+        )
 
     return (
         SAWItem(
@@ -172,6 +193,7 @@ def _saw_item_from_model_ids(
             action_mask=action_mask,
             weight=weight,
             meta=meta,
+            attachments=attachments,
         ),
         comp_len,
     )
@@ -283,6 +305,11 @@ class RolloutEngine:
                         "sampling_seed": run_sampling_seed,
                         "forced_env_seed": is_forced_env_seed,
                         "forced_sampling_seed": is_forced_sampling_seed,
+                        "return_spec": {
+                            "return_token_ids": bool(inf.return_.return_token_ids),
+                            "return_chosen_logprobs": bool(inf.return_.return_chosen_logprobs),
+                            "top_logprobs_k": int(inf.return_.top_logprobs_k),
+                        },
                     }
                 )
 
@@ -378,7 +405,7 @@ class RolloutEngine:
 
         Tokenization strategy:
         - Online RL requires rollout-time token IDs:
-          Step.info must contain `prompt_token_ids` and `completion_token_ids`.
+          Step.trace must contain prompt/completion token IDs.
 
         Filtering:
         - If sample_filter is provided, it's applied after SAWItems are created.
@@ -402,39 +429,42 @@ class RolloutEngine:
                 _require_finite(reward, what="reward", rollout_id=r.id, step_index=step.index)
 
                 info = step.info or {}
-                model_ids = _extract_model_token_ids(info)
-
-                if model_ids is not None:
-                    prompt_ids, completion_ids = model_ids
-                    prompt_len = len(prompt_ids)
-                    completion_logprobs = _coerce_completion_logprobs(
-                        info.get("completion_logprobs"),
-                        completion_ids=completion_ids,
-                        rollout_id=r.id,
-                        step_index=step.index,
-                    )
-                    item, comp_len = _saw_item_from_model_ids(
-                        rollout=r,
-                        step_index=step.index,
-                        reward=reward,
-                        weight=w,
-                        prev_obs=step.prev_obs,
-                        action=step.action,
-                        prompt_ids=prompt_ids,
-                        completion_ids=completion_ids,
-                        step_info=info,
-                        completion_logprobs=completion_logprobs,
-                        truncated=step.truncated,
-                        terminated=step.terminated,
-                    )
-                    items_with_lengths.append((item, prompt_len, comp_len))
-                else:
+                trace = _require_token_trace(step, rollout_id=r.id, step_index=step.index)
+                prompt_ids = list(trace.prompt_token_ids)
+                completion_ids = list(trace.completion_token_ids)
+                prompt_len = len(prompt_ids)
+                completion_logprobs = _coerce_completion_logprobs(
+                    trace.completion_logprobs,
+                    completion_ids=completion_ids,
+                    rollout_id=r.id,
+                    step_index=step.index,
+                )
+                require_chosen_logprobs = bool(
+                    (r.meta.get("engine") or {})
+                    .get("return_spec", {})
+                    .get("return_chosen_logprobs", False)
+                )
+                if require_chosen_logprobs and completion_logprobs is None:
                     raise ValueError(
-                        f"Missing rollout-time token IDs for rollout {r.id}, step {step.index}. "
-                        "Online RL batching requires Step.info['prompt_token_ids'] and "
-                        "Step.info['completion_token_ids'] (and optionally completion_logprobs). "
-                        "Fix your inference client to return token IDs."
+                        f"Missing completion_logprobs for rollout {r.id}, step {step.index}, "
+                        "but the rollout was executed with return_spec.return_chosen_logprobs=True. "
+                        "Fix your inference client to return chosen-token logprobs (e.g. ReturnSpec.for_rl())."
                     )
+                item, comp_len = _build_saw_item_from_token_trace(
+                    rollout=r,
+                    step_index=step.index,
+                    reward=reward,
+                    weight=w,
+                    prev_obs=step.prev_obs,
+                    action=step.action,
+                    prompt_ids=prompt_ids,
+                    completion_ids=completion_ids,
+                    step_info=info,
+                    completion_logprobs=completion_logprobs,
+                    truncated=step.truncated,
+                    terminated=step.terminated,
+                )
+                items_with_lengths.append((item, prompt_len, comp_len))
 
         # ---- Apply sample filter ------------------------------------------
         num_before_filter = len(items_with_lengths)

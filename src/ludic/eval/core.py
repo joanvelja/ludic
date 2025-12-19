@@ -27,8 +27,9 @@ def _eval_items_from_rollout(rollout: Rollout) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     for step in rollout.steps:
         info = step.info or {}
-        completion_ids = info.get("completion_token_ids") or []
-        comp_len = len(completion_ids) if isinstance(completion_ids, list) else 0
+        trace = step.trace
+        completion_ids = trace.completion_token_ids if trace is not None else []
+        comp_len = len(completion_ids)
 
         meta: Dict[str, Any] = {
             "rollout_id": rollout.id,

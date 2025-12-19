@@ -146,7 +146,7 @@ class SingleAgentProtocol(InteractionProtocol):
             current_obs_for_step = obs
             
             # --- A. Call the Agent ---
-            parse_result, raw_action, client_info = await agent.act(
+            parse_result, raw_action, client_info, token_trace = await agent.act(
                 inference=inf,
                 sampling_seed=sampling_seed,
                 timeout_s=timeout_s
@@ -168,6 +168,7 @@ class SingleAgentProtocol(InteractionProtocol):
                         client_info=client_info,
                         extra={"parse_error": True},
                     ),
+                    trace=token_trace,
                 )
                 
                 # Log this failure step
@@ -180,6 +181,7 @@ class SingleAgentProtocol(InteractionProtocol):
                     truncated=outcome.truncated,
                     terminated=outcome.terminated,
                     info=outcome.info,
+                    trace=outcome.trace,
                 ))
                 # When stopping on parse error, we still want to feed the synthetic
                 # observation back into the context before exiting.
@@ -214,7 +216,8 @@ class SingleAgentProtocol(InteractionProtocol):
                     reward=total_reward,
                     truncated=env_outcome.truncated,
                     terminated=env_outcome.terminated,
-                    info=step_info
+                    info=step_info,
+                    trace=token_trace,
                 )
 
                 # Log this success step
@@ -231,6 +234,7 @@ class SingleAgentProtocol(InteractionProtocol):
                     truncated=outcome.truncated,
                     terminated=outcome.terminated,
                     info=step_info,
+                    trace=outcome.trace,
                 ))
 
             # --- D. Update state for next loop ---

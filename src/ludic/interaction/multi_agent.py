@@ -132,7 +132,7 @@ class MultiAgentProtocol(InteractionProtocol):
             # Temporary storage to hold data needed for logging after the env step
             step_context_cache: Dict[str, Dict] = {}
 
-            for agent_id, (parse_result, raw, info) in zip(
+            for agent_id, (parse_result, raw, info, token_trace) in zip(
                 agents_to_poll.keys(), results
             ):
                 # Cache context for this specific agent's step
@@ -141,6 +141,7 @@ class MultiAgentProtocol(InteractionProtocol):
                     "raw_action": raw,
                     "client_info": info,
                     "parse_result": parse_result,
+                    "token_trace": token_trace,
                 }
 
                 if parse_result.action is not None:
@@ -157,6 +158,7 @@ class MultiAgentProtocol(InteractionProtocol):
             for agent_id, ctx in step_context_cache.items():
                 parse_result = ctx["parse_result"]
                 client_info = ctx["client_info"]
+                token_trace = ctx.get("token_trace")
 
                 # Did parsing fail?
                 if parse_result.action is None:
@@ -171,6 +173,7 @@ class MultiAgentProtocol(InteractionProtocol):
                             client_info=client_info,
                             extra={"parse_error": True},
                         ),
+                        trace=token_trace,
                     )
                 else:
                     # Normal environment outcome
@@ -192,6 +195,7 @@ class MultiAgentProtocol(InteractionProtocol):
                             client_info=client_info,
                             env_info=raw_outcome.info,
                         ),
+                        trace=token_trace,
                     )
 
                 # Track if this agent has finished
@@ -212,6 +216,7 @@ class MultiAgentProtocol(InteractionProtocol):
                     truncated=outcome.truncated,
                     terminated=outcome.terminated,
                     info=outcome.info,
+                    trace=outcome.trace,
                 )
                 collector.add(agent_id, step)
 
