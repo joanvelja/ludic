@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from functools import partial
 from typing import List
 
@@ -42,7 +43,7 @@ from ludic.training import (
     GRPORequestStrategy,
     ReinforceLoss,
 )
-from ludic.training import Reducer, RichLiveLogger
+from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger
 
 # STRICT: require <think>...</think> then exactly one <move>...</move>.
 # Success reward is set to 0.0 so multiple turns do not gain extra parser reward.
@@ -110,10 +111,17 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints_tictactoe", help="Checkpoint output directory.")
     parser.add_argument("--checkpoint-every", type=int, default=10, help="Checkpoint every N steps (0 to disable).")
     parser.add_argument("--max-to-keep", type=int, default=2, help="Max checkpoints to keep.")
+    parser.add_argument("--grad-accum-steps", type=int, default=6, help="Gradient accumulation steps.")
     parser.add_argument("--ctx", choices=["full", "truncated"], default="full",
                         help="Context strategy: 'full' (FullDialog) or 'truncated' (TruncatedThinkingContext)")
     parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
     parser.add_argument("--positive-only", action="store_true", help="Only learn from positive advantages; clip negative ones to 0.")
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="rich",
+        help="Comma-separated loggers: rich, print, wandb, none.",
+    )
 
     args = parser.parse_args()
 
@@ -216,7 +224,7 @@ def main():
     # Trainer
     cfg = TrainerConfig(
         model_device="cuda" if torch.cuda.is_available() else "cpu",
-        grad_accum_steps=6,
+        grad_accum_steps=args.grad_accum_steps,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         lr=5e-5,
@@ -282,33 +290,62 @@ def main():
         ),
     }
 
-    train_logger = RichLiveLogger(
-        keys=[
-            "loss",
-            "avg_total_reward",
-            "win_rate",
-            "loss_rate",
-            "draw_rate",
-            "illegal_rate",
-            "parse_error_rate",
-            "truncated_rate",
-            "avg_prompt_length",
-            "avg_completion_length",
-            "total_completion_tokens",
-            "eval_win_rate",
-            "eval_loss_rate",
-            "eval_draw_rate",
-            "eval_illegal_rate",
-            "eval_parse_error_rate",
-            "eval_truncated_rate",
-            "eval_avg_completion_tokens",
-            "num_rollouts",
-            "num_samples",
-        ],
-        spark_key="avg_total_reward",
-        history=100,
-        precision=4,
-    )
+    logger_keys = [
+        "train/loss",
+        "train/avg_total_reward",
+        "train/win_rate",
+        "train/loss_rate",
+        "train/draw_rate",
+        "train/illegal_rate",
+        "train/parse_error_rate",
+        "train/truncated_rate",
+        "train/avg_prompt_length",
+        "train/avg_completion_length",
+        "train/total_completion_tokens",
+        "eval/win_rate",
+        "eval/loss_rate",
+        "eval/draw_rate",
+        "eval/illegal_rate",
+        "eval/parse_error_rate",
+        "eval/truncated_rate",
+        "eval/avg_completion_tokens",
+        "train/num_rollouts",
+        "train/num_samples",
+    ]
+
+    raw_logger = args.logger or "rich"
+    logger_tokens = [tok.strip().lower() for tok in raw_logger.replace("+", ",").split(",") if tok.strip()]
+    valid_loggers = {"rich", "print", "wandb", "none"}
+    unknown = [tok for tok in logger_tokens if tok not in valid_loggers]
+    if unknown:
+        raise SystemExit(f"Unknown logger(s): {unknown}. Valid: {sorted(valid_loggers)}")
+    if "none" in logger_tokens:
+        logger_tokens = ["none"]
+
+    train_logger = None
+    console_logger = None
+    if "print" in logger_tokens:
+        console_logger = PrintLogger(prefix="[trainer]", keys=logger_keys, precision=4)
+    elif "rich" in logger_tokens:
+        if not sys.stdout.isatty():
+            console_logger = PrintLogger(prefix="[trainer]", keys=logger_keys, precision=4)
+        else:
+            console_logger = RichLiveLogger(
+                keys=logger_keys,
+                spark_key="train/avg_total_reward",
+                history=100,
+                precision=4,
+            )
+
+    wandb_logger = None
+    if "wandb" in logger_tokens:
+        wandb_logger = WandbLogger(config=dict(vars(args)))
+
+    if logger_tokens != ["none"]:
+        if console_logger and wandb_logger:
+            train_logger = TeeLogger(console_logger, wandb_logger)
+        else:
+            train_logger = console_logger or wandb_logger
 
     eval_reducers = {
         "win_rate": Reducer(kind="count_true", source="result", transform=lambda v: v == "win", normalize_by="rollouts", as_percent=True),

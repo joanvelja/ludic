@@ -201,9 +201,9 @@ def main() -> None:
         for step in range(total_steps):
             stats = await trainer.train_step()
             if rank == 0 and (step % args.log_every == 0):
-                loss_val = stats.get("loss")
+                loss_val = stats.get("train/loss")
                 loss_str = f"{loss_val:.4f}" if loss_val is not None else "n/a"
-                logp_val = stats.get("logp_mean")
+                logp_val = stats.get("train/logp_mean")
                 logp_str = f"{logp_val:.4f}" if logp_val is not None else "n/a"
                 print(
                     f"[step {step + 1}/{total_steps}] loss={loss_str} logp_mean={logp_str} "

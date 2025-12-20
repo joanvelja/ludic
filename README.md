@@ -44,6 +44,12 @@ If you want to find your way around quickly, there are two main things in here: 
 
 If you care about truncation semantics (env time limits vs protocol cutoffs vs model finish reasons), read `CONSIDERATIONS.md`.
 
+### Logging
+
+- Training stats use canonical prefixes: `train/`, `eval/`, and `perf/` (e.g., `train/loss`, `eval/accuracy`, `perf/gpu_mem_alloc_mb`).
+- `train/step` and `eval/step` are used by loggers to annotate panels and runs.
+- For W&B logging, set `WANDB_PROJECT` to your preferred project name; if unset, it defaults to `Ludic`.
+
 ### Examples at a glance
 
 - Tic-Tac-Toe (`examples/tic_tac_toe/`): a small env that’s useful for iterating on the full stack without paying a huge sampling bill.

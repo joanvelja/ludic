@@ -33,8 +33,8 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/gsm8k/train_gsm8k.py 
 Notes:
 - `PYTHONPATH=.` ensures local imports resolve.
 - Defaults connect to vLLM at `127.0.0.1:8000`; override `--host/--port` if you run it elsewhere.
-- Tweak batch size, concurrency, and limits via flags like `--batch-size`, `--concurrency`, `--limit`, `--train-steps`, `--group-size`, `--eval-every`, `--eval-limit`, `--eval-temperature`.
-- Tune `--limit`, `--concurrency`, and `--train-steps` to fit your budget/VRAM.
+- Tweak batch size, concurrency, and limits via flags like `--batch-size`, `--concurrency`, `--limit`, `--train-steps`, `--grad-accum-steps`, `--group-size`, `--eval-every`, `--eval-limit`, `--eval-temperature`, and `--logger`.
+- Tune `--limit`, `--concurrency`, `--train-steps`, and `--grad-accum-steps` to fit your budget/VRAM.
 - Training logs include loss, reward, avg_completion_length, and reducer stats (correct/parse-error rates, token totals).
 - Checkpoints are written to `checkpoints_gsm8k/` by default.
 - Training uses a boxed-answer parser (`boxed_parser`) and a small system prompt (`"First, think step by step. Then put your final answer inside \\boxed{...}."` by default).

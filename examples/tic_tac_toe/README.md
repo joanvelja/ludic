@@ -27,7 +27,8 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/tic_tac_toe/train_tic
 - Uses `GRPORequestStrategy` + `GroupNormalizedReturn`, LoRA on the HF model, and a strict `<think>...</think><move>...</move>` parser.
 - Samples 50/50 agent_starts=True/False so the policy practices both as first and second player.
 - Use `--final-save` to force a final checkpoint at the end of training (in addition to periodic saves).
-- Tweak `--group-size`, `--concurrency`, `--train-steps`, `--train-temperature`, `--batch-size`, and `--max-steps-per-episode` as needed.
+- Tweak `--group-size`, `--concurrency`, `--train-steps`, `--train-temperature`, `--batch-size`, `--max-steps-per-episode`, and `--grad-accum-steps` as needed.
+- Logger options: `--logger rich`, `--logger wandb`, or `--logger rich,wandb` (W&B uses `WANDB_*` env vars).
 
 ### 3) Evaluate (optional)
 ```bash

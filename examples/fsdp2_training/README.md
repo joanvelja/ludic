@@ -41,14 +41,15 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
      --log-level INFO \
      --logger print \
      --rank0-only-output
-   ```
+  ```
 
    Optional: if you have fast scratch (e.g. `/ephemeral`), set `UV_CACHE_DIR`, `--rollout-log`, and `--checkpoint-dir` there to reduce I/O contention.
 
 3. Checkpoints and logs:
    - Checkpoints: `checkpoints_math_fsdp2/` (rank0 saves).
-   - Rollout logs: `fsdp2_math_rollouts.rank{RANK}.jsonl`.
-   - Rank0 prints basic stats; attach `RichLiveLogger` only on rank0.
+- Rollout logs: `fsdp2_math_rollouts.rank{RANK}.jsonl`.
+- Rank0 prints basic stats; attach `RichLiveLogger` only on rank0.
+- Logger options: `--logger rich`, `--logger wandb`, or `--logger rich,wandb` (W&B uses `WANDB_*` env vars).
 
 ## Notes
 - Mixed precision: uses `fsdp.MixedPrecisionPolicy` with bf16 params / fp32 reductions.
@@ -58,4 +59,4 @@ This example shows how to run Ludic with PyTorch FSDP2 for training while servin
 - Weight publishing: only rank0 gathers a full state dict (DCP full_state_dict) and pushes weights to vLLM over the separate pynccl communicator.
 - Sample sharding: MATH samples are sharded per rank to avoid duplicates; adjust to your data loader if needed.
 
-Tune `--batch-size`, `--group-size`, and `--train-steps` based on hardware. The script is a scaffold; extend it for eval, better logging, and real hyperparameters.
+Tune `--batch-size`, `--group-size`, `--train-steps`, and `--grad-accum-steps` based on hardware. The script is a scaffold; extend it for eval, better logging, and real hyperparameters.

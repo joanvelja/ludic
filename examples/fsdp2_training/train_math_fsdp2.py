@@ -47,7 +47,7 @@ from ludic.training import (
     EnvSpec,
     ProtocolSpec,
 )
-from ludic.training import Reducer, RichLiveLogger
+from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger
 
 
 def configure_logging(*, rank: int, level: str) -> None:
@@ -91,7 +91,6 @@ def init_dist(*, local_rank: int) -> int:
 
 def shard_samples(samples: List[Dict[str, Any]], rank: int, world_size: int) -> List[Dict[str, Any]]:
     return [s for i, s in enumerate(samples) if i % world_size == rank]
-
 
 MATH_TRAIN_DATASET = "qwedsacf/competition_math"
 MATH_EVAL_DATASET = "HuggingFaceH4/MATH-500"
@@ -165,6 +164,7 @@ def main() -> None:
     parser.add_argument("--vllm-port", type=int, default=8000)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--train-steps", type=int, default=100, help="Number of trainer steps.")
+    parser.add_argument("--grad-accum-steps", type=int, default=2, help="Gradient accumulation steps.")
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--concurrency", type=int, default=11)
@@ -197,7 +197,12 @@ def main() -> None:
         help="Max tokens per completion (train + eval).",
     )
     parser.add_argument("--log-level", type=str, default="INFO")
-    parser.add_argument("--logger", choices=["rich", "print", "none"], default="rich")
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="rich",
+        help="Comma-separated loggers: rich, print, wandb, none.",
+    )
     parser.add_argument(
         "--rank0-only-output",
         action=argparse.BooleanOptionalAction,
@@ -339,7 +344,7 @@ def main() -> None:
 
     cfg = TrainerConfig(
         model_device=str(device),
-        grad_accum_steps=2,
+        grad_accum_steps=args.grad_accum_steps,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         reduce_stats_across_ranks=True,
@@ -369,43 +374,60 @@ def main() -> None:
     }
     train_logger = None
     if rank == 0:
-        if args.logger == "none":
-            train_logger = None
-        elif args.logger == "print" or not sys.stdout.isatty():
-            from ludic.training import PrintLogger
+        raw_logger = args.logger or "rich"
+        logger_tokens = [tok.strip().lower() for tok in raw_logger.replace("+", ",").split(",") if tok.strip()]
+        valid_loggers = {"rich", "print", "wandb", "none"}
+        unknown = [tok for tok in logger_tokens if tok not in valid_loggers]
+        if unknown:
+            raise SystemExit(f"Unknown logger(s): {unknown}. Valid: {sorted(valid_loggers)}")
+        if "none" in logger_tokens:
+            logger_tokens = ["none"]
 
-            train_logger = PrintLogger(
+        logger_keys = [
+            "train/loss",
+            "train/avg_total_reward",
+            "train/correct_rate",
+            "train/parse_err_rate",
+            "eval/accuracy",
+            "eval/parse_error_rate",
+            "eval/avg_completion_tokens",
+            "train/num_rollouts",
+            "train/num_samples",
+        ]
+        console_logger = None
+        if "print" in logger_tokens:
+            console_logger = PrintLogger(
                 prefix="[trainer]",
-                keys=[
-                    "loss",
-                    "avg_total_reward",
-                    "correct_rate",
-                    "parse_err_rate",
-                    "eval_accuracy",
-                    "eval_parse_error_rate",
-                    "eval_avg_completion_tokens",
-                    "num_rollouts",
-                    "num_samples",
-                ],
+                keys=logger_keys,
                 precision=4,
             )
-        else:
-            train_logger = RichLiveLogger(
-                keys=[
-                    "loss",
-                    "avg_total_reward",
-                    "correct_rate",
-                    "parse_err_rate",
-                    "eval_accuracy",
-                    "eval_parse_error_rate",
-                    "eval_avg_completion_tokens",
-                    "num_rollouts",
-                    "num_samples",
-                ],
-                spark_key="avg_total_reward",
-                history=100,
-                precision=4,
-            )
+        elif "rich" in logger_tokens:
+            if not sys.stdout.isatty():
+                console_logger = PrintLogger(
+                    prefix="[trainer]",
+                    keys=logger_keys,
+                    precision=4,
+                )
+            else:
+                console_logger = RichLiveLogger(
+                    keys=logger_keys,
+                    spark_key="train/avg_total_reward",
+                    history=100,
+                    precision=4,
+                )
+
+        wandb_logger = None
+        if "wandb" in logger_tokens:
+            wandb_config = dict(vars(args))
+            wandb_config["rank"] = rank
+            wandb_config["world_size"] = world_size
+            wandb_logger = WandbLogger(config=wandb_config)
+
+        if logger_tokens != ["none"]:
+            if console_logger and wandb_logger:
+                train_logger = TeeLogger(console_logger, wandb_logger)
+            else:
+                train_logger = console_logger or wandb_logger
 
     trainer = Trainer(
         model=model,
@@ -466,9 +488,10 @@ def main() -> None:
     def train_log(stats: Dict[str, float]) -> None:
         if rank != 0:
             return
-        step = int(stats.get("train_step", 0))
+        step = int(stats.get("train/step", 0))
         print(
-            f"[rank0 step {step}] loss={stats.get('loss'):.4f} reward={stats.get('avg_total_reward'):.4f}",
+            f"[rank0 step {step}] loss={stats.get('train/loss'):.4f} "
+            f"reward={stats.get('train/avg_total_reward'):.4f}",
             flush=True,
         )
 

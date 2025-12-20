@@ -62,7 +62,7 @@ from .batching import (
     make_chat_template_step_to_item,
 )
 from .stats import Reducer, apply_reducers_to_records
-from .loggers import TrainingLogger, PrintLogger, RichLiveLogger
+from .loggers import TrainingLogger, PrintLogger, RichLiveLogger, TeeLogger, WandbLogger
 
 if TYPE_CHECKING:  # pragma: no cover
     from .trainer import Trainer as Trainer
@@ -128,6 +128,8 @@ __all__ = [
     "TrainingLogger",
     "PrintLogger",
     "RichLiveLogger",
+    "TeeLogger",
+    "WandbLogger",
 ]
 
 

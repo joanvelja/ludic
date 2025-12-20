@@ -395,6 +395,28 @@ class Trainer:
         reduced["train_step"] = float(self._train_step_idx)
         return reduced
 
+    @staticmethod
+    def _group_log_stats(stats: Dict[str, float]) -> Dict[str, float]:
+        grouped: Dict[str, float] = {}
+        for key, value in stats.items():
+            if key == "phase":
+                continue
+            if key == "train_step":
+                grouped["train/step"] = value
+                continue
+            if key == "eval_step":
+                grouped["eval/step"] = value
+                continue
+            if key.startswith(("train/", "eval/", "perf/")):
+                grouped[key] = value
+            elif key.startswith("eval_"):
+                grouped[f"eval/{key[5:]}"] = value
+            elif key.startswith("gpu_"):
+                grouped[f"perf/{key}"] = value
+            else:
+                grouped[f"train/{key}"] = value
+        return grouped
+
     # ------------------------------------------------------------------
     # Memory utilities (GPU-only)
     # ------------------------------------------------------------------
@@ -497,7 +519,8 @@ class Trainer:
             - Optionally push updated params into runtime
 
         Returns:
-            Aggregated stats dict from all micro-batches.
+            Aggregated stats dict from all micro-batches, grouped as
+            train/*, eval/*, and perf/* keys for logging.
         """
         device = torch.device(self.cfg.model_device)
         grad_accum_steps = max(1, int(self.cfg.grad_accum_steps))
@@ -655,8 +678,9 @@ class Trainer:
             )
 
         # ---- 8) Optional logging ---------------------------------------
-        self._last_train_stats = dict(final_stats)
-        log_stats = dict(final_stats)
+        grouped = self._group_log_stats(final_stats)
+        self._last_train_stats = dict(grouped)
+        log_stats = dict(grouped)
         log_stats.update(self._last_eval_stats)
         if self.train_logger is not None:
             try:
@@ -664,7 +688,7 @@ class Trainer:
             except Exception:
                 logger.exception("Stats logger failed at step %s", self._train_step_idx)
 
-        return final_stats
+        return grouped
 
     # ------------------------------------------------------------------
     # Invariants / validation
@@ -852,8 +876,9 @@ class Trainer:
             except Exception:
                 logger.exception("Eval log_fn failed")
 
-        self._last_eval_stats = {"eval_step": float(self._train_step_idx)}
-        self._last_eval_stats.update({f"eval_{k}": float(v) for k, v in metrics.items()})
+        raw_eval_stats = {"eval_step": float(self._train_step_idx)}
+        raw_eval_stats.update({f"eval_{k}": float(v) for k, v in metrics.items()})
+        self._last_eval_stats = self._group_log_stats(raw_eval_stats)
         if self.train_logger is not None and (not is_distributed or rank == 0):
             try:
                 merged = dict(self._last_train_stats)
