@@ -23,6 +23,7 @@ from .algorithm import (
     make_reinforce,
     make_reinforce_baseline,
     make_grpo,
+    make_gspo,
     make_sft,
 )
 from .credit_assignment import (
@@ -37,6 +38,7 @@ from .loss import (
     ReinforceLoss,
     ReinforceBaselineLoss,
     ClippedSurrogateLoss,
+    TokenClippedSurrogateLoss,
     KLLoss,
     EntropyBonus,
     LossTerm,
@@ -77,6 +79,7 @@ __all__ = [
     "make_reinforce",
     "make_reinforce_baseline",
     "make_grpo",
+    "make_gspo",
     "make_sft",
     # Credit assignment
     "GroupNormalizedReturn",
@@ -89,6 +92,7 @@ __all__ = [
     "ReinforceLoss",
     "ReinforceBaselineLoss",
     "ClippedSurrogateLoss",
+    "TokenClippedSurrogateLoss",
     "KLLoss",
     "EntropyBonus",
     "LossTerm",

@@ -38,7 +38,7 @@ from ludic.training import (
     TrainerConfig,
     CheckpointConfig,
     make_dataset_queue_requests_fn,
-    make_grpo,
+    make_gspo,
     RequestsExhausted,
     RolloutRequest,
     EnvSpec,
@@ -138,12 +138,11 @@ def main():
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    # Algorithm (GRPO-style: group-relative advantages + PPO clipped objective)
-    algo = make_grpo(
-        name="grpo",
+    # Algorithm (GSPO-style: sequence-level ratios + PPO clipped objective)
+    algo = make_gspo(
+        name="gspo",
         group_size=args.group_size,
         group_normalize_adv=True,
-        clip_eps=0.1,
         length_normalize=True,
     )
 
@@ -155,7 +154,7 @@ def main():
     )
     train_inference = InferenceSpec(
         sampling=SamplingParams(temperature=args.train_temperature, max_tokens=512),
-        # Ask vLLM for token IDs + chosen-token logprobs so GRPO can use rollout-time behavior logprobs.
+        # Ask vLLM for token IDs + chosen-token logprobs so GSPO can use rollout-time behavior logprobs.
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
     requests_fn = make_dataset_queue_requests_fn(

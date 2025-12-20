@@ -12,6 +12,7 @@ from ludic.training.loss import (
     ReinforceLoss,
     ReinforceBaselineLoss,
     ClippedSurrogateLoss,
+    TokenClippedSurrogateLoss,
     MaskedCausalLMCrossEntropyLoss,
 )
 from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
@@ -180,12 +181,14 @@ def make_grpo(
     group_size: int,
     group_normalize_adv: bool = True,
     positive_only: bool = False,
-    clip_eps: float = 0.2,
+    clip_eps_low: float = 0.2,
+    clip_eps_high: float = 0.27,
     length_normalize: bool = False,
+    ratio_clip: Optional[float] = None,
     name: str = "grpo",
 ) -> RLAlgorithm:
     """
-    GRPO-style preset (clipped surrogate):
+    GRPO-style preset (clipped surrogate, token-level ratios by default):
 
       - Credit assignment: group-normalized returns (per-group baseline)
       - Loss: PPO-style clipped surrogate (policy term only)
@@ -197,8 +200,12 @@ def make_grpo(
         group_size: Number of rollouts per group.
         group_normalize_adv: Whether to normalize advantages within each group.
         positive_only: If True, clip negative advantages to zero (reinforce-only).
-        clip_eps: PPO clipping epsilon for the surrogate objective.
+        clip_eps_low: Lower PPO clipping epsilon for the surrogate objective.
+            Defaults follow GSPO paper settings (https://arxiv.org/abs/2507.18071).
+        clip_eps_high: Upper PPO clipping epsilon for the surrogate objective.
+            Defaults follow GSPO paper settings (https://arxiv.org/abs/2507.18071).
         length_normalize: Whether to normalize log-probs by action length.
+        ratio_clip: Optional upper bound C for truncation (min(r, C)).
         name: Algorithm name for logging/metrics.
     Note: For the clipped ratio objective, we need behavior-policy logprobs.
     This preset installs a preprocessor that validates
@@ -209,7 +216,51 @@ def make_grpo(
         normalize_adv=group_normalize_adv,
         positive_only=positive_only,
     )
-    loss: Loss = ClippedSurrogateLoss(clip_eps=clip_eps, length_normalize=length_normalize)
+    loss: Loss = TokenClippedSurrogateLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+        ratio_clip=ratio_clip,
+    )
+    preprocess = validate_actor_logps
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
+def make_gspo(
+    *,
+    group_size: int,
+    group_normalize_adv: bool = True,
+    positive_only: bool = False,
+    clip_eps_low: float = 3e-4,
+    clip_eps_high: float = 4e-4,
+    length_normalize: bool = True,
+    ratio_clip: Optional[float] = None,
+    name: str = "gspo",
+) -> RLAlgorithm:
+    """
+    GSPO-style preset (sequence-level ratios with sequence-level clipping).
+
+    This mirrors GRPO's group-normalized advantages but uses a sequence-level
+    importance ratio. With length_normalize=True, this matches the geometric
+    mean ratio used in the GSPO paper (https://arxiv.org/abs/2507.18071).
+    """
+    credit_assigner: CreditAssigner = GroupNormalizedReturn(
+        group_size=group_size,
+        normalize_adv=group_normalize_adv,
+        positive_only=positive_only,
+    )
+    loss: Loss = ClippedSurrogateLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+        ratio_clip=ratio_clip,
+    )
     preprocess = validate_actor_logps
 
     return RLAlgorithm(

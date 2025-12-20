@@ -41,7 +41,7 @@ from ludic.training import (
     TrainerConfig,
     CheckpointConfig,
     make_dataset_queue_requests_fn,
-    make_grpo,
+    make_gspo,
     RequestsExhausted,
     RolloutRequest,
     EnvSpec,
@@ -300,11 +300,10 @@ def main() -> None:
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    algo = make_grpo(
-        name="grpo",
+    algo = make_gspo(
+        name="gspo",
         group_size=args.group_size,
         group_normalize_adv=True,
-        clip_eps=0.1,
         length_normalize=True,
     )
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import os
-from beartype.typing import Any, Dict, Mapping, Protocol, Tuple, List
+from beartype.typing import Any, Dict, Mapping, Protocol, Tuple, List, Optional
 
 from beartype import beartype
 from jaxtyping import Float, Int, jaxtyped
@@ -100,6 +100,29 @@ def compute_logp_action(
         logp_action = logp_action / lengths
 
     return logp_action
+
+
+@jaxtyped(typechecker=typechecker)
+def compute_token_logp(
+    logits: Logits,
+    input_ids: TokenIds,
+) -> Float[Tensor, "B T-1"]:
+    """
+    Compute per-token log π(a_t|s_t) for each next-token prediction.
+
+    Returns:
+        token_logp: [B, T-1] log-prob of each next token.
+    """
+    if logits.ndim != 3:
+        raise ValueError(f"Expected logits [B, T, V], got {tuple(logits.shape)}")
+    if input_ids.shape != logits.shape[:2]:
+        raise ValueError(f"Shape mismatch: input_ids {input_ids.shape} vs logits {logits.shape}")
+    if logits.size(1) < 2:
+        raise ValueError("Sequence too short to compute next-token logprobs.")
+
+    logits_shifted = logits[:, :-1, :]          # [B, T-1, V]
+    target_ids = input_ids[:, 1:]               # [B, T-1]
+    return selective_log_softmax(logits_shifted, target_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -258,20 +281,33 @@ class ReinforceBaselineLoss:
 @dataclass
 class ClippedSurrogateLoss:
     """
-    PPO-style clipped surrogate policy loss (actor part only):
+    PPO-style clipped surrogate policy loss (actor part only).
 
         r = π_new(a|s) / π_old(a|s)
-        L_clip = - E[ min(r * A, clip(r, 1 - eps, 1 + eps) * A) ]
+        L_clip = - E[ min(r * A, clip(r, 1 - eps_low, 1 + eps_high) * A) ]
 
     Expects:
         - batch["weight"]:       A  (advantages)      [B]
         - batch[old_logp_key]:   log π_old(a|s)      [B]
         - input_ids / attention_mask / action_mask for π_new.
+
+    Defaults follow the GSPO paper clip ranges:
+    https://arxiv.org/abs/2507.18071
     """
 
-    clip_eps: float = 0.2
+    clip_eps_low: float = 3e-4
+    clip_eps_high: float = 4e-4
     old_logp_key: str = "old_logp_action"
     length_normalize: bool = False
+    ratio_clip: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.clip_eps_low < 0 or self.clip_eps_high < 0:
+            raise ValueError(
+                f"clip_eps_low/high must be non-negative, got {self.clip_eps_low}, {self.clip_eps_high}"
+            )
+        if self.ratio_clip is not None and self.ratio_clip <= 0:
+            raise ValueError(f"ratio_clip must be positive, got {self.ratio_clip}")
 
     @jaxtyped(typechecker=typechecker)
     def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
@@ -292,26 +328,136 @@ class ClippedSurrogateLoss:
             lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
             old_logp = old_logp / lengths
 
-        # ratio = π_new / π_old
-        ratio = torch.exp(logp_action - old_logp)                          # [B]
+        log_ratio = logp_action - old_logp
+        ratio = torch.exp(log_ratio)
+        if self.ratio_clip is not None:
+            ratio = torch.clamp(ratio, max=self.ratio_clip)
 
-        # unclipped and clipped objectives
         unclipped = ratio * advantages
-        clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
+        clipped = torch.clamp(
+            ratio, 1.0 - self.clip_eps_low, 1.0 + self.clip_eps_high
+        ) * advantages
 
         obj = torch.min(unclipped, clipped)
         loss = -obj.mean()
 
-        clip_frac = ((ratio > 1.0 + self.clip_eps) | (ratio < 1.0 - self.clip_eps)).float().mean()
+        ppo_clip_frac = (
+            (ratio > 1.0 + self.clip_eps_high) | (ratio < 1.0 - self.clip_eps_low)
+        ).float().mean()
+        if self.ratio_clip is not None:
+            ratio_clip_frac = (ratio >= self.ratio_clip).float().mean()
+        else:
+            ratio_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
 
-        stats: Dict[str, Any] = {
+        stats = {
             "loss": float(loss.detach().cpu()),
             "ratio_mean": float(ratio.mean().detach().cpu()),
             "ratio_std": float(ratio.std(unbiased=False).detach().cpu()),
-            "clip_frac": float(clip_frac.detach().cpu()),
+            "clip_frac": float(ppo_clip_frac.detach().cpu()),
+            "ratio_clip_frac": float(ratio_clip_frac.detach().cpu()),
             "adv_mean": float(advantages.mean().detach().cpu()),
             "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
             "logp_mean": float(logp_action.mean().detach().cpu()),
+        }
+        return loss, stats
+
+
+@dataclass
+class TokenClippedSurrogateLoss:
+    """
+    Token-level PPO-style clipped surrogate loss (Token-TIS-style ratios).
+
+    Uses asymmetric clipping: clip(r, 1 - eps_low, 1 + eps_high).
+
+    Expects:
+        - batch["weight"]:       A  (advantages)      [B]
+        - batch["actor_logps"]:  token logps under behavior policy [B, T]
+        - input_ids / attention_mask / action_mask for π_new.
+
+    Defaults follow the GSPO paper clip ranges for the GRPO baseline:
+    https://arxiv.org/abs/2507.18071
+    """
+
+    clip_eps_low: float = 0.2
+    clip_eps_high: float = 0.27
+    length_normalize: bool = False
+    ratio_clip: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.clip_eps_low < 0 or self.clip_eps_high < 0:
+            raise ValueError(
+                f"clip_eps_low/high must be non-negative, got {self.clip_eps_low}, {self.clip_eps_high}"
+            )
+        if self.ratio_clip is not None and self.ratio_clip <= 0:
+            raise ValueError(f"ratio_clip must be positive, got {self.ratio_clip}")
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        advantages = batch["weight"]
+        if "actor_logps" not in batch:
+            raise KeyError("TokenClippedSurrogateLoss requires batch['actor_logps'] for token IS.")
+
+        actor_logps = batch["actor_logps"]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
+
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)
+        actor_logps_shifted = actor_logps[:, 1:]
+
+        log_ratio = token_logp - actor_logps_shifted
+        ratio = torch.exp(log_ratio)
+        if self.ratio_clip is not None:
+            ratio = torch.clamp(ratio, max=self.ratio_clip)
+
+        ratio_clipped = torch.clamp(
+            ratio, 1.0 - self.clip_eps_low, 1.0 + self.clip_eps_high
+        )
+        adv = advantages.unsqueeze(-1)
+        unclipped = ratio * adv
+        clipped = ratio_clipped * adv
+        obj = torch.min(unclipped, clipped) * token_mask
+        per_sample_obj = obj.sum(dim=-1)
+        if self.length_normalize:
+            per_sample_obj = per_sample_obj / token_counts
+
+        loss = -per_sample_obj.mean()
+
+        mask = token_mask > 0
+        if mask.any():
+            ratio_vals = ratio.masked_select(mask)
+            ppo_clip_frac = (
+                (ratio_vals > 1.0 + self.clip_eps_high) | (ratio_vals < 1.0 - self.clip_eps_low)
+            ).float().mean()
+            ratio_mean = ratio_vals.mean()
+            ratio_std = ratio_vals.std(unbiased=False)
+            if self.ratio_clip is not None:
+                ratio_clip_frac = (ratio_vals >= self.ratio_clip).float().mean()
+            else:
+                ratio_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+        else:
+            ratio_mean = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            ratio_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            ppo_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            ratio_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+
+        logp_action = (token_logp * token_mask).sum(dim=-1)
+        stats: Dict[str, Any] = {
+            "loss": float(loss.detach().cpu()),
+            "ratio_mean": float(ratio_mean.detach().cpu()),
+            "ratio_std": float(ratio_std.detach().cpu()),
+            "clip_frac": float(ppo_clip_frac.detach().cpu()),
+            "ratio_clip_frac": float(ratio_clip_frac.detach().cpu()),
+            "adv_mean": float(advantages.mean().detach().cpu()),
+            "adv_std": float(advantages.std(unbiased=False).detach().cpu()),
+            "logp_mean": float(logp_action.mean().detach().cpu()),
+            "avg_action_tokens": float(token_counts.mean().detach().cpu()),
         }
         return loss, stats
 

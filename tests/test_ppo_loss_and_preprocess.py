@@ -5,10 +5,10 @@ from typing import Dict, Any, List
 import pytest
 import torch
 
-from ludic.training.loss import ClippedSurrogateLoss
+from ludic.training.loss import ClippedSurrogateLoss, TokenClippedSurrogateLoss
 from ludic.training.trainer import _collate_saw_items
 from ludic.training.types import SAWItem, SAWBatch, ActorTokenLogps, SampleAttachments
-from ludic.training.algorithm import RLAlgorithm, validate_actor_logps
+from ludic.training.algorithm import RLAlgorithm, validate_actor_logps, make_gspo, make_grpo
 from ludic.training.credit_assignment import MonteCarloReturn
 
 
@@ -107,3 +107,16 @@ def test_ppopreprocess_async_batch_missing_logprobs_raises():
     with pytest.raises(ValueError):
         assert algo.preprocess is not None
         algo.preprocess(saw_batch)
+
+
+def test_gspo_and_grpo_presets_defaults():
+    gspo = make_gspo(group_size=2)
+    assert isinstance(gspo.loss, ClippedSurrogateLoss)
+    assert gspo.loss.clip_eps_low == pytest.approx(3e-4)
+    assert gspo.loss.clip_eps_high == pytest.approx(4e-4)
+    assert gspo.loss.length_normalize is True
+
+    grpo = make_grpo(group_size=2)
+    assert isinstance(grpo.loss, TokenClippedSurrogateLoss)
+    assert grpo.loss.clip_eps_low == pytest.approx(0.2)
+    assert grpo.loss.clip_eps_high == pytest.approx(0.27)
