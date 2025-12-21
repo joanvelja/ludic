@@ -45,6 +45,9 @@ To reset corrupted podman-hpc state:
 
 from __future__ import annotations
 
+import os
+os.environ["TORCHDYNAMO_DISABLE"] = "1"    
+
 import argparse
 import asyncio
 import sys
@@ -541,7 +544,7 @@ async def test_training_step(minimal_config: bool = True) -> bool:
 
         # Mock publisher (no-op)
         class MockPublisher:
-            def publish(self, state_dict): pass
+            def publish(self, state_dict, version): pass
 
         trainer = Trainer(
             model=model,
@@ -554,7 +557,7 @@ async def test_training_step(minimal_config: bool = True) -> bool:
         log("  Running single training step...")
         # Run one step
         try:
-            trainer.train_sync(max_steps=1)
+            await trainer.train(num_steps=1)
             log("  Training step completed")
         except StopIteration:
             log("  Training stopped (samples exhausted, expected)")
