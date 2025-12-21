@@ -10,10 +10,13 @@ dependencies = [
     "peft>=0.18.0",
     "rich>=14.2.0",
     "setuptools>=79.0.1",
-    # torch/vllm: use UV_TORCH_BACKEND=cu128 on GPU systems (aarch64/x86)
-    # See: https://docs.astral.sh/uv/guides/integration/pytorch/
-    "torch>=2.8.0",
-    "vllm>=0.11.0",
+    # CRITICAL: torch>=2.9.0 required for aarch64 CUDA wheels
+    # PyTorch 2.8.0 has NO aarch64 CUDA wheels - skip it!
+    # See: https://download.pytorch.org/whl/cu128/torch/
+    "torch>=2.9.0",
+    # vLLM is Linux-only (depends on NVIDIA libraries)
+    # Use sys_platform marker to skip on macOS/Windows
+    "vllm>=0.12.0; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -49,26 +52,40 @@ markers = [
 testpaths = ["tests"]
 
 # =============================================================================
-# uv Configuration for PyTorch CUDA
+# uv Configuration for Cross-Platform PyTorch
 # =============================================================================
-# PyTorch publishes different wheels for CPU/CUDA on separate indexes.
-# By default, uv uses CPU wheels for aarch64 (ARM) systems.
+# This configuration automatically selects the correct PyTorch wheels:
+#   - Linux: CUDA 12.8 wheels from pytorch-cu128 index
+#   - macOS/Windows: CPU wheels from pytorch-cpu index
 #
-# IMPORTANT: --torch-backend only works with 'uv pip', NOT 'uv sync'!
-#
-# For GPU systems (Isambard-AI GH200, etc.):
-#   uv pip install torch torchvision --torch-backend=cu128
-#   uv pip install vllm --torch-backend=cu128
-#   uv run --no-sync python ...   # --no-sync prevents reverting to CPU
-#
-# For CPU systems (local dev):
-#   uv sync   # Uses default CPU wheels
+# Usage:
+#   Local dev (macOS):  uv sync
+#   HPC (Linux GPU):    uv sync
+#   Linux CI (no GPU):  uv sync --extra cpu
 #
 # See: https://docs.astral.sh/uv/guides/integration/pytorch/
 # See: https://docs.isambard.ac.uk/user-documentation/applications/ML-packages/
 # =============================================================================
 
 [tool.uv]
+
+# Platform-based torch source selection:
+# - Linux: Use CUDA 12.8 wheels (supports both x86_64 and aarch64)
+# - Non-Linux (macOS, Windows): Use CPU wheels
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

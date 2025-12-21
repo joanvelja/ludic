@@ -52,16 +52,14 @@ set -e
 # module load PrgEnv-gnu nvidia brics/nccl  # Uncomment if needed for NCCL
 
 # -----------------------------------------------------------------------------
-# Fix: PyTorch/vLLM aarch64 CUDA wheels
-# GH200 is ARM64 - uv defaults to CPU wheels for aarch64
-# --torch-backend=cu128 forces CUDA 12.8 wheels
-# NOTE: --torch-backend only works with 'uv pip', not 'uv sync'
-# Ref: https://docs.isambard.ac.uk/user-documentation/applications/ML-packages/
-# Ref: https://docs.astral.sh/uv/guides/integration/pytorch/
+# Sync environment (automatic CUDA wheel selection via pyproject.toml)
+# The pyproject.toml uses platform-based source markers to select:
+#   - Linux: CUDA 12.8 wheels from pytorch-cu128 index
+#   - macOS/Windows: CPU wheels from pytorch-cpu index
+# No manual --torch-backend needed!
 # -----------------------------------------------------------------------------
-echo "Installing PyTorch + vLLM with CUDA backend for aarch64..."
-uv pip install torch torchvision --torch-backend=cu128
-uv pip install vllm --torch-backend=cu128
+echo "Syncing Python environment..."
+uv sync --group examples
 
 # -----------------------------------------------------------------------------
 # CUDA library path setup
@@ -158,8 +156,7 @@ echo ""
 # -----------------------------------------------------------------------------
 
 echo "Verifying PyTorch CUDA..."
-# --no-sync prevents uv from reverting to CPU torch via pyproject.toml
-uv run --no-sync python -c "import torch; print('  PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available())" || {
+uv run python -c "import torch; print('  PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available())" || {
     echo "ERROR: PyTorch CUDA not available."
     exit 1
 }
@@ -222,7 +219,7 @@ echo "========================================"
 # Create log file for vLLM
 VLLM_LOG="vllm_server_${SLURM_JOB_ID}.log"
 
-CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --no-sync python -m ludic.inference.vllm_server \
+CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run python -m ludic.inference.vllm_server \
     --model "$MODEL" \
     --port $VLLM_PORT \
     --trust-remote-code \
@@ -274,7 +271,7 @@ echo "Starting training..."
 echo "========================================"
 
 # Build training command
-TRAIN_CMD="uv run --no-sync python examples/code_exec/train_apps.py"
+TRAIN_CMD="uv run python examples/code_exec/train_apps.py"
 TRAIN_CMD="$TRAIN_CMD --model $MODEL"
 TRAIN_CMD="$TRAIN_CMD --host 127.0.0.1 --port $VLLM_PORT"
 TRAIN_CMD="$TRAIN_CMD --limit $LIMIT"
