@@ -18,6 +18,29 @@ Requirements:
     - podman-hpc in PATH (auto-detected on Isambard)
     - Python 3.11+ with ludic installed
     - Image pre-pulled: podman-hpc pull python:3.11-slim
+
+Troubleshooting:
+----------------
+If you see "executable file not found in $PATH" errors for basic commands
+like 'sleep', 'echo', or 'python', this is a known podman-hpc issue on
+Isambard where the squashfs image conversion breaks PATH setup.
+
+Diagnosis:
+    # Should work (absolute path)
+    podman-hpc run --rm python:3.11-slim /bin/echo hello
+
+    # May fail (relies on PATH)
+    podman-hpc run --rm python:3.11-slim echo hello
+
+The ludic sandbox code uses absolute paths (/bin/sleep, /usr/local/bin/python)
+to work around this. If you encounter this on a new system, see:
+  - src/ludic/envs/code_exec/podman_sandbox.py (module docstring)
+  - features/CodeExecEnv/plan.md (Troubleshooting section)
+
+To reset corrupted podman-hpc state:
+    rm -rf $SCRATCH/storage ~/.local/share/containers ~/.config/containers
+    podman-hpc system reset && podman-hpc system migrate
+    podman-hpc pull python:3.11-slim
 """
 
 from __future__ import annotations

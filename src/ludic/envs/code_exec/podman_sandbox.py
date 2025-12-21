@@ -25,6 +25,24 @@ Usage:
   await pool.release(sandbox)
 
   await pool.shutdown()
+
+HPC Compatibility Note (Isambard/BRiCS - December 2024):
+---------------------------------------------------------
+On some HPC systems (notably Isambard), podman-hpc converts pulled images to
+squashfs format for shared storage. This conversion can break the container's
+PATH environment variable, causing commands like `sleep`, `python`, etc. to
+fail with "executable file not found in $PATH" errors.
+
+**Workaround**: All commands in this module use absolute paths:
+  - /bin/sleep, /bin/mkdir, /bin/sh
+  - /usr/local/bin/python (for official Python Docker images)
+  - /usr/bin/pkill
+
+If you encounter PATH-related errors on a new HPC system, verify paths with:
+  podman-hpc run --rm python:3.11-slim /bin/ls /bin/
+  podman-hpc run --rm python:3.11-slim /bin/ls /usr/local/bin/
+
+See: https://docs.isambard.ac.uk/user-documentation/guides/containers/podman-hpc/
 """
 
 from __future__ import annotations
@@ -127,16 +145,16 @@ class PodmanHPCSandbox:
         if self._config.extra_args:
             cmd.extend(self._config.extra_args)
 
-        # Image and command
-        cmd.extend([self._image, "sleep", "infinity"])
+        # Image and command (use full path for HPC compatibility)
+        cmd.extend([self._image, "/bin/sleep", "infinity"])
 
         # Capture stderr to provide useful error messages
         await self._run_podman(*cmd, capture=True)
 
-        # Ensure workspace directory exists
+        # Ensure workspace directory exists (use full path for HPC compatibility)
         await self._run_podman(
             "exec", self._container_name,
-            "mkdir", "-p", self._config.working_dir,
+            "/bin/mkdir", "-p", self._config.working_dir,
             capture=True,
         )
 
@@ -158,7 +176,7 @@ class PodmanHPCSandbox:
 
         await self._run_podman(
             "exec", self._container_name,
-            "sh", "-c", f"rm -rf {self._config.working_dir}/*"
+            "/bin/sh", "-c", f"rm -rf {self._config.working_dir}/*"
         )
 
     async def compile(
@@ -174,11 +192,11 @@ class PodmanHPCSandbox:
             # Write code to container
             await self._write_file("_check.py", code, timeout_s=timeout_s)
 
-            # Run py_compile
+            # Run py_compile (use full path for HPC compatibility)
             proc = await asyncio.wait_for(
                 self._run_podman(
                     "exec", self._container_name,
-                    "python", "-m", "py_compile",
+                    "/usr/local/bin/python", "-m", "py_compile",
                     f"{self._config.working_dir}/_check.py",
                     check=False, capture=True
                 ),
@@ -271,7 +289,7 @@ class PodmanHPCSandbox:
 
             exec_cmd.extend([
                 self._container_name,
-                "python", f"{self._config.working_dir}/{exec_filename}"
+                "/usr/local/bin/python", f"{self._config.working_dir}/{exec_filename}"
             ])
 
             # Run with timeout
@@ -314,11 +332,11 @@ class PodmanHPCSandbox:
             run_ms = (time.perf_counter() - run_start) * 1000
             total_ms = (time.perf_counter() - total_start) * 1000
 
-            # Try to kill the process
+            # Try to kill the process (use full path for HPC compatibility)
             try:
                 await self._run_podman(
                     "exec", self._container_name,
-                    "pkill", "-9", "python",
+                    "/usr/bin/pkill", "-9", "python",
                     check=False, capture=True
                 )
             except Exception:

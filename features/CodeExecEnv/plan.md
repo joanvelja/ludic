@@ -1542,6 +1542,71 @@ With 32 sandboxes and 10s timeout per test:
 
 ---
 
+## Troubleshooting: HPC Environments
+
+### Podman-HPC PATH Issues (Isambard/BRiCS - December 2024)
+
+**Symptom**: Commands fail with "executable file not found in $PATH" errors, even though the image is pulled successfully.
+
+```
+Error: runc: runc create failed: unable to start container process:
+error during container init: exec: "sleep": executable file not found in $PATH
+```
+
+**Root Cause**: On some HPC systems (notably Isambard), `podman-hpc` converts pulled images to squashfs format for shared storage (`$SCRATCH`). This conversion can break the container's PATH environment variable setup.
+
+**Diagnosis**:
+```bash
+# Check if image is migrated (R/O = true means squashfs)
+podman-hpc images
+
+# Test with absolute path (should work)
+podman-hpc run --rm python:3.11-slim /bin/echo hello
+
+# Test without absolute path (may fail)
+podman-hpc run --rm python:3.11-slim echo hello
+```
+
+**Solution**: Use absolute paths for all executables in container commands:
+
+| Command | Absolute Path |
+|---------|---------------|
+| `sleep` | `/bin/sleep` |
+| `mkdir` | `/bin/mkdir` |
+| `sh` | `/bin/sh` |
+| `python` | `/usr/local/bin/python` (official Python images) |
+| `pkill` | `/usr/bin/pkill` |
+
+**Verify paths for your image**:
+```bash
+podman-hpc run --rm python:3.11-slim /bin/ls /bin/
+podman-hpc run --rm python:3.11-slim /bin/ls /usr/local/bin/
+```
+
+**Reference**:
+- [Isambard Podman-HPC Docs](https://docs.isambard.ac.uk/user-documentation/guides/containers/podman-hpc/)
+- [NERSC Podman-HPC Troubleshooting](https://docs.nersc.gov/development/containers/podman-hpc/overview/)
+
+### Clearing Corrupted State
+
+If podman-hpc continues to malfunction after image re-pulls:
+
+```bash
+# Remove cached storage (paths may vary by system)
+rm -rf $SCRATCH/storage
+rm -rf ~/.local/share/containers
+rm -rf ~/.config/containers
+
+# Reset podman-hpc
+podman-hpc system reset
+podman-hpc system migrate
+
+# Re-pull images
+podman-hpc pull python:3.11-slim
+```
+
+---
+
 ## Open Items for Future Iterations
 
 1. **Multi-language support**: Add language field to config, select interpreter

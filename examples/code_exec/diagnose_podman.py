@@ -7,6 +7,19 @@ which flags work on your specific HPC environment.
 
 Usage:
     uv run python examples/code_exec/diagnose_podman.py
+
+Known Issue (Isambard/BRiCS - December 2024):
+---------------------------------------------
+If ALL tests fail with "executable file not found in $PATH", this is likely
+due to podman-hpc's squashfs image conversion breaking PATH environment setup.
+
+The solution is to use absolute paths for all executables:
+  - /bin/echo instead of echo
+  - /bin/sleep instead of sleep
+  - /usr/local/bin/python instead of python (for official Python images)
+
+This issue is worked around in src/ludic/envs/code_exec/podman_sandbox.py.
+See the module docstring and features/CodeExecEnv/plan.md for details.
 """
 
 from __future__ import annotations
