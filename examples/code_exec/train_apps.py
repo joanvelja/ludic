@@ -201,6 +201,8 @@ def main():
                         choices=["auto", "docker", "podman-hpc"],
                         help="Sandbox backend (default: auto-detect)")
     parser.add_argument("--python-version", default="3.11", help="Python version in sandbox")
+    parser.add_argument("--minimal-sandbox", action="store_true",
+                        help="Use minimal sandbox config (no memory/network limits) for HPC compatibility")
     parser.add_argument("--timeout-per-test", type=float, default=5.0, help="Timeout per test (seconds)")
 
     # Training
@@ -297,6 +299,13 @@ def main():
     # Setup sandbox pool
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # Build backend kwargs (minimal mode skips memory/network limits for HPC compatibility)
+    backend_kwargs = {}
+    if args.minimal_sandbox:
+        backend_kwargs["memory_limit"] = None
+        backend_kwargs["network_disabled"] = False
+
     try:
         sandbox_pool = loop.run_until_complete(
             create_sandbox_pool(
@@ -304,6 +313,7 @@ def main():
                 backend=args.sandbox_backend,
                 python_version=args.python_version,
                 cache_size=10000,
+                **backend_kwargs,
             )
         )
     except RuntimeError as e:

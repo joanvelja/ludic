@@ -11,3 +11,6 @@ wheels/
 
 # Slurm logs
 *.log
+
+# Big jsonl files
+*.jsonl
