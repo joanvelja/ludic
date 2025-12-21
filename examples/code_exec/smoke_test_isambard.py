@@ -27,7 +27,12 @@ import asyncio
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+# New API imports
+from ludic.training import EnvSpec, ProtocolSpec
+from ludic.types import ChatResponse
+from ludic.inference.request import ChatCompletionRequest
 
 # Check early for podman-hpc availability
 import shutil
@@ -251,12 +256,18 @@ async def test_rollout_engine(minimal_config: bool = True) -> bool:
             self.code = code_to_return
             self.call_count = 0
 
-        async def chat(self, messages, **kwargs):
+        async def complete(self, request: ChatCompletionRequest) -> Tuple[ChatResponse, Dict[str, Any]]:
             self.call_count += 1
-            return {
-                "content": f"```python\n{self.code}\n```",
-                "finish_reason": "stop",
-            }
+            text = f"```python\n{self.code}\n```"
+            return ChatResponse(
+                text=text,
+                finish_reason="stop",
+                prompt_token_ids=[1, 2, 3],  # dummy IDs for token trace
+                completion_token_ids=[4, 5, 6, 7],  # dummy IDs for token trace
+            ), {}
+
+        def sync_weights(self, params, *, timeout_s=600.0, version=None) -> str:
+            return "mock-v1"
 
     def simple_parser(raw: str) -> ParseResult:
         """Extract code from markdown blocks."""
@@ -321,16 +332,15 @@ async def test_rollout_engine(minimal_config: bool = True) -> bool:
         }
 
         request = RolloutRequest(
-            env_kind="code_exec",
-            protocol_kind="single_agent",
-            env_kwargs={"sample": sample},
-            max_steps=1,
+            env=EnvSpec(kind="code_exec", kwargs={"sample": sample}),
+            protocol=ProtocolSpec(kind="single_agent", kwargs={}),
             env_seed=42,
         )
 
         log("  Generating rollout...")
         rollouts = await engine.generate_rollouts(
             requests=[request],
+            max_steps=1,
             concurrency=1,
         )
 
@@ -402,29 +412,19 @@ async def test_training_step(minimal_config: bool = True) -> bool:
         model.to("cpu")
         log(f"  Model created: {sum(p.numel() for p in model.parameters())} parameters")
 
-        # Mock tokenizer
-        class MockTokenizer:
-            pad_token_id = 0
-            eos_token_id = 1
-
-            def __call__(self, texts, **kwargs):
-                # Return dummy token IDs
-                return {"input_ids": [[1, 2, 3] for _ in texts]}
-
-            def decode(self, ids, **kwargs):
-                return "print('hello')"
-
-        tokenizer = MockTokenizer()
-
         # Mock inference client
         class MockClient:
-            async def chat(self, messages, **kwargs):
-                return {
-                    "content": "```python\na, b = map(int, input().split()); print(a + b)\n```",
-                    "finish_reason": "stop",
-                    "prompt_token_ids": [1, 2, 3],
-                    "completion_token_ids": [4, 5, 6, 7],
-                }
+            async def complete(self, request: ChatCompletionRequest) -> Tuple[ChatResponse, Dict[str, Any]]:
+                text = "```python\na, b = map(int, input().split()); print(a + b)\n```"
+                return ChatResponse(
+                    text=text,
+                    finish_reason="stop",
+                    prompt_token_ids=[1, 2, 3],
+                    completion_token_ids=[4, 5, 6, 7],
+                ), {}
+
+            def sync_weights(self, params, *, timeout_s=600.0, version=None) -> str:
+                return "mock-v1"
 
         def simple_parser(raw: str) -> ParseResult:
             import re
@@ -487,17 +487,15 @@ async def test_training_step(minimal_config: bool = True) -> bool:
 
         sample_idx = [0]
 
-        def requests_fn(batch_size: int):
+        def requests_fn():
             from ludic.training import RolloutRequest
             if sample_idx[0] >= len(samples):
                 return []
             s = samples[sample_idx[0]]
             sample_idx[0] += 1
             return [RolloutRequest(
-                env_kind="code_exec",
-                protocol_kind="single_agent",
-                env_kwargs={"sample": s},
-                max_steps=1,
+                env=EnvSpec(kind="code_exec", kwargs={"sample": s}),
+                protocol=ProtocolSpec(kind="single_agent", kwargs={}),
             )]
 
         algo = make_reinforce(name="reinforce")
@@ -508,8 +506,6 @@ async def test_training_step(minimal_config: bool = True) -> bool:
             requests_fn=requests_fn,
             max_steps=1,
             concurrency=1,
-            retokenize=True,
-            tokenizer=tokenizer,
         )
 
         # Create trainer
@@ -517,7 +513,7 @@ async def test_training_step(minimal_config: bool = True) -> bool:
             model_device="cpu",
             grad_accum_steps=1,
             max_grad_norm=1.0,
-            pad_token_id=tokenizer.pad_token_id,
+            pad_token_id=0,  # dummy pad token ID
         )
 
         # Mock publisher (no-op)
