@@ -682,19 +682,6 @@ def main():
         evaluator=evaluator,
     )
 
-    # Wrap evaluator to drain sandbox pool before AND after each eval phase.
-    # - Before: ensures sandboxes released during training are available for eval
-    # - After: ensures sandboxes released during eval are available for training
-    if trainer.evaluator is not None:
-        original_eval = trainer.evaluator.eval
-
-        async def drain_and_eval(*args, **kwargs):
-            await sandbox_pool.drain_pending_resets()  # Before eval
-            result = await original_eval(*args, **kwargs)
-            await sandbox_pool.drain_pending_resets()  # After eval
-            return result
-
-        trainer.evaluator.eval = drain_and_eval
 
     print(f"\nStarting training for {args.train_steps} steps...")
     print(f"  Samples: {len(train_samples)}")

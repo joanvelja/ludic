@@ -241,6 +241,10 @@ class BaseSandboxPool(ABC, Generic[S]):
         The returned sandbox is guaranteed to be in a clean state (reset
         was performed in the background after the previous release).
 
+        If the queue is empty but resets are pending, waits for resets
+        to complete before timing out. This makes the pool self-healing
+        across phase transitions (e.g., eval → training).
+
         Args:
             timeout_s: Maximum time to wait for a sandbox
 
@@ -257,27 +261,40 @@ class BaseSandboxPool(ABC, Generic[S]):
         import time
 
         start_time = time.monotonic()
-        queue_size_before = self.available
+        deadline = start_time + timeout_s
 
-        try:
-            sandbox = await asyncio.wait_for(
-                self._queue.get(),
-                timeout=timeout_s,
-            )
-            wait_time = time.monotonic() - start_time
-            if wait_time > 1.0:  # Only log if wait was noticeable
-                logger.info(
-                    f"Sandbox checkout took {wait_time:.2f}s "
-                    f"(queue was {queue_size_before}/{self._n_workers}, "
-                    f"pending resets: {self.pending_resets})"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"No sandbox available after {timeout_s}s. "
+                    f"Pool size: {self._n_workers}, available: {self.available}, "
+                    f"pending resets: {self.pending_resets}"
                 )
-            return sandbox
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"No sandbox available after {timeout_s}s. "
-                f"Pool size: {self._n_workers}, available: {self.available}, "
-                f"pending resets: {self.pending_resets}"
-            )
+
+            # If queue is empty but resets are pending, wait for them first
+            if self._queue.empty() and self._pending_resets:
+                logger.info(
+                    f"Queue empty with {len(self._pending_resets)} pending resets, "
+                    f"waiting for resets to complete..."
+                )
+                await self.drain_pending_resets(timeout_s=remaining)
+
+            try:
+                sandbox = await asyncio.wait_for(
+                    self._queue.get(),
+                    timeout=min(remaining, 5.0),  # Short timeout to recheck
+                )
+                wait_time = time.monotonic() - start_time
+                if wait_time > 1.0:
+                    logger.info(
+                        f"Sandbox checkout took {wait_time:.2f}s "
+                        f"(waited for pending resets)"
+                    )
+                return sandbox
+            except asyncio.TimeoutError:
+                # Retry - more resets may have completed
+                continue
 
     async def release(self, sandbox: Sandbox) -> None:
         """

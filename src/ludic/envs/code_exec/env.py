@@ -132,7 +132,9 @@ class CodeExecEnv(SingleAgentEnv):
         """Return the configured system prompt."""
         return self._system_prompt
 
-    async def env_reset(self, *, seed: Optional[int] = None) -> Tuple[Observation, Info]:
+    async def env_reset(
+        self, *, seed: Optional[int] = None
+    ) -> Tuple[Observation, Info]:
         """
         Reset the environment for a new episode.
 
@@ -232,8 +234,10 @@ class CodeExecEnv(SingleAgentEnv):
         if result is None:
             # Checkout sandbox from pool
             sandbox = await self._sandbox_pool.checkout()
+            print(f"Checkout sandbox: {sandbox}")
 
             try:
+                print(f"Running tests for code: {code}")
                 # Run tests via code runner
                 result = await self._code_runner.run_tests(
                     sandbox=sandbox,
@@ -335,7 +339,9 @@ class CodeExecEnv(SingleAgentEnv):
         # Compilation failed - show compile error
         if result.compile_failed:
             first = result.results[0]
-            compile_err = first.execution.compile_result.error_message or "Unknown error"
+            compile_err = (
+                first.execution.compile_result.error_message or "Unknown error"
+            )
 
             # Truncate error if too long
             if len(compile_err) > self._config.max_error_length:
@@ -354,9 +360,7 @@ class CodeExecEnv(SingleAgentEnv):
             # Should never happen, but handle gracefully
             return f"Tests failed: {result.passed_count}/{result.total_count} passed"
 
-        obs_parts = [
-            f"Tests failed: {result.passed_count}/{result.total_count} passed"
-        ]
+        obs_parts = [f"Tests failed: {result.passed_count}/{result.total_count} passed"]
 
         # Add first failure details
         if first_failure.comparison_details:
@@ -424,28 +428,23 @@ class CodeExecEnv(SingleAgentEnv):
             "problem_id": self._problem_id,
             "code_hash": code_hash,
             "tests_hash": self._tests_hash,
-
             # Test results summary
             "passed": result.passed_count,
             "total": result.total_count,
             "all_passed": result.all_passed,
             "pass_rate": result.pass_rate,
             "compile_failed": result.compile_failed,
-
             # Detailed test results
             "test_results": test_results,
-
             # Timing
             "timing": {
                 "total_compile_ms": result.total_compile_ms,
                 "total_run_ms": result.total_run_ms,
                 "total_execution_ms": result.total_execution_ms,
             },
-
             # Cache info
             "cache_hit": cache_hit,
             "cache_stats": self._sandbox_pool.cache_stats,
-
             # Environment metadata
             "python_version": self._sandbox_pool.python_version,
         }
