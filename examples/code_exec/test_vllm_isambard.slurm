@@ -13,6 +13,9 @@ echo "Platform: $(uname -m)"
 echo "uv version: $(uv --version)"
 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"
 
+echo "=== Installing Python 3.12 ==="
+uv python install 3.12
+
 echo ""
 echo "=== Syncing environment (automatic CUDA wheels) ==="
 uv sync
@@ -20,6 +23,10 @@ uv sync
 echo ""
 echo "=== Verifying installed packages ==="
 uv pip list | grep -E "^(torch|vllm)" || true
+
+echo ""
+echo "=== Testing sqlite3 ==="
+uv run python -c "import sqlite3; print('sqlite3 works!')"
 
 echo ""
 echo "=== Testing PyTorch CUDA ==="

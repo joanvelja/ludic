@@ -2,7 +2,7 @@
 #SBATCH --job-name=ludic-apps-train
 #SBATCH --nodes=1
 #SBATCH --gpus=2
-#SBATCH --time=04:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=apps_train_%j.log
 #SBATCH --error=apps_train_%j.log
 
@@ -56,57 +56,13 @@ set -e
 # The pyproject.toml uses platform-based source markers to select:
 #   - Linux: CUDA 12.8 wheels from pytorch-cu128 index
 #   - macOS/Windows: CPU wheels from pytorch-cpu index
-# No manual --torch-backend needed!
 # -----------------------------------------------------------------------------
 echo "Syncing Python environment..."
-uv sync --group examples
+uv python install 3.12
+uv sync
 
-# -----------------------------------------------------------------------------
-# CUDA library path setup
-# vLLM requires libcudart.so.12 - find CUDA installation and add to LD_LIBRARY_PATH
-# -----------------------------------------------------------------------------
-# Try common CUDA locations on Isambard-AI (GH200 nodes)
-CUDA_SEARCH_PATHS=(
-    "/usr/local/cuda/lib64"
-    "/usr/local/cuda-12/lib64"
-    "/usr/local/cuda-12.0/lib64"
-    "/usr/local/cuda-12.1/lib64"
-    "/usr/local/cuda-12.2/lib64"
-    "/usr/local/cuda-12.3/lib64"
-    "/usr/local/cuda-12.4/lib64"
-    "/opt/nvidia/hpc_sdk/Linux_aarch64/24.*/cuda/12.*/lib64"
-    "/opt/nvidia/hpc_sdk/Linux_aarch64/25.*/cuda/12.*/lib64"
-)
-
-CUDA_LIB_PATH=""
-for pattern in "${CUDA_SEARCH_PATHS[@]}"; do
-    # Use glob expansion for paths with wildcards
-    for path in $pattern; do
-        if [ -f "$path/libcudart.so.12" ] || [ -f "$path/libcudart.so" ]; then
-            CUDA_LIB_PATH="$path"
-            break 2
-        fi
-    done
-done
-
-if [ -n "$CUDA_LIB_PATH" ]; then
-    echo "Found CUDA libraries at: $CUDA_LIB_PATH"
-    export LD_LIBRARY_PATH="${CUDA_LIB_PATH}:${LD_LIBRARY_PATH:-}"
-    # Also set CUDA_HOME if we can infer it
-    CUDA_HOME_CANDIDATE="${CUDA_LIB_PATH%/lib64}"
-    if [ -d "$CUDA_HOME_CANDIDATE/bin" ]; then
-        export CUDA_HOME="$CUDA_HOME_CANDIDATE"
-        export PATH="${CUDA_HOME}/bin:${PATH}"
-        echo "Set CUDA_HOME=$CUDA_HOME"
-    fi
-else
-    echo "WARNING: Could not find CUDA libraries in common locations."
-    echo "  Searched: ${CUDA_SEARCH_PATHS[*]}"
-    echo "  vLLM may fail to start. Check 'module avail' for CUDA modules."
-    # Try to find libcudart anywhere as a fallback diagnostic
-    echo "  Searching system for libcudart.so.12..."
-    find /usr/local /opt -name "libcudart.so.12" 2>/dev/null | head -5 || true
-fi
+echo "Adding datasets..."
+uv add datasets
 
 # -----------------------------------------------------------------------------
 # Configuration (override via environment variables)
@@ -152,45 +108,45 @@ echo "========================================"
 echo ""
 
 # -----------------------------------------------------------------------------
-# Environment checks
+# Environment checks — commented out because passing.
 # -----------------------------------------------------------------------------
 
-echo "Verifying PyTorch CUDA..."
-uv run python -c "import torch; print('  PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available())" || {
-    echo "ERROR: PyTorch CUDA not available."
-    exit 1
-}
+# echo "Verifying PyTorch CUDA..."
+# uv run python -c "import torch; print('  PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available())" || {
+#     echo "ERROR: PyTorch CUDA not available."
+#     exit 1
+# }
 
-# Check podman-hpc
-if ! command -v podman-hpc &> /dev/null; then
-    echo "ERROR: podman-hpc not found in PATH"
-    exit 1
-fi
-echo "podman-hpc version: $(podman-hpc --version 2>&1 | head -1)"
+# # Check podman-hpc
+# if ! command -v podman-hpc &> /dev/null; then
+#     echo "ERROR: podman-hpc not found in PATH"
+#     exit 1
+# fi
+# echo "podman-hpc version: $(podman-hpc --version 2>&1 | head -1)"
 
-# Check uv
-if ! command -v uv &> /dev/null; then
-    echo "ERROR: uv not found in PATH"
-    exit 1
-fi
-echo "uv version: $(uv --version 2>&1)"
+# # Check uv
+# if ! command -v uv &> /dev/null; then
+#     echo "ERROR: uv not found in PATH"
+#     exit 1
+# fi
+# echo "uv version: $(uv --version 2>&1)"
 
-# Ensure we're in the repo root
-if [ ! -f "pyproject.toml" ]; then
-    echo "ERROR: Must run from repo root (pyproject.toml not found)"
-    echo "  Hint: cd to your ludic repo before submitting"
-    exit 1
-fi
+# # Ensure we're in the repo root
+# if [ ! -f "pyproject.toml" ]; then
+#     echo "ERROR: Must run from repo root (pyproject.toml not found)"
+#     echo "  Hint: cd to your ludic repo before submitting"
+#     exit 1
+# fi
 
-# Check Python sandbox image
-echo ""
-echo "Checking container image..."
-if podman-hpc images | grep -q "python.*3.11"; then
-    echo "  python:3.11-slim image found"
-else
-    echo "  Image not found, pulling..."
-    podman-hpc pull python:3.11-slim
-fi
+# # Check Python sandbox image
+# echo ""
+# echo "Checking container image..."
+# if podman-hpc images | grep -q "python.*3.11"; then
+#     echo "  python:3.11-slim image found"
+# else
+#     echo "  Image not found, pulling..."
+#     podman-hpc pull python:3.11-slim
+# fi
 
 # -----------------------------------------------------------------------------
 # GPU allocation

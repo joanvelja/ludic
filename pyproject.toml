@@ -3,9 +3,10 @@ name = "ludic"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "aiohttp>=3.13.2",
+    "datasets>=4.4.2",
     "openai>=2.7.1",
     "peft>=0.18.0",
     "rich>=14.2.0",
@@ -16,6 +17,7 @@ dependencies = [
     "torch>=2.9.0",
     # vLLM is Linux-only (depends on NVIDIA libraries)
     # Use sys_platform marker to skip on macOS/Windows
+    "torch-c-dlpack-ext>=0.1.4",
     "vllm>=0.12.0; sys_platform == 'linux'",
 ]
 

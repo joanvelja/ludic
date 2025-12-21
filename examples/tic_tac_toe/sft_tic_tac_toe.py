@@ -116,7 +116,7 @@ def main() -> None:
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": "cpu"},
         low_cpu_mem_usage=True,
         trust_remote_code=True,

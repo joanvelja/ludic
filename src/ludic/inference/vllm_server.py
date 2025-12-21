@@ -29,8 +29,10 @@ from vllm.entrypoints.openai.cli_args import (
     validate_parsed_serve_args,
 )
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import FlexibleArgumentParser, set_ulimit
-from vllm.transformers_utils.tokenizer import init_tokenizer_from_configs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.system_utils import set_ulimit
+from vllm.tokenizers import cached_tokenizer_from_config
+
 
 # V1 logits-processor interface
 from vllm.v1.sample.logits_processor.interface import (
@@ -337,9 +339,7 @@ async def run_server(args: Namespace) -> None:
     #    the engine will use. This is controller-side only.
     # --------------------------------------------------------------
     try:
-        tokenizer = init_tokenizer_from_configs(
-            model_config=vllm_config.model_config
-        )
+        tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
         think_ids = tokenizer.encode("</think>", add_special_tokens=False)
         vllm_config.additional_config["think_ids"] = think_ids
     except Exception as e:
@@ -535,11 +535,8 @@ async def run_server(args: Namespace) -> None:
         return {"status": "ok"}
 
     # ------------------------ start HTTP server --------------------------
-
-    vllm_config_live = await engine.get_vllm_config()
-    print(vllm_config_live)
-
-    await init_app_state(engine, vllm_config_live, app.state, args)
+    
+    await init_app_state(engine, app.state, args)
 
     shutdown_task = await serve_http(
         app,
