@@ -22,7 +22,17 @@ Write a Python solution that:
 2. Prints the output to stdout using print()
 3. Handles all edge cases correctly
 
-Output ONLY valid Python code, no explanations or markdown."""
+You **MUST** output your answer in the following format:
+
+<think>
+...
+</think>
+
+<code>
+```python
+...
+```
+</code>"""
 
 
 class APPSTestAdapter:

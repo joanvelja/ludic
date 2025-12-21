@@ -117,7 +117,9 @@ def code_block_parser(raw: str) -> ParseResult:
 
     if match:
         code = match.group(1).strip()
-        return ParseResult(action=code, reward=0.05, obs=None)  # Small bonus for proper formatting
+        return ParseResult(
+            action=code, reward=0.05, obs=None
+        )  # Small bonus for proper formatting
 
     # Fall back to raw text (strip leading/trailing whitespace)
     code = raw.strip()
@@ -157,13 +159,15 @@ def load_apps_samples(
         if row.get("is_nondeterministic", False):
             continue
 
-        samples.append({
-            "problem_id": row.get("problem_id", str(idx)),
-            "question": row["question"],
-            "inputs": row.get("inputs", []),
-            "outputs": row.get("outputs", []),
-            "difficulty": row.get("difficulty", "unknown"),
-        })
+        samples.append(
+            {
+                "problem_id": row.get("problem_id", str(idx)),
+                "question": row["question"],
+                "inputs": row.get("inputs", []),
+                "outputs": row.get("outputs", []),
+                "difficulty": row.get("difficulty", "unknown"),
+            }
+        )
 
         if limit is not None and len(samples) >= limit:
             break
@@ -171,10 +175,10 @@ def load_apps_samples(
     return samples
 
 
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Train on APPS code generation dataset with LoRA")
+    parser = argparse.ArgumentParser(
+        description="Train on APPS code generation dataset with LoRA"
+    )
 
     # Model and inference
     parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
@@ -183,12 +187,18 @@ def main():
 
     # LoRA configuration
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
-    parser.add_argument("--lora-alpha-mult", type=float, default=2.0, help="LoRA alpha = rank * mult")
+    parser.add_argument(
+        "--lora-alpha-mult", type=float, default=2.0, help="LoRA alpha = rank * mult"
+    )
     parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout")
 
     # KL regularization
-    parser.add_argument("--kl-coeff", type=float, default=0.0,
-                        help="KL penalty coefficient (0 = disabled)")
+    parser.add_argument(
+        "--kl-coeff",
+        type=float,
+        default=0.0,
+        help="KL penalty coefficient (0 = disabled)",
+    )
 
     # Data
     parser.add_argument("--split", default="train", help="Dataset split")
@@ -196,47 +206,103 @@ def main():
     parser.add_argument("--difficulty", default=None, help="Filter by difficulty")
 
     # Sandbox
-    parser.add_argument("--sandbox-workers", type=int, default=4, help="Number of sandbox containers")
-    parser.add_argument("--sandbox-backend", default="auto",
-                        choices=["auto", "docker", "podman-hpc"],
-                        help="Sandbox backend (default: auto-detect)")
-    parser.add_argument("--python-version", default="3.11", help="Python version in sandbox")
-    parser.add_argument("--minimal-sandbox", action="store_true",
-                        help="Use minimal sandbox config (no memory/network limits) for HPC compatibility")
-    parser.add_argument("--timeout-per-test", type=float, default=5.0, help="Timeout per test (seconds)")
+    parser.add_argument(
+        "--sandbox-workers", type=int, default=4, help="Number of sandbox containers"
+    )
+    parser.add_argument(
+        "--sandbox-backend",
+        default="auto",
+        choices=["auto", "docker", "podman-hpc"],
+        help="Sandbox backend (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--python-version", default="3.11", help="Python version in sandbox"
+    )
+    parser.add_argument(
+        "--minimal-sandbox",
+        action="store_true",
+        help="Use minimal sandbox config (no memory/network limits) for HPC compatibility",
+    )
+    parser.add_argument(
+        "--timeout-per-test", type=float, default=5.0, help="Timeout per test (seconds)"
+    )
 
     # Training
-    parser.add_argument("--concurrency", type=int, default=32, help="Rollout concurrency")
-    parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch")
-    parser.add_argument("--train-steps", type=int, default=100, help="Training steps (0=run until exhausted)")
+    parser.add_argument(
+        "--concurrency", type=int, default=32, help="Rollout concurrency"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=4, help="Rollout requests per batch"
+    )
+    parser.add_argument(
+        "--train-steps",
+        type=int,
+        default=100,
+        help="Training steps (0=run until exhausted)",
+    )
     parser.add_argument("--group-size", type=int, default=8, help="GRPO group size")
-    parser.add_argument("--train-temperature", type=float, default=0.8, help="Sampling temperature")
-    parser.add_argument("--partial-credit", action="store_true", help="Enable partial credit rewards")
+    parser.add_argument(
+        "--train-temperature", type=float, default=0.8, help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--partial-credit", action="store_true", help="Enable partial credit rewards"
+    )
 
     # Evaluation
-    parser.add_argument("--eval-samples", type=int, default=200, help="Number of samples to hold out for eval")
-    parser.add_argument("--eval-every", type=int, default=25, help="Eval every N training steps")
-    parser.add_argument("--eval-before-start", action="store_true", default=True, help="Run baseline eval")
-    parser.add_argument("--eval-concurrency", type=int, default=32, help="Eval concurrency")
-    parser.add_argument("--eval-temperature", type=float, default=0.0, help="Eval sampling temperature (greedy)")
+    parser.add_argument(
+        "--eval-samples",
+        type=int,
+        default=200,
+        help="Number of samples to hold out for eval",
+    )
+    parser.add_argument(
+        "--eval-every", type=int, default=25, help="Eval every N training steps"
+    )
+    parser.add_argument(
+        "--eval-before-start",
+        action="store_true",
+        default=True,
+        help="Run baseline eval",
+    )
+    parser.add_argument(
+        "--eval-concurrency", type=int, default=32, help="Eval concurrency"
+    )
+    parser.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=0.0,
+        help="Eval sampling temperature (greedy)",
+    )
 
     # Logging
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", type=str, default="ludic-apps", help="WandB project name")
+    parser.add_argument(
+        "--wandb", action="store_true", help="Enable Weights & Biases logging"
+    )
+    parser.add_argument(
+        "--wandb-project", type=str, default="ludic-apps", help="WandB project name"
+    )
 
     # Checkpoints
     parser.add_argument("--rollout-log", default="apps_train_rollouts.jsonl")
     parser.add_argument("--checkpoint-dir", default="checkpoints_apps")
     parser.add_argument("--checkpoint-every", type=int, default=25)
-    parser.add_argument("--final-save", action="store_true", help="Save final checkpoint after training")
+    parser.add_argument(
+        "--final-save", action="store_true", help="Save final checkpoint after training"
+    )
 
     args = parser.parse_args()
 
     # Warn about concurrency/pool mismatch
     if args.concurrency > args.sandbox_workers:
-        print(f"WARNING: concurrency ({args.concurrency}) > sandbox-workers ({args.sandbox_workers})")
-        print(f"  This means {args.concurrency - args.sandbox_workers} tasks will wait for sandboxes.")
-        print(f"  Consider: --sandbox-workers={args.concurrency} OR --concurrency={args.sandbox_workers}")
+        print(
+            f"WARNING: concurrency ({args.concurrency}) > sandbox-workers ({args.sandbox_workers})"
+        )
+        print(
+            f"  This means {args.concurrency - args.sandbox_workers} tasks will wait for sandboxes."
+        )
+        print(
+            f"  Consider: --sandbox-workers={args.concurrency} OR --concurrency={args.sandbox_workers}"
+        )
         print()
 
     # Setup rollout log
@@ -253,8 +319,8 @@ def main():
 
     # Split: last N samples for eval (deterministic, reproducible)
     if args.eval_samples > 0 and len(all_samples) > args.eval_samples:
-        train_samples = all_samples[:-args.eval_samples]
-        eval_samples = all_samples[-args.eval_samples:]
+        train_samples = all_samples[: -args.eval_samples]
+        eval_samples = all_samples[-args.eval_samples :]
     else:
         train_samples = all_samples
         eval_samples = []
@@ -294,7 +360,9 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.print_trainable_parameters()
-    print(f"Model loaded on {device} with LoRA (rank={args.lora_rank}, alpha={int(args.lora_rank * args.lora_alpha_mult)}).")
+    print(
+        f"Model loaded on {device} with LoRA (rank={args.lora_rank}, alpha={int(args.lora_rank * args.lora_alpha_mult)})."
+    )
 
     # Setup sandbox pool
     loop = asyncio.new_event_loop()
@@ -324,7 +392,7 @@ def main():
     test_adapter = APPSTestAdapter()
     env_config = CodeExecConfig(
         timeout_per_test_s=args.timeout_per_test,
-        stop_on_first_failure=True,
+        stop_on_first_failure=False,
         compile_first=True,
         partial_credit=args.partial_credit,
         compile_failure_reward=-0.1,
@@ -368,18 +436,20 @@ def main():
     # Build loss with optional KL penalty
     if args.kl_coeff > 0:
         # CompositeLoss: PPO + KL penalty
-        loss = CompositeLoss(terms=[
-            LossTerm(
-                name="policy",
-                loss=ClippedSurrogateLoss(clip_eps=0.1, length_normalize=True),
-                weight=1.0,
-            ),
-            LossTerm(
-                name="kl",
-                loss=KLLoss(coeff=args.kl_coeff),
-                weight=1.0,
-            ),
-        ])
+        loss = CompositeLoss(
+            terms=[
+                LossTerm(
+                    name="policy",
+                    loss=ClippedSurrogateLoss(clip_eps=0.1, length_normalize=True),
+                    weight=1.0,
+                ),
+                LossTerm(
+                    name="kl",
+                    loss=KLLoss(coeff=args.kl_coeff),
+                    weight=1.0,
+                ),
+            ]
+        )
         print(f"Using GRPO with KL penalty (coeff={args.kl_coeff})")
     else:
         # Standard GRPO (no KL penalty)
@@ -437,7 +507,11 @@ def main():
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         eval_at_start=bool(args.eval_before_start and eval_samples),
-        eval_every_n_steps=(args.eval_every if args.eval_every and args.eval_every > 0 and eval_samples else None),
+        eval_every_n_steps=(
+            args.eval_every
+            if args.eval_every and args.eval_every > 0 and eval_samples
+            else None
+        ),
         eval_concurrency=args.eval_concurrency,
         eval_max_steps=1,
     )
@@ -534,6 +608,7 @@ def main():
     # Configure logger (WandB or RichLive terminal dashboard)
     if args.wandb:
         import wandb
+
         run = wandb.init(
             project=args.wandb_project,
             config={
@@ -566,7 +641,9 @@ def main():
     evaluator = None
     if eval_samples:
         evaluator = EngineEvaluator(
-            engine=RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry),
+            engine=RolloutEngine(
+                env_registry=env_registry, protocol_registry=protocol_registry
+            ),
             requests_fn=lambda: [
                 RolloutRequest(
                     env=EnvSpec(kind="apps", kwargs={"sample": sample}),
@@ -588,7 +665,9 @@ def main():
             timeout_s=cfg.eval_timeout_s,
             concurrency=cfg.eval_concurrency,
         )
-        print(f"Eval configured: {len(eval_samples)} samples, every {args.eval_every} steps")
+        print(
+            f"Eval configured: {len(eval_samples)} samples, every {args.eval_every} steps"
+        )
 
     trainer = Trainer(
         model=model,
@@ -636,6 +715,7 @@ def main():
     # Close WandB if used
     if args.wandb:
         import wandb
+
         wandb.finish()
         print("WandB run finished.")
 
