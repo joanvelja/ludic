@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# wandb files
+wandb/
+
 # Slurm logs
 *.log
 
