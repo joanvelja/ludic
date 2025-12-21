@@ -14,3 +14,7 @@ wheels/
 
 # Big jsonl files
 *.jsonl
+
+# Environment files (secrets)
+.env
+.env.*

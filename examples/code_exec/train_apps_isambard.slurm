@@ -16,10 +16,13 @@
 #   - GRPO with optional KL regularization
 #
 # Prerequisites:
-#   1. Pre-pull the Python sandbox image:
+#   1. Create a .env file with your HF_TOKEN in the repo root:
+#      echo 'HF_TOKEN=your_token_here' > .env
+#
+#   2. Pre-pull the Python sandbox image:
 #      podman-hpc pull python:3.11-slim
 #
-#   2. (Optional) Login to WandB for cloud logging:
+#   3. (Optional) Login to WandB for cloud logging:
 #      wandb login
 #
 # Usage:
@@ -77,7 +80,7 @@ SANDBOX_WORKERS="${SANDBOX_WORKERS:-64}"
 CONCURRENCY="${CONCURRENCY:-64}"
 LORA_RANK="${LORA_RANK:-8}"
 KL_COEFF="${KL_COEFF:-0.0}"
-USE_WANDB="${USE_WANDB:-0}"
+USE_WANDB="${USE_WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-ludic-apps}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 
@@ -107,12 +110,19 @@ echo "  WandB: $([ "$USE_WANDB" = "1" ] && echo "enabled" || echo "disabled")"
 echo "========================================"
 echo ""
 
+# Check for .env file (required for HF_TOKEN)
+if [ ! -f ".env" ]; then
+    echo "ERROR: .env file not found. Please create it with HF_TOKEN."
+    echo "  Example: echo 'HF_TOKEN=your_token_here' > .env"
+    exit 1
+fi
+
 # -----------------------------------------------------------------------------
 # Environment checks — commented out because passing.
 # -----------------------------------------------------------------------------
 
 # echo "Verifying PyTorch CUDA..."
-# uv run python -c "import torch; print('  PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available())" || {
+# uv run --env-file .env python -c "import torch; print('  PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available())" || {
 #     echo "ERROR: PyTorch CUDA not available."
 #     exit 1
 # }
@@ -175,7 +185,7 @@ echo "========================================"
 # Create log file for vLLM
 VLLM_LOG="vllm_server_${SLURM_JOB_ID}.log"
 
-CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run python -m ludic.inference.vllm_server \
+CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_server \
     --model "$MODEL" \
     --port $VLLM_PORT \
     --trust-remote-code \
@@ -232,7 +242,7 @@ echo "Starting training..."
 echo "========================================"
 
 # Build training command
-TRAIN_CMD="uv run python examples/code_exec/train_apps.py"
+TRAIN_CMD="uv run --env-file .env python examples/code_exec/train_apps.py"
 TRAIN_CMD="$TRAIN_CMD --model $MODEL"
 TRAIN_CMD="$TRAIN_CMD --host 127.0.0.1 --port $VLLM_PORT"
 TRAIN_CMD="$TRAIN_CMD --limit $LIMIT"

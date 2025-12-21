@@ -2,18 +2,29 @@
 
 Train language models on code generation tasks with sandboxed test-driven evaluation.
 
+## Prerequisites
+
+**HuggingFace Token**: To avoid rate limits when downloading models, set up a `.env` file with your HuggingFace token:
+
+```bash
+# Create .env file with your HF token (get one from https://huggingface.co/settings/tokens)
+echo 'HF_TOKEN=your_hf_token_here' > .env
+```
+
+The `.env` file is already in `.gitignore`. Use `--env-file .env` with `uv run` commands.
+
 ## TL;DR (Local Development)
 
 ```bash
 # 1. Start inference server
-CUDA_VISIBLE_DEVICES=0 uv run python -m ludic.inference.vllm_server \
+CUDA_VISIBLE_DEVICES=0 uv run --env-file .env python -m ludic.inference.vllm_server \
     --model Qwen/Qwen2.5-Coder-0.5B-Instruct
 
 # 2. Install dependencies
 pip install docker datasets
 
 # 3. Run training (auto-detects Docker)
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/code_exec/train_apps.py \
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run --env-file .env python examples/code_exec/train_apps.py \
     --model Qwen/Qwen2.5-Coder-0.5B-Instruct \
     --limit 100 \
     --train-steps 10
