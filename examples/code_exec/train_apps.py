@@ -610,10 +610,11 @@ def main():
     print(f"  Concurrency: {args.concurrency}")
     print(f"  Sandbox workers: {args.sandbox_workers}")
     print(f"  Sandbox backend: {args.sandbox_backend}")
+    print(f"  Progress will be logged every training step.")
     print()
 
     try:
-        trainer.train_sync(args.train_steps)
+        loop.run_until_complete(trainer.train(args.train_steps))
     except RequestsExhausted:
         print("Training samples exhausted; stopping.")
     except KeyboardInterrupt:
