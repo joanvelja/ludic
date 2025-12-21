@@ -45,6 +45,10 @@ To reset corrupted podman-hpc state:
 
 from __future__ import annotations
 
+import os
+
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 import argparse
 import asyncio
 import sys
@@ -59,9 +63,12 @@ from ludic.inference.request import ChatCompletionRequest
 
 # Check early for podman-hpc availability
 import shutil
+
 if not shutil.which("podman-hpc"):
     print("ERROR: podman-hpc not found in PATH")
-    print("  On Isambard, ensure you're in a Slurm job or on a login node with podman-hpc")
+    print(
+        "  On Isambard, ensure you're in a Slurm job or on a login node with podman-hpc"
+    )
     sys.exit(1)
 
 
@@ -74,6 +81,7 @@ def log(msg: str, level: str = "INFO") -> None:
 # ============================================================================
 # Test 1: Podman-HPC Sandbox Pool
 # ============================================================================
+
 
 async def test_sandbox_pool(n_workers: int = 2, minimal_config: bool = True) -> bool:
     """Test that we can create and use a Podman-HPC sandbox pool."""
@@ -117,11 +125,15 @@ async def test_sandbox_pool(n_workers: int = 2, minimal_config: bool = True) -> 
 
         log("  Testing compile...")
         compile_result = await sandbox.compile("print('hello')")
-        assert compile_result.status == CompileStatus.SUCCESS, f"Compile failed: {compile_result}"
+        assert compile_result.status == CompileStatus.SUCCESS, (
+            f"Compile failed: {compile_result}"
+        )
 
         log("  Testing execute...")
         exec_result = await sandbox.execute("print('Hello from Podman-HPC!')")
-        assert exec_result.run_status == RunStatus.SUCCESS, f"Execute failed: {exec_result}"
+        assert exec_result.run_status == RunStatus.SUCCESS, (
+            f"Execute failed: {exec_result}"
+        )
         assert "Hello from Podman-HPC!" in exec_result.stdout
 
         log("  Testing stdin handling...")
@@ -138,6 +150,7 @@ async def test_sandbox_pool(n_workers: int = 2, minimal_config: bool = True) -> 
     except Exception as e:
         log(f"  Sandbox pool test FAILED: {e}", "ERROR")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -149,6 +162,7 @@ async def test_sandbox_pool(n_workers: int = 2, minimal_config: bool = True) -> 
 # ============================================================================
 # Test 2: CodeExecEnv
 # ============================================================================
+
 
 async def test_code_exec_env(minimal_config: bool = True) -> bool:
     """Test CodeExecEnv reset/step cycle."""
@@ -166,7 +180,9 @@ async def test_code_exec_env(minimal_config: bool = True) -> bool:
     if minimal_config:
         pool_config = PodmanConfig(memory_limit=None, network_disabled=False, gpu=False)
     else:
-        pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+        pool_config = PodmanConfig(
+            memory_limit="128m", network_disabled=True, gpu=False
+        )
     pool = PodmanHPCSandboxPool(
         n_workers=2,
         image="python:3.11-slim",
@@ -216,7 +232,9 @@ async def test_code_exec_env(minimal_config: bool = True) -> bool:
         assert outcome.reward == 1.0, f"Expected reward=1.0, got {outcome.reward}"
         assert outcome.info["all_passed"] is True
         assert outcome.info["passed"] == 3
-        log(f"  Correct code: reward={outcome.reward}, passed={outcome.info['passed']}/{outcome.info['total']}")
+        log(
+            f"  Correct code: reward={outcome.reward}, passed={outcome.info['passed']}/{outcome.info['total']}"
+        )
 
         # Test step with wrong code (need new env instance)
         env2 = CodeExecEnv(
@@ -234,7 +252,9 @@ async def test_code_exec_env(minimal_config: bool = True) -> bool:
         assert outcome2.terminated is True
         assert outcome2.reward == 0.0
         assert outcome2.info["all_passed"] is False
-        log(f"  Wrong code: reward={outcome2.reward}, passed={outcome2.info['passed']}/{outcome2.info['total']}")
+        log(
+            f"  Wrong code: reward={outcome2.reward}, passed={outcome2.info['passed']}/{outcome2.info['total']}"
+        )
 
         log("  CodeExecEnv test PASSED", "SUCCESS")
         return True
@@ -242,6 +262,7 @@ async def test_code_exec_env(minimal_config: bool = True) -> bool:
     except Exception as e:
         log(f"  CodeExecEnv test FAILED: {e}", "ERROR")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -252,6 +273,7 @@ async def test_code_exec_env(minimal_config: bool = True) -> bool:
 # ============================================================================
 # Test 3: RolloutEngine with Protocol
 # ============================================================================
+
 
 async def test_rollout_engine(minimal_config: bool = True) -> bool:
     """Test RolloutEngine generates rollouts correctly."""
@@ -279,7 +301,9 @@ async def test_rollout_engine(minimal_config: bool = True) -> bool:
             self.code = code_to_return
             self.call_count = 0
 
-        async def complete(self, request: ChatCompletionRequest) -> Tuple[ChatResponse, Dict[str, Any]]:
+        async def complete(
+            self, request: ChatCompletionRequest
+        ) -> Tuple[ChatResponse, Dict[str, Any]]:
             self.call_count += 1
             text = f"```python\n{self.code}\n```"
             return ChatResponse(
@@ -295,6 +319,7 @@ async def test_rollout_engine(minimal_config: bool = True) -> bool:
     def simple_parser(raw: str) -> ParseResult:
         """Extract code from markdown blocks."""
         import re
+
         match = re.search(r"```(?:python)?\s*\n(.*?)\n```", raw, re.DOTALL)
         if match:
             return ParseResult(action=match.group(1).strip(), reward=0.0, obs=None)
@@ -304,7 +329,9 @@ async def test_rollout_engine(minimal_config: bool = True) -> bool:
     if minimal_config:
         pool_config = PodmanConfig(memory_limit=None, network_disabled=False, gpu=False)
     else:
-        pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+        pool_config = PodmanConfig(
+            memory_limit="128m", network_disabled=True, gpu=False
+        )
     pool = PodmanHPCSandboxPool(
         n_workers=2,
         image="python:3.11-slim",
@@ -383,6 +410,7 @@ async def test_rollout_engine(minimal_config: bool = True) -> bool:
     except Exception as e:
         log(f"  RolloutEngine test FAILED: {e}", "ERROR")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -393,6 +421,7 @@ async def test_rollout_engine(minimal_config: bool = True) -> bool:
 # ============================================================================
 # Test 4: Training Step (Mock)
 # ============================================================================
+
 
 async def test_training_step(minimal_config: bool = True) -> bool:
     """Test a single training step with mock model and inference."""
@@ -437,7 +466,9 @@ async def test_training_step(minimal_config: bool = True) -> bool:
 
         # Mock inference client
         class MockClient:
-            async def complete(self, request: ChatCompletionRequest) -> Tuple[ChatResponse, Dict[str, Any]]:
+            async def complete(
+                self, request: ChatCompletionRequest
+            ) -> Tuple[ChatResponse, Dict[str, Any]]:
                 text = "```python\na, b = map(int, input().split()); print(a + b)\n```"
                 return ChatResponse(
                     text=text,
@@ -451,6 +482,7 @@ async def test_training_step(minimal_config: bool = True) -> bool:
 
         def simple_parser(raw: str) -> ParseResult:
             import re
+
             match = re.search(r"```(?:python)?\s*\n(.*?)\n```", raw, re.DOTALL)
             if match:
                 return ParseResult(action=match.group(1).strip(), reward=0.0, obs=None)
@@ -458,9 +490,13 @@ async def test_training_step(minimal_config: bool = True) -> bool:
 
         # Use minimal config for HPC compatibility
         if minimal_config:
-            pool_config = PodmanConfig(memory_limit=None, network_disabled=False, gpu=False)
+            pool_config = PodmanConfig(
+                memory_limit=None, network_disabled=False, gpu=False
+            )
         else:
-            pool_config = PodmanConfig(memory_limit="128m", network_disabled=True, gpu=False)
+            pool_config = PodmanConfig(
+                memory_limit="128m", network_disabled=True, gpu=False
+            )
         pool = PodmanHPCSandboxPool(
             n_workers=2,
             image="python:3.11-slim",
@@ -512,14 +548,17 @@ async def test_training_step(minimal_config: bool = True) -> bool:
 
         def requests_fn():
             from ludic.training import RolloutRequest
+
             if sample_idx[0] >= len(samples):
                 return []
             s = samples[sample_idx[0]]
             sample_idx[0] += 1
-            return [RolloutRequest(
-                env=EnvSpec(kind="code_exec", kwargs={"sample": s}),
-                protocol=ProtocolSpec(kind="single_agent", kwargs={}),
-            )]
+            return [
+                RolloutRequest(
+                    env=EnvSpec(kind="code_exec", kwargs={"sample": s}),
+                    protocol=ProtocolSpec(kind="single_agent", kwargs={}),
+                )
+            ]
 
         algo = make_reinforce(name="reinforce")
 
@@ -541,7 +580,8 @@ async def test_training_step(minimal_config: bool = True) -> bool:
 
         # Mock publisher (no-op)
         class MockPublisher:
-            def publish(self, state_dict): pass
+            def publish(self, state_dict, version):
+                pass
 
         trainer = Trainer(
             model=model,
@@ -554,7 +594,7 @@ async def test_training_step(minimal_config: bool = True) -> bool:
         log("  Running single training step...")
         # Run one step
         try:
-            trainer.train_sync(max_steps=1)
+            await trainer.train(num_steps=1)
             log("  Training step completed")
         except StopIteration:
             log("  Training stopped (samples exhausted, expected)")
@@ -571,6 +611,7 @@ async def test_training_step(minimal_config: bool = True) -> bool:
     except Exception as e:
         log(f"  Training step test FAILED: {e}", "ERROR")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -579,7 +620,10 @@ async def test_training_step(minimal_config: bool = True) -> bool:
 # Main
 # ============================================================================
 
-async def run_all_tests(skip_training: bool = False, minimal_config: bool = True) -> bool:
+
+async def run_all_tests(
+    skip_training: bool = False, minimal_config: bool = True
+) -> bool:
     """Run all smoke tests and return overall success."""
     log("=" * 60)
     log("CodeExecEnv Smoke Test for Isambard HPC")
@@ -593,7 +637,9 @@ async def run_all_tests(skip_training: bool = False, minimal_config: bool = True
     results = {}
 
     # Test 1: Sandbox Pool
-    results["sandbox_pool"] = await test_sandbox_pool(n_workers=2, minimal_config=minimal_config)
+    results["sandbox_pool"] = await test_sandbox_pool(
+        n_workers=2, minimal_config=minimal_config
+    )
 
     # Test 2: CodeExecEnv
     results["code_exec_env"] = await test_code_exec_env(minimal_config=minimal_config)
@@ -603,7 +649,9 @@ async def run_all_tests(skip_training: bool = False, minimal_config: bool = True
 
     # Test 4: Training Step (optional)
     if not skip_training:
-        results["training_step"] = await test_training_step(minimal_config=minimal_config)
+        results["training_step"] = await test_training_step(
+            minimal_config=minimal_config
+        )
     else:
         log("Skipping training step test (--skip-training)")
         results["training_step"] = True
@@ -632,7 +680,9 @@ async def run_all_tests(skip_training: bool = False, minimal_config: bool = True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smoke test for CodeExecEnv on Isambard")
+    parser = argparse.ArgumentParser(
+        description="Smoke test for CodeExecEnv on Isambard"
+    )
     parser.add_argument(
         "--skip-training",
         action="store_true",
@@ -645,10 +695,12 @@ def main():
     )
     args = parser.parse_args()
 
-    success = asyncio.run(run_all_tests(
-        skip_training=args.skip_training,
-        minimal_config=not args.full_config,
-    ))
+    success = asyncio.run(
+        run_all_tests(
+            skip_training=args.skip_training,
+            minimal_config=not args.full_config,
+        )
+    )
     sys.exit(0 if success else 1)
 
 
