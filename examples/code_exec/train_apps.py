@@ -112,7 +112,7 @@ def code_block_parser(raw: str) -> ParseResult:
     import re
 
     # Try to extract from markdown code block
-    code_block_pattern = r"```(?:python)?\s*\n(.*?)\n```"
+    code_block_pattern = r"```(?:python)?\s*\n(.*?)(?:\n)?```"
     match = re.search(code_block_pattern, raw, re.DOTALL)
 
     if match:

@@ -12,6 +12,17 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
+class SandboxPoolExhaustedError(Exception):
+    """
+    Raised when sandbox pool experiences too many consecutive failures.
+
+    This indicates a systemic issue with sandbox creation/reset that
+    requires operator intervention.
+    """
+
+    pass
+
+
 class CompileStatus(Enum):
     """Status of code compilation/syntax checking."""
 

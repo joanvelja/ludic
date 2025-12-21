@@ -24,6 +24,16 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/code_exec/train_apps.
 ## TL;DR (HPC Cluster)
 
 ```bash
+# 1. Prepare environment on LOGIN NODE (one-time, requires internet)
+./examples/code_exec/prepare_env.sh
+
+# 2. Submit Slurm job (runs on compute nodes, no internet needed)
+sbatch examples/code_exec/train_apps_isambard.slurm
+```
+
+**Manual alternative** (if not using prepare_env.sh):
+
+```bash
 # 1. Prepare container image (one-time)
 podman-hpc pull python:3.11-slim
 
@@ -48,6 +58,8 @@ EOF
 ```
 
 **Prerequisites:** Podman-HPC installed on cluster. See [Appendix: Podman-HPC Setup](#appendix-podman-hpc-setup).
+
+**Note:** The `prepare_env.sh` script pre-stages all network-dependent resources (Python, packages, container images) on the login node, so compute jobs can run without internet access.
 
 ## Architecture Overview
 
@@ -212,6 +224,20 @@ python train_apps.py --sandbox-workers 4 --concurrency 16
 podman-hpc pull python:3.11-slim  # Auto-migrates
 podman-hpc images  # Verify R/O column shows 'true'
 ```
+
+### Network access denied on compute node
+
+If you see errors about downloading packages or connecting to PyPI during job execution:
+
+```bash
+# Run environment preparation on the LOGIN NODE first
+./examples/code_exec/prepare_env.sh
+
+# Then submit the job (it won't need network access)
+sbatch examples/code_exec/train_apps_isambard.slurm
+```
+
+The `prepare_env.sh` script pre-stages Python, packages, and container images on shared storage so compute nodes can run offline.
 
 ### Integration tests skipped
 

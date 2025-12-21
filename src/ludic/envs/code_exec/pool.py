@@ -15,7 +15,7 @@ from typing import Dict, Generic, List, Optional, Set, TypeVar
 
 from .cache import LRUCache
 from .sandbox import Sandbox
-from .types import BatchTestResult
+from .types import BatchTestResult, SandboxPoolExhaustedError
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ class BaseSandboxPool(ABC, Generic[S]):
         n_workers: int = 4,
         cache_size: int = 10000,
         auto_replace_failed: bool = True,
+        max_consecutive_failures: int = 5,
     ):
         """
         Initialize the pool.
@@ -63,16 +64,20 @@ class BaseSandboxPool(ABC, Generic[S]):
             n_workers: Number of sandboxes to create
             cache_size: Maximum entries in the execution cache
             auto_replace_failed: If True, create new sandbox when reset fails
+            max_consecutive_failures: Maximum consecutive reset failures before raising
+                SandboxPoolExhaustedError (circuit breaker threshold)
         """
         self._n_workers = n_workers
         self._cache = LRUCache(max_size=cache_size)
         self._auto_replace_failed = auto_replace_failed
+        self._max_consecutive_failures = max_consecutive_failures
 
         self._sandboxes: List[S] = []
         self._queue: Optional[asyncio.Queue[S]] = None
         self._pending_resets: Set[asyncio.Task] = set()
         self._started = False
         self._shutting_down = False
+        self._consecutive_failures = 0
 
     # -------------------------------------------------------------------------
     # Abstract methods (must be implemented by subclasses)
@@ -215,11 +220,23 @@ class BaseSandboxPool(ABC, Generic[S]):
         if not self._started or self._queue is None:
             raise RuntimeError("Pool not started. Call start() first.")
 
+        import time
+
+        start_time = time.monotonic()
+        queue_size_before = self.available
+
         try:
             sandbox = await asyncio.wait_for(
                 self._queue.get(),
                 timeout=timeout_s,
             )
+            wait_time = time.monotonic() - start_time
+            if wait_time > 1.0:  # Only log if wait was noticeable
+                logger.info(
+                    f"Sandbox checkout took {wait_time:.2f}s "
+                    f"(queue was {queue_size_before}/{self._n_workers}, "
+                    f"pending resets: {self.pending_resets})"
+                )
             return sandbox
         except asyncio.TimeoutError:
             raise TimeoutError(
@@ -277,9 +294,30 @@ class BaseSandboxPool(ABC, Generic[S]):
         Handle a sandbox that failed to reset.
 
         Logs the error, removes the sandbox from the pool, and optionally
-        creates a replacement.
+        creates a replacement. Implements circuit breaker pattern to detect
+        systemic failures.
+
+        Raises:
+            SandboxPoolExhaustedError: If consecutive failures exceed threshold
         """
-        logger.warning(f"Sandbox reset failed: {error}. Discarding sandbox.")
+        # Increment failure counter
+        self._consecutive_failures += 1
+
+        logger.warning(
+            f"Sandbox reset failed: {error}. Discarding sandbox. "
+            f"Consecutive failures: {self._consecutive_failures}/{self._max_consecutive_failures}"
+        )
+
+        # Check circuit breaker threshold
+        if self._consecutive_failures >= self._max_consecutive_failures:
+            logger.error(
+                f"Circuit breaker triggered: {self._consecutive_failures} consecutive "
+                f"sandbox reset failures. Pool is exhausted."
+            )
+            raise SandboxPoolExhaustedError(
+                f"Sandbox pool exhausted after {self._consecutive_failures} consecutive "
+                f"reset failures. This indicates a systemic issue requiring operator intervention."
+            )
 
         # Remove from tracked sandboxes
         if sandbox in self._sandboxes:
@@ -299,7 +337,12 @@ class BaseSandboxPool(ABC, Generic[S]):
                     self._sandboxes.append(replacement)
                     if self._queue is not None:
                         await self._queue.put(replacement)
-                    logger.info("Created replacement sandbox after reset failure")
+                    # Reset failure counter on successful replacement
+                    self._consecutive_failures = 0
+                    logger.info(
+                        "Created replacement sandbox after reset failure. "
+                        "Consecutive failure counter reset."
+                    )
             except Exception as create_error:
                 logger.warning(f"Failed to create replacement sandbox: {create_error}")
 

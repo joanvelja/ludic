@@ -214,6 +214,11 @@ cleanup() {
         kill $VLLM_PID 2>/dev/null || true
         wait $VLLM_PID 2>/dev/null || true
     fi
+    # Clean up any ludic sandbox containers for this job
+    if [ -n "$SLURM_JOB_ID" ]; then
+        echo "  Cleaning up sandbox containers..."
+        podman-hpc ps -aq --filter "name=ludic-sandbox-${SLURM_JOB_ID}" 2>/dev/null | xargs -r podman-hpc rm -f 2>/dev/null || true
+    fi
     echo "Cleanup complete."
 }
 trap cleanup EXIT

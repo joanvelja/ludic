@@ -395,12 +395,14 @@ class DockerSandboxPool(BaseSandboxPool[DockerSandbox]):
         cache_size: int = 10000,
         executor_threads: int = 8,
         auto_replace_failed: bool = False,
+        max_consecutive_failures: int = 5,
     ):
         # Initialize base pool
         super().__init__(
             n_workers=n_workers,
             cache_size=cache_size,
             auto_replace_failed=auto_replace_failed,
+            max_consecutive_failures=max_consecutive_failures,
         )
 
         # Docker-specific configuration

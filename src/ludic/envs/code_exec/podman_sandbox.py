@@ -496,6 +496,7 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         config: Optional[PodmanConfig] = None,
         cache_size: int = 10000,
         auto_replace_failed: bool = True,
+        max_consecutive_failures: int = 5,
     ):
         """
         Initialize Podman-HPC sandbox pool.
@@ -506,11 +507,14 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             config: Podman-specific configuration
             cache_size: Maximum entries in execution cache
             auto_replace_failed: If True, create new sandbox when reset fails
+            max_consecutive_failures: Maximum consecutive reset failures before raising
+                SandboxPoolExhaustedError (circuit breaker threshold)
         """
         super().__init__(
             n_workers=n_workers,
             cache_size=cache_size,
             auto_replace_failed=auto_replace_failed,
+            max_consecutive_failures=max_consecutive_failures,
         )
         self._image = image
         self._config = config or PodmanConfig()
