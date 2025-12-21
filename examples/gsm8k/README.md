@@ -5,11 +5,11 @@ Minimal commands to train and evaluate GSM8K using a vLLM-hosted model and the p
 ## Prerequisites
 
 - At least 2 GPU(s). I used 2 A100s.
-- Required packages: `datasets`, `math-verify`.
+- Required extra packages: `datasets`, `math-verify`.
 
 Install deps (once):
 ```bash
-uv sync --group examples   # or: uv pip install datasets math-verify
+uv sync --extra examples
 ```
 
 ## 1) Start vLLM server

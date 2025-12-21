@@ -67,7 +67,7 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.12+
 
 - PyTorch >= 2.8.0 with CUDA for training examples
 
@@ -86,7 +86,7 @@ uv sync
 For running example code use:
 
 ```bash
-uv sync --group examples
+uv sync --extra examples
 ```
 
 ## TODO
