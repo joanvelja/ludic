@@ -14,10 +14,11 @@ echo "uv version: $(uv --version)"
 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo "nvidia-smi not available"
 
 echo ""
-echo "=== Syncing with CUDA backend ==="
-# This uses the pyproject.toml config + CUDA backend
+echo "=== Installing PyTorch + vLLM with CUDA backend ==="
+# --torch-backend only works with 'uv pip', not 'uv sync'
 # See: https://docs.astral.sh/uv/guides/integration/pytorch/
-uv sync --torch-backend=cu128
+uv pip install torch torchvision --torch-backend=cu128
+uv pip install vllm --torch-backend=cu128
 
 echo ""
 echo "=== Verifying installed packages ==="
@@ -25,7 +26,8 @@ uv pip list | grep -E "^(torch|vllm)" || true
 
 echo ""
 echo "=== Testing PyTorch CUDA ==="
-uv run python -c "
+# Use --no-sync to prevent uv from reverting via pyproject.toml
+uv run --no-sync python -c "
 import torch
 print('PyTorch:', torch.__version__)
 print('CUDA available:', torch.cuda.is_available())
@@ -37,11 +39,11 @@ if torch.cuda.is_available():
 
 echo ""
 echo "=== Testing vLLM import ==="
-uv run python -c "import vllm; print('vLLM:', vllm.__version__)"
+uv run --no-sync python -c "import vllm; print('vLLM:', vllm.__version__)"
 
 echo ""
 echo "=== Starting vLLM server (60s test) ==="
-timeout 60 uv run python -m vllm.entrypoints.openai.api_server \
+timeout 60 uv run --no-sync python -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen2.5-0.5B-Instruct \
     --port 8000 \
     --trust-remote-code \
