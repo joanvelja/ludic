@@ -53,13 +53,13 @@ set -e
 
 # -----------------------------------------------------------------------------
 # Fix: PyTorch/vLLM aarch64 CUDA wheels
-# GH200 is ARM64 - standard PyPI wheels are x86_64 only
-# This index has aarch64 CUDA 12.8 wheels
+# GH200 is ARM64 - uv defaults to CPU wheels for aarch64
+# --torch-backend=cu128 forces CUDA 12.8 wheels
+# Ref: https://docs.isambard.ac.uk/user-documentation/applications/ML-packages/
+# Ref: https://docs.astral.sh/uv/guides/integration/pytorch/
 # -----------------------------------------------------------------------------
-export UV_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu128"
-
-echo "Syncing dependencies for aarch64..."
-uv sync --reinstall-package torch --reinstall-package vllm
+echo "Syncing with CUDA backend for aarch64..."
+uv sync --torch-backend=cu128
 
 # -----------------------------------------------------------------------------
 # CUDA library path setup
@@ -157,7 +157,7 @@ echo ""
 
 echo "Verifying PyTorch CUDA..."
 uv run python -c "import torch; print('  PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available())" || {
-    echo "ERROR: PyTorch CUDA not available. Check UV_EXTRA_INDEX_URL."
+    echo "ERROR: PyTorch CUDA not available."
     exit 1
 }
 

@@ -10,6 +10,8 @@ dependencies = [
     "peft>=0.18.0",
     "rich>=14.2.0",
     "setuptools>=79.0.1",
+    # torch/vllm: use UV_TORCH_BACKEND=cu128 on GPU systems (aarch64/x86)
+    # See: https://docs.astral.sh/uv/guides/integration/pytorch/
     "torch>=2.8.0",
     "vllm>=0.11.0",
 ]
@@ -45,3 +47,29 @@ markers = [
     "report: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
 ]
 testpaths = ["tests"]
+
+# =============================================================================
+# uv Configuration for PyTorch CUDA
+# =============================================================================
+# PyTorch publishes different wheels for CPU/CUDA on separate indexes.
+# By default, uv uses CPU wheels for aarch64 (ARM) systems.
+#
+# To install with CUDA support, use one of:
+#   1. uv sync --torch-backend=cu128
+#   2. UV_TORCH_BACKEND=cu128 uv sync
+#   3. uv pip install torch --torch-backend=cu128
+#
+# For Isambard-AI (GH200/aarch64), always use cu128 backend.
+# See: https://docs.astral.sh/uv/guides/integration/pytorch/
+# See: https://docs.isambard.ac.uk/user-documentation/applications/ML-packages/
+# =============================================================================
+
+[tool.uv]
+# Define PyTorch CUDA index (used when --torch-backend=cu128 is specified)
+# This is NOT used by default - you must explicitly request CUDA via:
+#   UV_TORCH_BACKEND=cu128 or --torch-backend=cu128
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true  # Only used for packages that explicitly reference this index
