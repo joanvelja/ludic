@@ -196,6 +196,40 @@ class BaseSandboxPool(ABC, Generic[S]):
         self._queue = None
         self._shutting_down = False
 
+    async def drain_pending_resets(self, timeout_s: float = 60.0) -> int:
+        """
+        Wait for all pending reset tasks to complete.
+
+        Call this before switching between high-concurrency phases
+        (e.g., before eval after training step) to ensure all sandboxes
+        are available in the queue.
+
+        Args:
+            timeout_s: Maximum time to wait for resets to complete
+
+        Returns:
+            Number of resets that completed
+        """
+        if not self._pending_resets:
+            return 0
+
+        count = len(self._pending_resets)
+        logger.info(f"Draining {count} pending sandbox resets...")
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self._pending_resets, return_exceptions=True),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Timeout draining resets after {timeout_s}s. "
+                f"Remaining: {len(self._pending_resets)}"
+            )
+
+        logger.info(f"Drain complete. Pool available: {self.available}/{self._n_workers}")
+        return count
+
     # -------------------------------------------------------------------------
     # Checkout / Release with background reset
     # -------------------------------------------------------------------------
