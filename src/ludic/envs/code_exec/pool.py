@@ -56,6 +56,7 @@ class BaseSandboxPool(ABC, Generic[S]):
         cache_size: int = 10000,
         auto_replace_failed: bool = True,
         max_consecutive_failures: int = 5,
+        max_concurrent_resets: int = 8,
     ):
         """
         Initialize the pool.
@@ -66,15 +67,19 @@ class BaseSandboxPool(ABC, Generic[S]):
             auto_replace_failed: If True, create new sandbox when reset fails
             max_consecutive_failures: Maximum consecutive reset failures before raising
                 SandboxPoolExhaustedError (circuit breaker threshold)
+            max_concurrent_resets: Maximum concurrent reset operations (prevents
+                podman deadlock with too many simultaneous exec calls)
         """
         self._n_workers = n_workers
         self._cache = LRUCache(max_size=cache_size)
         self._auto_replace_failed = auto_replace_failed
         self._max_consecutive_failures = max_consecutive_failures
+        self._max_concurrent_resets = max_concurrent_resets
 
         self._sandboxes: List[S] = []
         self._queue: Optional[asyncio.Queue[S]] = None
         self._pending_resets: Set[asyncio.Task] = set()
+        self._reset_semaphore: Optional[asyncio.Semaphore] = None
         self._started = False
         self._shutting_down = False
         self._consecutive_failures = 0
@@ -160,6 +165,13 @@ class BaseSandboxPool(ABC, Generic[S]):
         if self._started:
             return
 
+        # Initialize reset semaphore (prevents podman deadlock with concurrent ops)
+        self._reset_semaphore = asyncio.Semaphore(self._max_concurrent_resets)
+        logger.info(
+            f"Pool starting: n_workers={self._n_workers}, "
+            f"max_concurrent_resets={self._max_concurrent_resets}"
+        )
+
         # Create sandboxes (backend-specific)
         self._sandboxes = await self._create_sandboxes()
 
@@ -169,6 +181,10 @@ class BaseSandboxPool(ABC, Generic[S]):
             await self._queue.put(sandbox)
 
         self._started = True
+        logger.info(
+            f"Pool started: {len(self._sandboxes)} sandboxes ready, "
+            f"queue_size={self._queue.qsize()}"
+        )
 
     async def shutdown(self) -> None:
         """
@@ -204,6 +220,9 @@ class BaseSandboxPool(ABC, Generic[S]):
         (e.g., before eval after training step) to ensure all sandboxes
         are available in the queue.
 
+        Uses asyncio.wait() instead of wait_for(gather()) to avoid
+        cancelling tasks on timeout (which would destroy sandboxes).
+
         Args:
             timeout_s: Maximum time to wait for resets to complete
 
@@ -211,24 +230,43 @@ class BaseSandboxPool(ABC, Generic[S]):
             Number of resets that completed
         """
         if not self._pending_resets:
+            logger.debug("Drain called but no pending resets")
             return 0
 
-        count = len(self._pending_resets)
-        logger.info(f"Draining {count} pending sandbox resets...")
+        # Snapshot the current tasks (set may change during await)
+        tasks = list(self._pending_resets)
+        count = len(tasks)
+        semaphore_free = self._reset_semaphore._value if self._reset_semaphore else 0
+        logger.info(
+            f"Draining {count} pending resets... "
+            f"semaphore: {semaphore_free}/{self._max_concurrent_resets} free, "
+            f"queue: {self.available}/{self._n_workers}"
+        )
 
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*self._pending_resets, return_exceptions=True),
-                timeout=timeout_s,
-            )
-        except asyncio.TimeoutError:
+        import time
+        start = time.time()
+
+        # Use wait() instead of wait_for(gather()) - doesn't cancel on timeout
+        done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+
+        elapsed = time.time() - start
+
+        if pending:
+            semaphore_free = self._reset_semaphore._value if self._reset_semaphore else 0
             logger.warning(
-                f"Timeout draining resets after {timeout_s}s. "
-                f"Remaining: {len(self._pending_resets)}"
+                f"Drain timeout after {elapsed:.1f}s! "
+                f"Completed: {len(done)}, still pending: {len(pending)}, "
+                f"semaphore: {semaphore_free}/{self._max_concurrent_resets} free, "
+                f"queue: {self.available}/{self._n_workers}"
+            )
+        else:
+            logger.info(
+                f"Drain complete in {elapsed:.1f}s: "
+                f"{len(done)} resets finished, "
+                f"queue: {self.available}/{self._n_workers}"
             )
 
-        logger.info(f"Drain complete. Pool available: {self.available}/{self._n_workers}")
-        return count
+        return len(done)
 
     # -------------------------------------------------------------------------
     # Checkout / Release with background reset
@@ -241,9 +279,8 @@ class BaseSandboxPool(ABC, Generic[S]):
         The returned sandbox is guaranteed to be in a clean state (reset
         was performed in the background after the previous release).
 
-        If the queue is empty but resets are pending, waits for resets
-        to complete before timing out. This makes the pool self-healing
-        across phase transitions (e.g., eval → training).
+        Waits on the queue for a sandbox to become available. Background
+        resets are rate-limited by semaphore to prevent backend deadlock.
 
         Args:
             timeout_s: Maximum time to wait for a sandbox
@@ -262,23 +299,36 @@ class BaseSandboxPool(ABC, Generic[S]):
 
         start_time = time.monotonic()
         deadline = start_time + timeout_s
+        attempt = 0
 
         while True:
             remaining = deadline - time.monotonic()
+            attempt += 1
+
             if remaining <= 0:
+                # Detailed timeout diagnostics
+                semaphore_free = self._reset_semaphore._value if self._reset_semaphore else 0
+                logger.error(
+                    f"CHECKOUT TIMEOUT after {timeout_s}s! "
+                    f"Pool: {self._n_workers}, available: {self.available}, "
+                    f"pending_resets: {self.pending_resets}, "
+                    f"semaphore: {semaphore_free}/{self._max_concurrent_resets} free, "
+                    f"attempts: {attempt}"
+                )
                 raise TimeoutError(
                     f"No sandbox available after {timeout_s}s. "
                     f"Pool size: {self._n_workers}, available: {self.available}, "
                     f"pending resets: {self.pending_resets}"
                 )
 
-            # If queue is empty but resets are pending, wait for them first
-            if self._queue.empty() and self._pending_resets:
+            # Log if we're waiting with empty queue
+            if self._queue.empty() and attempt == 1:
+                semaphore_free = self._reset_semaphore._value if self._reset_semaphore else 0
                 logger.info(
-                    f"Queue empty with {len(self._pending_resets)} pending resets, "
-                    f"waiting for resets to complete..."
+                    f"Checkout waiting: queue empty, "
+                    f"pending_resets: {self.pending_resets}, "
+                    f"semaphore: {semaphore_free}/{self._max_concurrent_resets} free"
                 )
-                await self.drain_pending_resets(timeout_s=remaining)
 
             try:
                 sandbox = await asyncio.wait_for(
@@ -288,12 +338,19 @@ class BaseSandboxPool(ABC, Generic[S]):
                 wait_time = time.monotonic() - start_time
                 if wait_time > 1.0:
                     logger.info(
-                        f"Sandbox checkout took {wait_time:.2f}s "
-                        f"(waited for pending resets)"
+                        f"Checkout OK after {wait_time:.2f}s wait, "
+                        f"queue now: {self._queue.qsize()}/{self._n_workers}"
                     )
                 return sandbox
             except asyncio.TimeoutError:
-                # Retry - more resets may have completed
+                # Log periodic status during long waits
+                elapsed = time.monotonic() - start_time
+                semaphore_free = self._reset_semaphore._value if self._reset_semaphore else 0
+                logger.warning(
+                    f"Checkout still waiting after {elapsed:.1f}s: "
+                    f"available: {self.available}, pending: {self.pending_resets}, "
+                    f"semaphore: {semaphore_free}/{self._max_concurrent_resets} free"
+                )
                 continue
 
     async def release(self, sandbox: Sandbox) -> None:
@@ -329,16 +386,52 @@ class BaseSandboxPool(ABC, Generic[S]):
         """
         Reset sandbox and return to queue (runs in background).
 
+        Uses semaphore to limit concurrent reset operations (prevents
+        podman deadlock with too many simultaneous exec calls).
+
         On success, the sandbox is returned to the available queue.
         On failure, the sandbox is discarded and optionally replaced.
         """
-        try:
-            await sandbox.reset()
-            # Only return to queue if we're not shutting down
-            if self._queue is not None and not self._shutting_down:
-                await self._queue.put(sandbox)
-        except Exception as e:
-            await self._handle_reset_failure(sandbox, e)
+        import time
+
+        sandbox_id = id(sandbox) % 10000  # Short ID for logging
+
+        # Log queue state before acquiring semaphore
+        semaphore_free = self._reset_semaphore._value if self._reset_semaphore else 0
+        logger.info(
+            f"[SB-{sandbox_id}] Reset queued. "
+            f"Semaphore: {semaphore_free}/{self._max_concurrent_resets} free, "
+            f"pending_resets: {len(self._pending_resets)}, "
+            f"queue_size: {self._queue.qsize() if self._queue else 0}"
+        )
+
+        wait_start = time.time()
+
+        # Limit concurrent resets to prevent podman deadlock
+        async with self._reset_semaphore:
+            wait_elapsed = time.time() - wait_start
+            if wait_elapsed > 0.1:
+                logger.info(f"[SB-{sandbox_id}] Semaphore acquired after {wait_elapsed:.2f}s wait")
+
+            reset_start = time.time()
+            try:
+                await sandbox.reset()
+                reset_elapsed = time.time() - reset_start
+                total_elapsed = time.time() - wait_start
+
+                if self._queue is not None and not self._shutting_down:
+                    await self._queue.put(sandbox)
+                    logger.info(
+                        f"[SB-{sandbox_id}] Reset OK: {reset_elapsed:.2f}s reset, "
+                        f"{total_elapsed:.2f}s total. "
+                        f"Queue now: {self._queue.qsize()}/{self._n_workers}"
+                    )
+            except Exception as e:
+                reset_elapsed = time.time() - reset_start
+                logger.error(
+                    f"[SB-{sandbox_id}] Reset FAILED after {reset_elapsed:.2f}s: {e}"
+                )
+                await self._handle_reset_failure(sandbox, e)
 
     async def _handle_reset_failure(self, sandbox: S, error: Exception) -> None:
         """

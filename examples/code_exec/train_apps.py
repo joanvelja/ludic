@@ -97,6 +97,12 @@ from ludic.envs.code_exec import (
 )
 from ludic.envs.code_exec.adapters.apps import APPSTestAdapter, APPS_SYSTEM_PROMPT
 
+import logging
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+
 
 def code_block_parser(raw: str) -> ParseResult:
     """
@@ -681,7 +687,6 @@ def main():
         reducers=reducers,
         evaluator=evaluator,
     )
-
 
     print(f"\nStarting training for {args.train_steps} steps...")
     print(f"  Samples: {len(train_samples)}")

@@ -174,10 +174,16 @@ class PodmanHPCSandbox:
         if not self._started:
             return
 
+        logger.debug(f"[{self._container_name}] reset() starting podman-hpc exec...")
+        start = time.perf_counter()
+
         await self._run_podman(
             "exec", self._container_name,
             "/bin/sh", "-c", f"rm -rf {self._config.working_dir}/*"
         )
+
+        elapsed = time.perf_counter() - start
+        logger.debug(f"[{self._container_name}] reset() completed in {elapsed:.3f}s")
 
     async def compile(
         self,
@@ -405,6 +411,10 @@ class PodmanHPCSandbox:
         Returns:
             PodmanResult with returncode, stdout, stderr
         """
+        # Track timing for exec commands (the ones that can deadlock)
+        is_exec = args and args[0] == "exec"
+        start = time.perf_counter() if is_exec else None
+
         proc = await asyncio.create_subprocess_exec(
             "podman-hpc",
             *args,
@@ -414,6 +424,16 @@ class PodmanHPCSandbox:
         )
 
         stdout_bytes, stderr_bytes = await proc.communicate(input=input_data)
+
+        if is_exec and start:
+            elapsed = time.perf_counter() - start
+            if elapsed > 1.0:
+                # Log slow exec commands
+                cmd_preview = " ".join(args[:4])  # First 4 args for brevity
+                logger.warning(
+                    f"[{self._container_name}] SLOW podman-hpc {cmd_preview}... "
+                    f"took {elapsed:.2f}s"
+                )
 
         result = PodmanResult(
             returncode=proc.returncode or 0,
@@ -497,6 +517,7 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         cache_size: int = 10000,
         auto_replace_failed: bool = True,
         max_consecutive_failures: int = 5,
+        max_concurrent_resets: int = 8,
     ):
         """
         Initialize Podman-HPC sandbox pool.
@@ -509,12 +530,16 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             auto_replace_failed: If True, create new sandbox when reset fails
             max_consecutive_failures: Maximum consecutive reset failures before raising
                 SandboxPoolExhaustedError (circuit breaker threshold)
+            max_concurrent_resets: Maximum concurrent reset operations (prevents
+                podman deadlock with too many simultaneous exec calls). Default 8
+                is based on podman's known concurrency limits.
         """
         super().__init__(
             n_workers=n_workers,
             cache_size=cache_size,
             auto_replace_failed=auto_replace_failed,
             max_consecutive_failures=max_consecutive_failures,
+            max_concurrent_resets=max_concurrent_resets,
         )
         self._image = image
         self._config = config or PodmanConfig()
