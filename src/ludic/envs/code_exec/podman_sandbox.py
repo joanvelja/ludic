@@ -103,6 +103,11 @@ class PodmanHPCSandbox:
 
     Uses persistent containers (sleep infinity) with exec for code execution.
     All operations use asyncio.create_subprocess_exec for non-blocking I/O.
+
+    Podman Concurrency Note:
+        Podman has known issues with concurrent operations (deadlock above ~8
+        simultaneous exec calls). All sandboxes in a pool share an exec_semaphore
+        to prevent overwhelming podman's lock manager.
     """
 
     def __init__(
@@ -111,11 +116,13 @@ class PodmanHPCSandbox:
         image: str,
         config: PodmanConfig,
         python_version: str = "3.11",
+        exec_semaphore: Optional[asyncio.Semaphore] = None,
     ):
         self._container_name = container_name
         self._image = image
         self._config = config
         self._python_version = python_version
+        self._exec_semaphore = exec_semaphore  # Shared across all sandboxes in pool
         self._started = False
 
     @property
@@ -338,7 +345,7 @@ class PodmanHPCSandbox:
             run_ms = (time.perf_counter() - run_start) * 1000
             total_ms = (time.perf_counter() - total_start) * 1000
 
-            # Try to kill the process (use full path for HPC compatibility)
+            # Best-effort cleanup - goes through exec_semaphore so won't deadlock
             try:
                 await self._run_podman(
                     "exec", self._container_name,
@@ -346,7 +353,7 @@ class PodmanHPCSandbox:
                     check=False, capture=True
                 )
             except Exception:
-                pass  # Best effort cleanup
+                pass  # Best effort, reset() will clean up anyway
 
             return ExecutionResult(
                 compile_result=compile_result,
@@ -402,6 +409,10 @@ class PodmanHPCSandbox:
         """
         Run a podman-hpc command asynchronously.
 
+        For 'exec' commands, acquires the shared semaphore to prevent
+        overwhelming podman's lock manager (which deadlocks above ~8
+        concurrent operations).
+
         Args:
             *args: Command arguments (e.g., "exec", container_name, "python", ...)
             check: Raise exception if command fails
@@ -411,9 +422,28 @@ class PodmanHPCSandbox:
         Returns:
             PodmanResult with returncode, stdout, stderr
         """
-        # Track timing for exec commands (the ones that can deadlock)
         is_exec = args and args[0] == "exec"
-        start = time.perf_counter() if is_exec else None
+
+        # Use semaphore for exec commands to prevent podman deadlock
+        if is_exec and self._exec_semaphore:
+            async with self._exec_semaphore:
+                return await self._run_podman_inner(
+                    *args, check=check, capture=capture, input_data=input_data
+                )
+        else:
+            return await self._run_podman_inner(
+                *args, check=check, capture=capture, input_data=input_data
+            )
+
+    async def _run_podman_inner(
+        self,
+        *args: str,
+        check: bool = True,
+        capture: bool = False,
+        input_data: Optional[bytes] = None,
+    ) -> "PodmanResult":
+        """Actually run the podman-hpc command (called by _run_podman)."""
+        start = time.perf_counter()
 
         proc = await asyncio.create_subprocess_exec(
             "podman-hpc",
@@ -425,15 +455,13 @@ class PodmanHPCSandbox:
 
         stdout_bytes, stderr_bytes = await proc.communicate(input=input_data)
 
-        if is_exec and start:
-            elapsed = time.perf_counter() - start
-            if elapsed > 1.0:
-                # Log slow exec commands
-                cmd_preview = " ".join(args[:4])  # First 4 args for brevity
-                logger.warning(
-                    f"[{self._container_name}] SLOW podman-hpc {cmd_preview}... "
-                    f"took {elapsed:.2f}s"
-                )
+        elapsed = time.perf_counter() - start
+        if elapsed > 1.0:
+            cmd_preview = " ".join(args[:4])
+            logger.warning(
+                f"[{self._container_name}] SLOW podman-hpc {cmd_preview}... "
+                f"took {elapsed:.2f}s"
+            )
 
         result = PodmanResult(
             returncode=proc.returncode or 0,
@@ -518,6 +546,7 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         auto_replace_failed: bool = True,
         max_consecutive_failures: int = 5,
         max_concurrent_resets: int = 8,
+        max_concurrent_exec: int = 8,
     ):
         """
         Initialize Podman-HPC sandbox pool.
@@ -530,9 +559,12 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             auto_replace_failed: If True, create new sandbox when reset fails
             max_consecutive_failures: Maximum consecutive reset failures before raising
                 SandboxPoolExhaustedError (circuit breaker threshold)
-            max_concurrent_resets: Maximum concurrent reset operations (prevents
-                podman deadlock with too many simultaneous exec calls). Default 8
-                is based on podman's known concurrency limits.
+            max_concurrent_resets: Maximum concurrent reset operations. Default 8.
+                (Legacy parameter, now superseded by max_concurrent_exec)
+            max_concurrent_exec: Maximum concurrent podman-hpc exec operations.
+                Podman deadlocks above ~8 concurrent operations due to lock
+                contention. This limits ALL exec calls (execute, compile, reset,
+                cleanup) to prevent deadlock. Default 8.
         """
         super().__init__(
             n_workers=n_workers,
@@ -543,6 +575,8 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         )
         self._image = image
         self._config = config or PodmanConfig()
+        self._max_concurrent_exec = max_concurrent_exec
+        self._exec_semaphore: Optional[asyncio.Semaphore] = None
 
         # Extract Python version from image name
         self._python_version = self._parse_python_version(image)
@@ -566,6 +600,12 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         Returns:
             List of started PodmanHPCSandbox instances
         """
+        # Create shared exec semaphore (prevents podman deadlock)
+        self._exec_semaphore = asyncio.Semaphore(self._max_concurrent_exec)
+        logger.info(
+            f"Podman exec semaphore initialized: max_concurrent_exec={self._max_concurrent_exec}"
+        )
+
         # Pull image (podman-hpc pull auto-migrates to shared storage)
         logger.info(f"Pulling image {self._image} (may take a moment for HPC migration)...")
         proc = await asyncio.create_subprocess_exec(
@@ -585,6 +625,7 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
                 image=self._image,
                 config=self._config,
                 python_version=self._python_version,
+                exec_semaphore=self._exec_semaphore,  # Shared across all sandboxes
             )
             await sandbox.start()
             return sandbox
@@ -630,6 +671,7 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
                 image=self._image,
                 config=self._config,
                 python_version=self._python_version,
+                exec_semaphore=self._exec_semaphore,  # Use shared semaphore
             )
             await sandbox.start()
             logger.info(f"Created replacement Podman sandbox: {container_name}")
