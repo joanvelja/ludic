@@ -509,8 +509,8 @@ def main():
     cfg = TrainerConfig(
         model_device=device,
         lr=1e-5,
-        grad_accum_steps=8,
-        max_grad_norm=0.5,
+        grad_accum_steps=4,
+        max_grad_norm=0.1,
         pad_token_id=tokenizer.pad_token_id,
         eval_at_start=bool(args.eval_before_start and eval_samples),
         eval_every_n_steps=(
