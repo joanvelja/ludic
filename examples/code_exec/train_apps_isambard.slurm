@@ -3,8 +3,20 @@
 #SBATCH --nodes=1
 #SBATCH --gpus=2
 #SBATCH --time=01:00:00
-#SBATCH --output=apps_train_%j.log
-#SBATCH --error=apps_train_%j.log
+
+# Logging directory tree:
+#   logs/
+#   └── YYYY-MM-DD_HH-MM-SS_<job-id>/
+#       ├── slurm.log           # SLURM stdout/stderr
+#       ├── vllm.log            # vLLM inference server
+#       └── training.log        # Training script output (created by train_apps.py)
+
+#SBATCH --output=logs/%x_%j/slurm.log
+#SBATCH --error=logs/%x_%j/slurm.log
+
+# Create the base log directory for this job
+# SLURM will create the job-specific subdirectory based on --output/%x_%j
+mkdir -p "logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
 
 # =============================================================================
 # APPS LoRA Training on Isambard-AI (GH200 Grace Hopper)
@@ -65,24 +77,31 @@ uv python install 3.12
 uv sync
 
 echo "Adding datasets..."
-uv add datasets
+uv pip uninstall wandb
+uv add wandb
 
 # -----------------------------------------------------------------------------
 # Configuration (override via environment variables)
 # -----------------------------------------------------------------------------
 MODEL="${MODEL:-Qwen/Qwen2.5-3B-Instruct}"
-LIMIT="${LIMIT:-500}"
+LIMIT="${LIMIT:-310}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-1}"
-TRAIN_STEPS="${TRAIN_STEPS:-100}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
-GROUP_SIZE="${GROUP_SIZE:-8}"
-SANDBOX_WORKERS="${SANDBOX_WORKERS:-64}"
-CONCURRENCY="${CONCURRENCY:-64}"
+TRAIN_STEPS="${TRAIN_STEPS:-300}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+GROUP_SIZE="${GROUP_SIZE:-4}"
+MAX_CONCURRENT_RESETS="${MAX_CONCURRENT_RESETS:-16}"
+SANDBOX_WORKERS="${SANDBOX_WORKERS:-32}"
+CONCURRENCY="${CONCURRENCY:-32}"
 LORA_RANK="${LORA_RANK:-8}"
 KL_COEFF="${KL_COEFF:-0.0}"
-USE_WANDB="${USE_WANDB:-0}"
+USE_WANDB="${USE_WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-ludic-apps}"
 VLLM_PORT="${VLLM_PORT:-8000}"
+
+# Token length limits (for memory efficiency)
+MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-1024}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-5120}"  # MAX_PROMPT_TOKENS + MAX_NEW_TOKENS
 
 # -----------------------------------------------------------------------------
 # Job info
@@ -104,6 +123,7 @@ echo "  Batch size: $BATCH_SIZE"
 echo "  Group size: $GROUP_SIZE"
 echo "  LoRA rank: $LORA_RANK"
 echo "  KL coefficient: $KL_COEFF"
+echo "  Max concurrent resets: $MAX_CONCURRENT_RESETS"
 echo "  Sandbox workers: $SANDBOX_WORKERS"
 echo "  Concurrency: $CONCURRENCY"
 echo "  WandB: $([ "$USE_WANDB" = "1" ] && echo "enabled" || echo "disabled")"
@@ -182,13 +202,14 @@ echo "========================================"
 echo "Starting vLLM server..."
 echo "========================================"
 
-# Create log file for vLLM
-VLLM_LOG="vllm_server_${SLURM_JOB_ID}.log"
+# Create log file for vLLM (goes in structured log directory)
+VLLM_LOG="logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}/vllm.log"
 
 CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_server \
     --model "$MODEL" \
     --port $VLLM_PORT \
     --trust-remote-code \
+    --max-model-len $MAX_SEQ_LEN \
     > "$VLLM_LOG" 2>&1 &
 
 VLLM_PID=$!
@@ -246,6 +267,7 @@ TRAIN_CMD="uv run --env-file .env python examples/code_exec/train_apps.py"
 TRAIN_CMD="$TRAIN_CMD --model $MODEL"
 TRAIN_CMD="$TRAIN_CMD --host 127.0.0.1 --port $VLLM_PORT"
 TRAIN_CMD="$TRAIN_CMD --limit $LIMIT"
+TRAIN_CMD="$TRAIN_CMD --difficulty introductory"
 TRAIN_CMD="$TRAIN_CMD --eval-samples $EVAL_SAMPLES"
 TRAIN_CMD="$TRAIN_CMD --train-steps $TRAIN_STEPS"
 TRAIN_CMD="$TRAIN_CMD --batch-size $BATCH_SIZE"
@@ -254,10 +276,14 @@ TRAIN_CMD="$TRAIN_CMD --sandbox-workers $SANDBOX_WORKERS"
 TRAIN_CMD="$TRAIN_CMD --sandbox-backend podman-hpc"
 TRAIN_CMD="$TRAIN_CMD --minimal-sandbox"
 TRAIN_CMD="$TRAIN_CMD --concurrency $CONCURRENCY"
+TRAIN_CMD="$TRAIN_CMD --max-concurrent-resets $MAX_CONCURRENT_RESETS"
 TRAIN_CMD="$TRAIN_CMD --lora-rank $LORA_RANK"
 TRAIN_CMD="$TRAIN_CMD --eval-every 25"
 TRAIN_CMD="$TRAIN_CMD --eval-before-start"
 TRAIN_CMD="$TRAIN_CMD --final-save"
+TRAIN_CMD="$TRAIN_CMD --max-prompt-tokens $MAX_PROMPT_TOKENS"
+TRAIN_CMD="$TRAIN_CMD --max-new-tokens $MAX_NEW_TOKENS"
+TRAIN_CMD="$TRAIN_CMD --partial-credit"
 
 # Add KL coefficient if non-zero
 if [ "$KL_COEFF" != "0.0" ] && [ "$KL_COEFF" != "0" ]; then

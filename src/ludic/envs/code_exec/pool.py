@@ -398,7 +398,7 @@ class BaseSandboxPool(ABC, Generic[S]):
 
         # Log queue state before acquiring semaphore
         semaphore_free = self._reset_semaphore._value if self._reset_semaphore else 0
-        logger.info(
+        logger.debug(
             f"[SB-{sandbox_id}] Reset queued. "
             f"Semaphore: {semaphore_free}/{self._max_concurrent_resets} free, "
             f"pending_resets: {len(self._pending_resets)}, "
@@ -411,7 +411,7 @@ class BaseSandboxPool(ABC, Generic[S]):
         async with self._reset_semaphore:
             wait_elapsed = time.time() - wait_start
             if wait_elapsed > 0.1:
-                logger.info(f"[SB-{sandbox_id}] Semaphore acquired after {wait_elapsed:.2f}s wait")
+                logger.debug(f"[SB-{sandbox_id}] Semaphore acquired after {wait_elapsed:.2f}s wait")
 
             reset_start = time.time()
             try:
@@ -421,7 +421,7 @@ class BaseSandboxPool(ABC, Generic[S]):
 
                 if self._queue is not None and not self._shutting_down:
                     await self._queue.put(sandbox)
-                    logger.info(
+                    logger.debug(
                         f"[SB-{sandbox_id}] Reset OK: {reset_elapsed:.2f}s reset, "
                         f"{total_elapsed:.2f}s total. "
                         f"Queue now: {self._queue.qsize()}/{self._n_workers}"

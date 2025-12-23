@@ -399,7 +399,7 @@ def main():
     env_config = CodeExecConfig(
         timeout_per_test_s=args.timeout_per_test,
         stop_on_first_failure=False,
-        compile_first=True,
+        compile_first=False,
         partial_credit=args.partial_credit,
         compile_failure_reward=-0.1,
         use_cache=True,

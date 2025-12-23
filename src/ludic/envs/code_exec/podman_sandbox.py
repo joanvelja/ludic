@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -56,18 +57,46 @@ import tarfile
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import AsyncIterator, Dict, List, Optional, Union
 
 from .cache import LRUCache
 from .pool import BaseSandboxPool
 from .sandbox import Sandbox, SandboxPool
 from .types import (
+    BatchExecutionSpec,
     BatchTestResult,
     CompileResult,
     CompileStatus,
     ExecutionResult,
     RunStatus,
+    TestCase,
 )
+
+# Import batch runner script using importlib.resources
+# This ensures the script is available regardless of installation method
+try:
+    from importlib.resources import files
+    _BATCH_RUNNER_SCRIPT: Optional[str] = None
+
+    def _get_batch_runner_script() -> str:
+        """Lazy-load the batch runner script from package resources."""
+        global _BATCH_RUNNER_SCRIPT
+        if _BATCH_RUNNER_SCRIPT is None:
+            _BATCH_RUNNER_SCRIPT = (
+                files("ludic.envs.code_exec")
+                .joinpath("batch_runner.py")
+                .read_text()
+            )
+        return _BATCH_RUNNER_SCRIPT
+
+except ImportError:
+    # Fallback for older Python versions
+    import pkg_resources
+
+    def _get_batch_runner_script() -> str:
+        return pkg_resources.resource_string(
+            "ludic.envs.code_exec", "batch_runner.py"
+        ).decode("utf-8")
 
 logger = logging.getLogger(__name__)
 
@@ -509,6 +538,272 @@ class PodmanHPCSandbox:
                 clean_msg = lines[-1]
 
         return line, column, clean_msg
+
+    # -------------------------------------------------------------------------
+    # Batch execution (reduces semaphore acquisitions from O(N) to O(1))
+    # -------------------------------------------------------------------------
+
+    async def execute_batch(
+        self,
+        spec: BatchExecutionSpec,
+    ) -> AsyncIterator[Union[CompileResult, ExecutionResult]]:
+        """
+        Execute all tests in a single batch with streaming results.
+
+        This method reduces semaphore acquisitions from O(2N+1) to O(3) by:
+        1. Bundling code, manifest, and runner into a single tar
+        2. Executing the batch runner once, which runs all tests sequentially
+        3. Streaming results back as JSONL
+
+        Args:
+            spec: Batch execution specification with code, tests, and options
+
+        Yields:
+            CompileResult (if compile_first=True), then ExecutionResult for each test
+        """
+        batch_dir = "_batch"
+        batch_start = time.perf_counter()
+
+        # Build manifest for the batch runner
+        manifest = {
+            "code_file": "solution.py",
+            "compile_first": spec.compile_first,
+            "timeout_s": spec.timeout_s,
+            "stop_on_first_failure": spec.stop_on_first_failure,
+            "tests": [
+                {"id": t.id or f"test_{i}", "stdin": t.input, "expected": t.expected}
+                for i, t in enumerate(spec.tests)
+            ],
+        }
+
+        # Build tar archive with all files
+        tar_data = self._build_batch_tar(
+            manifest=manifest,
+            code=spec.code,
+            runner_script=_get_batch_runner_script(),
+            batch_dir=batch_dir,
+        )
+
+        # Write tar to container (1 semaphore acquisition)
+        await self._write_tar(tar_data, timeout_s=spec.timeout_s)
+
+        # Execute batch runner and stream results (1 semaphore acquisition)
+        manifest_path = f"{self._config.working_dir}/{batch_dir}/manifest.json"
+        runner_path = f"{self._config.working_dir}/{batch_dir}/batch_runner.py"
+
+        # Track timing and received results
+        run_start = time.perf_counter()
+        received_done = False
+        received_test_ids: set[str] = set()
+        compile_result: Optional[CompileResult] = None
+
+        try:
+            async with self._exec_semaphore:
+                proc = await asyncio.create_subprocess_exec(
+                    "podman-hpc", "exec", self._container_name,
+                    "/usr/local/bin/python", runner_path, manifest_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=f"{self._config.working_dir}/{batch_dir}",
+                )
+
+                # Stream results line by line
+                async for line_bytes in proc.stdout:
+                    line = line_bytes.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+
+                    try:
+                        result = json.loads(line)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON from batch runner: {line}")
+                        continue
+
+                    result_type = result.get("type")
+
+                    if result_type == "compile":
+                        compile_result = self._parse_batch_compile_result(result)
+                        yield compile_result
+                        if not compile_result.success:
+                            # Compilation failed, we're done
+                            break
+
+                    elif result_type == "test":
+                        test_id = result.get("id", "unknown")
+                        received_test_ids.add(test_id)
+                        exec_result = self._parse_batch_test_result(result, run_start)
+                        yield exec_result
+
+                    elif result_type == "done":
+                        received_done = True
+                        break
+
+                    elif result_type == "error":
+                        logger.error(f"Batch runner error: {result.get('message')}")
+
+                # Wait for process to complete
+                await proc.wait()
+
+        except asyncio.TimeoutError:
+            logger.warning(f"Batch execution timed out after {spec.timeout_s}s")
+
+        except Exception as e:
+            logger.warning(f"Batch execution stream broke: {e}")
+
+        # Handle missing tests (stream truncated before "done")
+        if not received_done and compile_result is None:
+            # No compile result received - emit a failure
+            compile_result = CompileResult(
+                status=CompileStatus.UNKNOWN_ERROR,
+                error_message="Batch execution terminated unexpectedly",
+                duration_ms=(time.perf_counter() - batch_start) * 1000,
+            )
+            yield compile_result
+
+        if not received_done and (compile_result is None or compile_result.success):
+            # Some tests may not have been run
+            for i, test in enumerate(spec.tests):
+                test_id = test.id or f"test_{i}"
+                if test_id not in received_test_ids:
+                    run_ms = (time.perf_counter() - run_start) * 1000
+                    yield ExecutionResult(
+                        compile_result=compile_result or CompileResult(
+                            status=CompileStatus.SUCCESS
+                        ),
+                        run_status=RunStatus.SANDBOX_ERROR,
+                        stdout="",
+                        stderr="Batch execution terminated unexpectedly",
+                        exit_code=None,
+                        run_duration_ms=run_ms,
+                        total_duration_ms=run_ms,
+                    )
+
+    def _build_batch_tar(
+        self,
+        manifest: dict,
+        code: str,
+        runner_script: str,
+        batch_dir: str = "_batch",
+    ) -> bytes:
+        """Build tar archive containing batch execution files.
+
+        Creates a tar with:
+        - {batch_dir}/manifest.json: Test configuration
+        - {batch_dir}/solution.py: Code under test
+        - {batch_dir}/batch_runner.py: Self-contained test runner
+
+        Args:
+            manifest: Test configuration dict
+            code: Python code to test
+            runner_script: Content of batch_runner.py
+            batch_dir: Directory name within workspace
+
+        Returns:
+            Tar archive bytes
+        """
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            # Add manifest.json
+            manifest_data = json.dumps(manifest, indent=2).encode("utf-8")
+            info = tarfile.TarInfo(name=f"{batch_dir}/manifest.json")
+            info.size = len(manifest_data)
+            info.mtime = int(time.time())
+            tar.addfile(info, io.BytesIO(manifest_data))
+
+            # Add solution.py
+            code_data = code.encode("utf-8")
+            info = tarfile.TarInfo(name=f"{batch_dir}/solution.py")
+            info.size = len(code_data)
+            info.mtime = int(time.time())
+            tar.addfile(info, io.BytesIO(code_data))
+
+            # Add batch_runner.py
+            runner_data = runner_script.encode("utf-8")
+            info = tarfile.TarInfo(name=f"{batch_dir}/batch_runner.py")
+            info.size = len(runner_data)
+            info.mtime = int(time.time())
+            tar.addfile(info, io.BytesIO(runner_data))
+
+        buf.seek(0)
+        return buf.read()
+
+    async def _write_tar(
+        self,
+        tar_data: bytes,
+        *,
+        timeout_s: float = 5.0,
+    ) -> None:
+        """Write a tar archive directly to the container.
+
+        Similar to _write_file but takes raw tar bytes.
+        """
+        await asyncio.wait_for(
+            self._run_podman(
+                "exec", "-i", self._container_name,
+                "tar", "-xC", self._config.working_dir,
+                check=True,
+                capture=True,
+                input_data=tar_data,
+            ),
+            timeout=timeout_s,
+        )
+
+    def _parse_batch_compile_result(self, result: dict) -> CompileResult:
+        """Parse compile result from batch runner JSON."""
+        status_str = result.get("status", "unknown_error")
+
+        if status_str == "success":
+            status = CompileStatus.SUCCESS
+        elif status_str == "syntax_error":
+            status = CompileStatus.SYNTAX_ERROR
+        elif status_str == "timeout":
+            status = CompileStatus.TIMEOUT
+        else:
+            status = CompileStatus.UNKNOWN_ERROR
+
+        return CompileResult(
+            status=status,
+            error_message=result.get("error_message"),
+            error_line=result.get("error_line"),
+            error_column=result.get("error_column"),
+            duration_ms=result.get("duration_ms", 0.0),
+        )
+
+    def _parse_batch_test_result(
+        self,
+        result: dict,
+        run_start: float,
+    ) -> ExecutionResult:
+        """Parse test result from batch runner JSON."""
+        status_str = result.get("status", "runtime_error")
+
+        if status_str == "success":
+            run_status = RunStatus.SUCCESS
+        elif status_str == "runtime_error":
+            run_status = RunStatus.RUNTIME_ERROR
+        elif status_str == "timeout":
+            run_status = RunStatus.TIMEOUT
+        elif status_str == "memory_exceeded":
+            run_status = RunStatus.MEMORY_EXCEEDED
+        elif status_str == "not_run":
+            run_status = RunStatus.NOT_RUN
+        elif status_str == "killed":
+            run_status = RunStatus.KILLED
+        else:
+            run_status = RunStatus.RUNTIME_ERROR
+
+        duration_ms = result.get("duration_ms", 0.0)
+        total_ms = (time.perf_counter() - run_start) * 1000
+
+        return ExecutionResult(
+            compile_result=CompileResult(status=CompileStatus.SUCCESS),
+            run_status=run_status,
+            stdout=result.get("stdout", ""),
+            stderr=result.get("stderr", ""),
+            exit_code=result.get("exit_code"),
+            run_duration_ms=duration_ms,
+            total_duration_ms=total_ms,
+        )
 
 
 @dataclass

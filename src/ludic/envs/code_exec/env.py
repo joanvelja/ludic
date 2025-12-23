@@ -234,10 +234,8 @@ class CodeExecEnv(SingleAgentEnv):
         if result is None:
             # Checkout sandbox from pool
             sandbox = await self._sandbox_pool.checkout()
-            print(f"Checkout sandbox: {sandbox}")
 
             try:
-                print(f"Running tests for code: {code}")
                 # Run tests via code runner
                 result = await self._code_runner.run_tests(
                     sandbox=sandbox,
