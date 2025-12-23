@@ -100,7 +100,7 @@ from ludic.envs.code_exec.adapters.apps import APPSTestAdapter, APPS_SYSTEM_PROM
 import logging
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 
 
@@ -190,6 +190,14 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--host", default="127.0.0.1", help="vLLM server host")
     parser.add_argument("--port", type=int, default=8000, help="vLLM server port")
+    parser.add_argument("--max-prompt-tokens", type=int, default=1024, help="Max prompt tokens")
+    parser.add_argument("--max-new-tokens", type=int, default=4096, help="Max new tokens")
+    parser.add_argument(
+        "--stop",
+        nargs="*",
+        default=None,
+        help="Stop sequences (e.g. --stop '```' '</answer>')",
+    )
 
     # LoRA configuration
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
@@ -483,7 +491,11 @@ def main():
     )
 
     train_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=1024),
+        sampling=SamplingParams(
+            temperature=args.train_temperature,
+            max_tokens=args.max_new_tokens,
+            stop=args.stop,
+        ),
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
 
@@ -647,7 +659,11 @@ def main():
 
     # Create EngineEvaluator for eval set
     eval_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.eval_temperature, max_tokens=1024),
+        sampling=SamplingParams(
+            temperature=args.eval_temperature,
+            max_tokens=args.max_new_tokens,
+            stop=args.stop,
+        ),
         return_=ReturnSpec.for_eval(return_token_ids=True),
     )
 

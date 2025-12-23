@@ -19,6 +19,7 @@ checkpoints_*/
 wandb/
 
 # Slurm logs
+logs/
 *.log
 
 # Big jsonl files

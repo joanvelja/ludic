@@ -6,17 +6,34 @@
 
 # Logging directory tree:
 #   logs/
-#   └── YYYY-MM-DD_HH-MM-SS_<job-id>/
-#       ├── slurm.log           # SLURM stdout/stderr
-#       ├── vllm.log            # vLLM inference server
-#       └── training.log        # Training script output (created by train_apps.py)
+#   └── YYYY-MM-DD/
+#       └── HH-MM-SS_<job-id>/
+#           ├── slurm.log           # SLURM stdout/stderr
+#           ├── vllm.log            # vLLM inference server
+#           └── training.log        # Training script output (created by train_apps.py)
+#
+# Note: We create this structure at runtime since SLURM directives don't support
+# date formatting. Initial output goes to a temp file, then we redirect.
 
-#SBATCH --output=logs/%x_%j/slurm.log
-#SBATCH --error=logs/%x_%j/slurm.log
+#SBATCH --output=logs/slurm_%j_init.log
+#SBATCH --error=logs/slurm_%j_init.log
 
-# Create the base log directory for this job
-# SLURM will create the job-specific subdirectory based on --output/%x_%j
-mkdir -p "logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}"
+# Create the structured log directory for this job
+LOG_DATE=$(date +%Y-%m-%d)
+LOG_TIME=$(date +%H-%M-%S)
+LOG_DIR="logs/${LOG_DATE}/${LOG_TIME}_${SLURM_JOB_ID}"
+mkdir -p "$LOG_DIR"
+
+# Redirect all subsequent output to the structured log directory
+exec > >(tee -a "${LOG_DIR}/slurm.log") 2>&1
+
+# Clean up the initial temp log file (move its contents to the proper location)
+if [ -f "logs/slurm_${SLURM_JOB_ID}_init.log" ]; then
+    cat "logs/slurm_${SLURM_JOB_ID}_init.log" >> "${LOG_DIR}/slurm.log"
+    rm -f "logs/slurm_${SLURM_JOB_ID}_init.log"
+fi
+
+echo "Log directory: $LOG_DIR"
 
 # =============================================================================
 # APPS LoRA Training on Isambard-AI (GH200 Grace Hopper)
@@ -76,10 +93,6 @@ echo "Syncing Python environment..."
 uv python install 3.12
 uv sync
 
-echo "Adding datasets..."
-uv pip uninstall wandb
-uv add wandb
-
 # -----------------------------------------------------------------------------
 # Configuration (override via environment variables)
 # -----------------------------------------------------------------------------
@@ -102,6 +115,9 @@ VLLM_PORT="${VLLM_PORT:-8000}"
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-1024}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-5120}"  # MAX_PROMPT_TOKENS + MAX_NEW_TOKENS
+
+# Stop sequences (space-separated, e.g. STOP_SEQUENCES="'\`\`\`' '</answer>'")
+STOP_SEQUENCES="${STOP_SEQUENCES:-</code>}"
 
 # -----------------------------------------------------------------------------
 # Job info
@@ -203,7 +219,7 @@ echo "Starting vLLM server..."
 echo "========================================"
 
 # Create log file for vLLM (goes in structured log directory)
-VLLM_LOG="logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}/vllm.log"
+VLLM_LOG="${LOG_DIR}/vllm.log"
 
 CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_server \
     --model "$MODEL" \
@@ -284,6 +300,11 @@ TRAIN_CMD="$TRAIN_CMD --final-save"
 TRAIN_CMD="$TRAIN_CMD --max-prompt-tokens $MAX_PROMPT_TOKENS"
 TRAIN_CMD="$TRAIN_CMD --max-new-tokens $MAX_NEW_TOKENS"
 TRAIN_CMD="$TRAIN_CMD --partial-credit"
+
+# Add stop sequences if specified
+if [ -n "$STOP_SEQUENCES" ]; then
+    TRAIN_CMD="$TRAIN_CMD --stop $STOP_SEQUENCES"
+fi
 
 # Add KL coefficient if non-zero
 if [ "$KL_COEFF" != "0.0" ] && [ "$KL_COEFF" != "0" ]; then
