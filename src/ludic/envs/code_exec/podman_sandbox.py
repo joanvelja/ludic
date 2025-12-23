@@ -51,6 +51,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import re
 import tarfile
@@ -597,6 +598,12 @@ class PodmanHPCSandbox:
         received_test_ids: set[str] = set()
         compile_result: Optional[CompileResult] = None
 
+        # Calculate aggregate timeout accounting for parallelization in batch_runner
+        # With N workers: timeout = (ceil(N_tests / workers) × timeout_per_test) + buffer
+        num_workers = 16  # Matches batch_runner.py default for HPC
+        parallel_batches = math.ceil(len(spec.tests) / num_workers) if spec.tests else 1
+        aggregate_timeout = spec.timeout_s * parallel_batches + 60.0  # 60s buffer for HPC
+
         try:
             async with self._exec_semaphore:
                 proc = await asyncio.create_subprocess_exec(
@@ -608,45 +615,64 @@ class PodmanHPCSandbox:
                     stderr=asyncio.subprocess.PIPE,
                 )
 
-                # Stream results line by line
-                async for line_bytes in proc.stdout:
-                    line = line_bytes.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
+                # Results collected from streaming to yield after timeout handling
+                streamed_results: list = []
 
-                    try:
-                        result = json.loads(line)
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON from batch runner: {line}")
-                        continue
+                async def _stream_results():
+                    """Stream results from batch runner, updating nonlocal state."""
+                    nonlocal received_done, compile_result
+                    async for line_bytes in proc.stdout:
+                        line = line_bytes.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
 
-                    result_type = result.get("type")
+                        try:
+                            result = json.loads(line)
+                        except json.JSONDecodeError:
+                            logger.warning(f"Invalid JSON from batch runner: {line}")
+                            continue
 
-                    if result_type == "compile":
-                        compile_result = self._parse_batch_compile_result(result)
-                        yield compile_result
-                        if not compile_result.success:
-                            # Compilation failed, we're done
+                        result_type = result.get("type")
+
+                        if result_type == "compile":
+                            compile_result = self._parse_batch_compile_result(result)
+                            streamed_results.append(("compile", compile_result))
+                            if not compile_result.success:
+                                # Compilation failed, we're done
+                                break
+
+                        elif result_type == "test":
+                            test_id = result.get("id", "unknown")
+                            received_test_ids.add(test_id)
+                            exec_result = self._parse_batch_test_result(result, run_start)
+                            streamed_results.append(("test", exec_result))
+
+                        elif result_type == "done":
+                            received_done = True
                             break
 
-                    elif result_type == "test":
-                        test_id = result.get("id", "unknown")
-                        received_test_ids.add(test_id)
-                        exec_result = self._parse_batch_test_result(result, run_start)
-                        yield exec_result
+                        elif result_type == "error":
+                            logger.error(f"Batch runner error: {result.get('message')}")
 
-                    elif result_type == "done":
-                        received_done = True
-                        break
+                    # Wait for process to complete
+                    await proc.wait()
 
-                    elif result_type == "error":
-                        logger.error(f"Batch runner error: {result.get('message')}")
+                try:
+                    await asyncio.wait_for(_stream_results(), timeout=aggregate_timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[{self._container_name}] Batch timed out after {aggregate_timeout:.1f}s "
+                        f"({len(received_test_ids)}/{len(spec.tests)} tests received)"
+                    )
+                    proc.kill()
+                    await proc.wait()
 
-                # Wait for process to complete
-                await proc.wait()
+                # Yield all collected results
+                for result_type, result in streamed_results:
+                    yield result
 
         except asyncio.TimeoutError:
-            logger.warning(f"Batch execution timed out after {spec.timeout_s}s")
+            logger.warning(f"Batch execution timed out after {aggregate_timeout:.1f}s")
 
         except Exception as e:
             logger.warning(f"Batch execution stream broke: {e}")
