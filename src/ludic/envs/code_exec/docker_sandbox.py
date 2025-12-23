@@ -645,6 +645,7 @@ class DockerSandbox:
             exit_code=result.get("exit_code"),
             run_duration_ms=duration_ms,
             total_duration_ms=total_ms,
+            cache_key=result.get("id", ""),  # Pass test_id for matching in runner
         )
 
 
