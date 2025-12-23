@@ -186,13 +186,23 @@ class StdinStdoutRunner:
         Returns:
             BatchTestResult with results for each test
         """
+        import time
+
+        run_start = time.perf_counter()
+
         # Compute hashes for caching
         code_hash = compute_hash(code)
         tests_hash_val = hash_tests(tests)
 
         # Use batch execution if enabled and sandbox supports it
-        if self._use_batch_execution and hasattr(sandbox, "execute_batch"):
-            return await self._run_tests_batched(
+        has_batch = hasattr(sandbox, "execute_batch")
+        logger.debug(
+            f"run_tests: use_batch={self._use_batch_execution}, "
+            f"has_execute_batch={has_batch}, num_tests={len(tests)}"
+        )
+
+        if self._use_batch_execution and has_batch:
+            result = await self._run_tests_batched(
                 sandbox=sandbox,
                 code=code,
                 tests=tests,
@@ -202,8 +212,14 @@ class StdinStdoutRunner:
                 code_hash=code_hash,
                 tests_hash=tests_hash_val,
             )
+            elapsed_ms = (time.perf_counter() - run_start) * 1000
+            logger.debug(
+                f"Batch execution completed: {len(tests)} tests in {elapsed_ms:.1f}ms, "
+                f"passed={result.passed_count}/{result.total_count}"
+            )
+            return result
 
-        # Non-batch execution TODO [joan]: Maybe mention?
+        # Non-batch execution
         # Step 1: Compile first if requested
         compile_result: Optional[CompileResult] = None
         if compile_first:
