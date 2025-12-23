@@ -133,6 +133,7 @@ def _create_docker_pool(
     n_workers: int,
     python_version: str,
     cache_size: int,
+    max_concurrent_ops: int = 8,
     memory_limit: str = "256m",
     cpu_quota: int = 50000,
     network_disabled: bool = True,
@@ -160,6 +161,7 @@ def _create_docker_pool(
         n_workers=n_workers,
         config=config,
         cache_size=cache_size,
+        max_concurrent_ops=max_concurrent_ops,
     )
 
 
@@ -167,6 +169,7 @@ def _create_podman_hpc_pool(
     n_workers: int,
     python_version: str,
     cache_size: int,
+    max_concurrent_ops: int = 8,
     memory_limit: str = "256m",
     cpu_quota: Optional[float] = None,
     network_disabled: bool = True,
@@ -195,4 +198,5 @@ def _create_podman_hpc_pool(
         image=image,
         config=config,
         cache_size=cache_size,
+        max_concurrent_ops=max_concurrent_ops,
     )
