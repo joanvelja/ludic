@@ -849,8 +849,7 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         cache_size: int = 10000,
         auto_replace_failed: bool = True,
         max_consecutive_failures: int = 5,
-        max_concurrent_resets: int = 8,
-        max_concurrent_exec: int = 8,
+        max_concurrent_ops: int = 8,
     ):
         """
         Initialize Podman-HPC sandbox pool.
@@ -863,23 +862,17 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             auto_replace_failed: If True, create new sandbox when reset fails
             max_consecutive_failures: Maximum consecutive reset failures before raising
                 SandboxPoolExhaustedError (circuit breaker threshold)
-            max_concurrent_resets: Maximum concurrent reset operations. Default 8.
-                (Legacy parameter, now superseded by max_concurrent_exec)
-            max_concurrent_exec: Maximum concurrent podman-hpc exec operations.
-                Podman deadlocks above ~8 concurrent operations due to lock
-                contention. This limits ALL exec calls (execute, compile, reset,
-                cleanup) to prevent deadlock. Default 8.
+            max_concurrent_ops: Maximum concurrent operations (resets, executions)
         """
         super().__init__(
             n_workers=n_workers,
             cache_size=cache_size,
             auto_replace_failed=auto_replace_failed,
             max_consecutive_failures=max_consecutive_failures,
-            max_concurrent_resets=max_concurrent_resets,
+            max_concurrent_ops=max_concurrent_ops,
         )
         self._image = image
         self._config = config or PodmanConfig()
-        self._max_concurrent_exec = max_concurrent_exec
         self._exec_semaphore: Optional[asyncio.Semaphore] = None
 
         # Extract Python version from image name
@@ -905,9 +898,9 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             List of started PodmanHPCSandbox instances
         """
         # Create shared exec semaphore (prevents podman deadlock)
-        self._exec_semaphore = asyncio.Semaphore(self._max_concurrent_exec)
+        self._exec_semaphore = asyncio.Semaphore(self._max_concurrent_ops)
         logger.info(
-            f"Podman exec semaphore initialized: max_concurrent_exec={self._max_concurrent_exec}"
+            f"Podman exec semaphore initialized: max_concurrent_ops={self._max_concurrent_ops}"
         )
 
         # Pull image (podman-hpc pull auto-migrates to shared storage)

@@ -35,6 +35,7 @@ async def create_sandbox_pool(
     backend: str = "auto",
     python_version: str = "3.11",
     cache_size: int = 10000,
+    max_concurrent_ops: int = 8,
     **backend_kwargs: Any,
 ) -> SandboxPool:
     """
@@ -50,6 +51,8 @@ async def create_sandbox_pool(
         backend: Backend to use ("auto", "docker", "podman-hpc", "singularity")
         python_version: Python version for the sandbox containers
         cache_size: Maximum number of cached execution results
+        max_concurrent_ops: Maximum concurrent sandbox operations (resets, exec
+            calls). Prevents deadlock in HPC environments. Default 8.
         **backend_kwargs: Additional backend-specific configuration:
             - memory_limit (str): Memory limit (e.g., "256m", "1g")
             - cpu_quota (float): CPU limit as fraction (e.g., 0.5 = 50% of one CPU)
@@ -96,6 +99,7 @@ async def create_sandbox_pool(
             n_workers=n_workers,
             python_version=python_version,
             cache_size=cache_size,
+            max_concurrent_ops=max_concurrent_ops,
             **backend_kwargs,
         )
 
@@ -104,6 +108,7 @@ async def create_sandbox_pool(
             n_workers=n_workers,
             python_version=python_version,
             cache_size=cache_size,
+            max_concurrent_ops=max_concurrent_ops,
             **backend_kwargs,
         )
 

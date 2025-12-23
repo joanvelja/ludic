@@ -221,10 +221,10 @@ def main():
 
     # Sandbox
     parser.add_argument(
-        "--max-concurrent-resets",
+        "--max-concurrent-ops",
         type=int,
         default=8,
-        help="Max concurrent sandbox resets (for HPC compatibility)",
+        help="Max concurrent sandbox operations (prevents deadlock in HPC environments)",
     )
     parser.add_argument(
         "--sandbox-workers", type=int, default=4, help="Number of sandbox containers"
@@ -244,7 +244,7 @@ def main():
         help="Use minimal sandbox config (no memory/network limits) for HPC compatibility",
     )
     parser.add_argument(
-        "--timeout-per-test", type=float, default=5.0, help="Timeout per test (seconds)"
+        "--timeout-per-test", type=float, default=1.0, help="Timeout per test (seconds)"
     )
 
     # Training
@@ -330,11 +330,37 @@ def main():
     os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
     open(rollout_log_path, "a", encoding="utf-8").close()
 
+    # Load tokenizer early (needed for prompt length filtering)
+    print(f"Loading tokenizer: {args.model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
     # Load data and split into train/eval sets
     print(f"Loading APPS samples (split={args.split}, limit={args.limit})...")
     all_samples = load_apps_samples(args.split, args.limit, args.difficulty)
     if not all_samples:
         print("ERROR: No APPS samples loaded.")
+        return 1
+
+    # Filter out samples with prompts that exceed max_prompt_tokens
+    # This ensures max_new_tokens can fit within the model's context window
+    def prompt_fits(sample: Dict[str, Any]) -> bool:
+        messages = [
+            {"role": "system", "content": APPS_SYSTEM_PROMPT},
+            {"role": "user", "content": sample["question"]},
+        ]
+        token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        return len(token_ids) <= args.max_prompt_tokens
+
+    pre_filter_count = len(all_samples)
+    all_samples = [s for s in all_samples if prompt_fits(s)]
+    filtered_count = pre_filter_count - len(all_samples)
+    if filtered_count > 0:
+        print(f"Filtered {filtered_count} samples exceeding {args.max_prompt_tokens} prompt tokens.")
+
+    if not all_samples:
+        print("ERROR: All samples filtered out by prompt length. Increase --max-prompt-tokens.")
         return 1
 
     # Split: last N samples for eval (deterministic, reproducible)
@@ -345,7 +371,7 @@ def main():
         train_samples = all_samples
         eval_samples = []
 
-    print(f"Loaded {len(all_samples)} total samples.")
+    print(f"Loaded {len(all_samples)} total samples (after filtering).")
     print(f"  Train: {len(train_samples)} samples")
     print(f"  Eval:  {len(eval_samples)} samples (held out)")
 
@@ -353,11 +379,8 @@ def main():
     for idx, s in enumerate(train_samples):
         samples_q.put((idx, s))
 
-    # Tokenizer + model with LoRA
+    # Load model with LoRA
     print(f"Loading model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -400,7 +423,7 @@ def main():
                 n_workers=args.sandbox_workers,
                 backend=args.sandbox_backend,
                 python_version=args.python_version,
-                max_concurrent_resets=args.max_concurrent_resets,
+                max_concurrent_ops=args.max_concurrent_ops,
                 cache_size=10000,
                 **backend_kwargs,
             )
@@ -414,7 +437,7 @@ def main():
     env_config = CodeExecConfig(
         timeout_per_test_s=args.timeout_per_test,
         stop_on_first_failure=False,
-        compile_first=False,
+        compile_first=True,
         partial_credit=args.partial_credit,
         compile_failure_reward=-0.1,
         use_cache=True,
