@@ -559,6 +559,13 @@ class DockerSandbox:
         """Build tar archive containing batch execution files."""
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
+            # Create directory entry first
+            dir_info = tarfile.TarInfo(name=batch_dir)
+            dir_info.type = tarfile.DIRTYPE
+            dir_info.mode = 0o755
+            dir_info.mtime = int(time.time())
+            tar.addfile(dir_info)
+
             # Add manifest.json
             manifest_data = json.dumps(manifest, indent=2).encode("utf-8")
             info = tarfile.TarInfo(name=f"{batch_dir}/manifest.json")

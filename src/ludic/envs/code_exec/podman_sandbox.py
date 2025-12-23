@@ -600,11 +600,12 @@ class PodmanHPCSandbox:
         try:
             async with self._exec_semaphore:
                 proc = await asyncio.create_subprocess_exec(
-                    "podman-hpc", "exec", self._container_name,
-                    "/usr/local/bin/python", runner_path, manifest_path,
+                    "podman-hpc", "exec",
+                    "--workdir", f"{self._config.working_dir}/{batch_dir}",
+                    self._container_name,
+                    "python", runner_path, manifest_path,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=f"{self._config.working_dir}/{batch_dir}",
                 )
 
                 # Stream results line by line
@@ -703,6 +704,13 @@ class PodmanHPCSandbox:
         """
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w") as tar:
+            # Create directory entry first
+            dir_info = tarfile.TarInfo(name=batch_dir)
+            dir_info.type = tarfile.DIRTYPE
+            dir_info.mode = 0o755
+            dir_info.mtime = int(time.time())
+            tar.addfile(dir_info)
+
             # Add manifest.json
             manifest_data = json.dumps(manifest, indent=2).encode("utf-8")
             info = tarfile.TarInfo(name=f"{batch_dir}/manifest.json")
