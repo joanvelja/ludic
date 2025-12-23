@@ -213,6 +213,12 @@ def main():
 
     # Sandbox
     parser.add_argument(
+        "--max-concurrent-resets",
+        type=int,
+        default=8,
+        help="Max concurrent sandbox resets (for HPC compatibility)",
+    )
+    parser.add_argument(
         "--sandbox-workers", type=int, default=4, help="Number of sandbox containers"
     )
     parser.add_argument(
@@ -386,6 +392,7 @@ def main():
                 n_workers=args.sandbox_workers,
                 backend=args.sandbox_backend,
                 python_version=args.python_version,
+                max_concurrent_resets=args.max_concurrent_resets,
                 cache_size=10000,
                 **backend_kwargs,
             )

@@ -9,8 +9,11 @@ Usage:
     # Local Docker (requires Docker running):
     python benchmark_batch.py --backend docker --n-workers 4 --n-problems 10
 
-    # On Isambard (requires podman-hpc):
-    python benchmark_batch.py --backend podman --n-workers 4 --n-problems 10
+    # On Isambard compute node (via SLURM):
+    srun python benchmark_batch.py --backend podman --n-workers 4 --n-problems 10
+
+    # On Isambard login node (testing only - no cgroups):
+    python benchmark_batch.py --backend podman --n-workers 4 --n-problems 10 --no-memory-limit
 
 The benchmark reports:
   - Individual execution time (baseline)
@@ -119,6 +122,7 @@ async def run_benchmark(
     n_workers: int,
     n_problems: int,
     tests_per_problem: int,
+    no_memory_limit: bool = False,
 ) -> None:
     """Main benchmark function."""
     print(f"Benchmark Configuration:")
@@ -126,6 +130,8 @@ async def run_benchmark(
     print(f"  Workers: {n_workers}")
     print(f"  Problems: {n_problems}")
     print(f"  Tests per problem: {tests_per_problem}")
+    if no_memory_limit:
+        print(f"  Memory limit: DISABLED (login node mode)")
     print()
 
     # Generate test problems
@@ -141,9 +147,17 @@ async def run_benchmark(
 
         pool = DockerSandboxPool(n_workers=n_workers)
     elif backend == "podman":
-        from ludic.envs.code_exec.podman_sandbox import PodmanHPCSandboxPool
+        from ludic.envs.code_exec.podman_sandbox import (
+            PodmanHPCSandboxPool,
+            PodmanConfig,
+        )
 
-        pool = PodmanHPCSandboxPool(n_workers=n_workers)
+        config = None
+        if no_memory_limit:
+            # Disable memory limits for login node testing (cgroups not available)
+            config = PodmanConfig(memory_limit="")
+
+        pool = PodmanHPCSandboxPool(n_workers=n_workers, config=config)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -246,6 +260,11 @@ def main():
         default=10,
         help="Number of tests per problem (default: 10)",
     )
+    parser.add_argument(
+        "--no-memory-limit",
+        action="store_true",
+        help="Disable container memory limits (required for login nodes without cgroup support)",
+    )
 
     args = parser.parse_args()
 
@@ -255,6 +274,7 @@ def main():
             n_workers=args.n_workers,
             n_problems=args.n_problems,
             tests_per_problem=args.tests_per_problem,
+            no_memory_limit=args.no_memory_limit,
         )
     )
 
