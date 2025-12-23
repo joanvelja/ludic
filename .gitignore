@@ -9,6 +9,9 @@ wheels/
 # mac specific crap
 .DS_Store
 
+# checkpoints
+checkpoints_*/
+
 # Virtual environments
 .venv
 
