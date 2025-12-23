@@ -208,6 +208,129 @@ async def main() -> int:
 
     await cleanup_container(test_container)
 
+    # =========================================================================
+    # Test 8: Host bind mount (CRITICAL for I/O optimization)
+    # =========================================================================
+    log("")
+    log("=" * 60)
+    log("Testing HOST BIND MOUNT (potential 3x throughput improvement)")
+    log("=" * 60)
+
+    import tempfile
+    import shutil as sh
+
+    # Create a temp directory on the host
+    bind_test_dir = tempfile.mkdtemp(prefix="ludic_bind_test_")
+    log(f"Created host directory: {bind_test_dir}")
+
+    try:
+        await cleanup_container(test_container)
+
+        # Test: Run container with bind mount and write a file from inside
+        success, stdout, stderr = await run_cmd(
+            [
+                "podman-hpc", "run", "--rm",
+                "-v", f"{bind_test_dir}:/workspace",
+                test_image,
+                "/usr/local/bin/python", "-c",
+                "open('/workspace/test_from_container.txt', 'w').write('hello from container')"
+            ],
+            "Bind mount write test (-v host:container)",
+        )
+        results["bind_mount_write"] = success
+
+        # Check if file appeared on host
+        test_file = os.path.join(bind_test_dir, "test_from_container.txt")
+        if os.path.exists(test_file):
+            with open(test_file) as f:
+                content = f.read()
+            if content == "hello from container":
+                log(f"  Host file verification: PASSED (content matches)")
+                results["bind_mount_verify"] = True
+            else:
+                log(f"  Host file verification: FAILED (content mismatch: {content!r})")
+                results["bind_mount_verify"] = False
+        else:
+            log(f"  Host file verification: FAILED (file not found on host)")
+            results["bind_mount_verify"] = False
+
+        # Test: Write from host, read from container
+        host_write_file = os.path.join(bind_test_dir, "test_from_host.txt")
+        with open(host_write_file, "w") as f:
+            f.write("hello from host")
+
+        success, stdout, stderr = await run_cmd(
+            [
+                "podman-hpc", "run", "--rm",
+                "-v", f"{bind_test_dir}:/workspace",
+                test_image,
+                "/usr/local/bin/python", "-c",
+                "print(open('/workspace/test_from_host.txt').read())"
+            ],
+            "Bind mount read test (host→container)",
+        )
+        results["bind_mount_read"] = success and "hello from host" in stdout
+        if success and "hello from host" in stdout:
+            log(f"  Container read verification: PASSED")
+        else:
+            log(f"  Container read verification: FAILED (stdout: {stdout[:100]})")
+
+    finally:
+        # Cleanup
+        sh.rmtree(bind_test_dir, ignore_errors=True)
+        log(f"Cleaned up: {bind_test_dir}")
+
+    # =========================================================================
+    # Test 9: Concurrent exec stress test
+    # =========================================================================
+    log("")
+    log("=" * 60)
+    log("Testing CONCURRENT EXEC (finding actual concurrency limit)")
+    log("=" * 60)
+
+    await cleanup_container(test_container)
+
+    # Start a persistent container
+    success, _, _ = await run_cmd(
+        ["podman-hpc", "run", "-d", "--name", test_container, test_image, "sleep", "infinity"],
+        "Starting persistent container for concurrency test",
+    )
+
+    if success:
+        for concurrency in [8, 16, 24, 32]:
+            log(f"  Testing {concurrency} concurrent exec calls...")
+
+            async def run_one_exec(i: int) -> bool:
+                proc = await asyncio.create_subprocess_exec(
+                    "podman-hpc", "exec", test_container,
+                    "/usr/local/bin/python", "-c", f"import time; time.sleep(0.5); print({i})",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await proc.communicate()
+                return proc.returncode == 0
+
+            start = asyncio.get_event_loop().time()
+            tasks = [run_one_exec(i) for i in range(concurrency)]
+            results_list = await asyncio.gather(*tasks, return_exceptions=True)
+            elapsed = asyncio.get_event_loop().time() - start
+
+            successes = sum(1 for r in results_list if r is True)
+            failures = sum(1 for r in results_list if r is False)
+            exceptions = sum(1 for r in results_list if isinstance(r, Exception))
+
+            status = "PASSED" if successes == concurrency else "PARTIAL" if successes > 0 else "FAILED"
+            log(f"    {concurrency} concurrent: {status} ({successes}/{concurrency} ok, {failures} failed, {exceptions} exceptions) in {elapsed:.1f}s")
+
+            results[f"concurrent_{concurrency}"] = (successes == concurrency)
+
+            # If we start seeing failures, note the limit
+            if successes < concurrency:
+                log(f"    ⚠️  Concurrency limit appears to be around {successes}")
+                break
+
+    await cleanup_container(test_container)
+
     # Summary
     log("")
     log("=" * 60)
@@ -222,6 +345,8 @@ async def main() -> int:
             all_passed = False
 
     log("")
+
+    # Basic functionality
     if results.get("persistent_minimal") and results.get("exec"):
         log("RECOMMENDATION: Use minimal config (no memory/network limits)", "SUCCESS")
         log("  Set PodmanConfig(memory_limit=None, network_disabled=False)")
@@ -230,6 +355,32 @@ async def main() -> int:
     else:
         log("podman-hpc appears non-functional on this system", "ERROR")
 
+    # Bind mount recommendation
+    log("")
+    if results.get("bind_mount_write") and results.get("bind_mount_verify") and results.get("bind_mount_read"):
+        log("🚀 BIND MOUNTS WORK! This enables major I/O optimization:", "SUCCESS")
+        log("  - Write code directly to host filesystem (skip podman exec tar)")
+        log("  - Reset via host rmtree (skip podman exec rm)")
+        log("  - Potential 3x throughput improvement")
+        log("  → Implement host-mounted workspace in PodmanHPCSandbox")
+    else:
+        log("Bind mounts not working - continue using tar-based I/O", "WARN")
+
+    # Concurrency recommendation
+    log("")
+    max_working_concurrency = 0
+    for c in [32, 24, 16, 8]:
+        if results.get(f"concurrent_{c}"):
+            max_working_concurrency = c
+            break
+
+    if max_working_concurrency > 0:
+        log(f"CONCURRENCY: {max_working_concurrency} concurrent execs work reliably", "SUCCESS")
+        log(f"  → Set max_concurrent_ops={max_working_concurrency} in create_sandbox_pool()")
+    else:
+        log("CONCURRENCY: Could not determine safe concurrency limit", "WARN")
+
+    log("")
     log("=" * 60)
     return 0 if all_passed else 1
 
