@@ -18,6 +18,9 @@ wandb/
 # Big jsonl files
 *.jsonl
 
+# Checkpoint folders
+checkpoints_*/
+
 # Environment files (secrets)
 .env
 .env.*

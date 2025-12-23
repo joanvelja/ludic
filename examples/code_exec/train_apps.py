@@ -233,6 +233,20 @@ def main():
         "--timeout-per-test", type=float, default=5.0, help="Timeout per test (seconds)"
     )
 
+    # Token length limits (for memory efficiency)
+    parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=1024,
+        help="Maximum prompt tokens (samples exceeding this are filtered)",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=4096,
+        help="Maximum new tokens to generate",
+    )
+
     # Training
     parser.add_argument(
         "--concurrency", type=int, default=32, help="Rollout concurrency"
@@ -335,15 +349,52 @@ def main():
     print(f"  Train: {len(train_samples)} samples")
     print(f"  Eval:  {len(eval_samples)} samples (held out)")
 
-    samples_q: queue.Queue = queue.Queue()
-    for idx, s in enumerate(train_samples):
-        samples_q.put((idx, s))
-
     # Tokenizer + model with LoRA
     print(f"Loading model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Filter samples by prompt token length
+    max_prompt_tokens = args.max_prompt_tokens
+    print(f"Filtering samples with prompt > {max_prompt_tokens} tokens...")
+
+    def count_prompt_tokens(sample: Dict[str, Any]) -> int:
+        """Count approximate prompt tokens for a sample."""
+        # Build the prompt as the model would see it (system + question)
+        prompt = APPS_SYSTEM_PROMPT + "\n\n" + sample.get("question", "")
+        return len(tokenizer.encode(prompt, add_special_tokens=True))
+
+    # Filter train samples
+    train_samples_filtered = []
+    train_filtered_count = 0
+    for s in train_samples:
+        if count_prompt_tokens(s) <= max_prompt_tokens:
+            train_samples_filtered.append(s)
+        else:
+            train_filtered_count += 1
+    train_samples = train_samples_filtered
+
+    # Filter eval samples
+    eval_samples_filtered = []
+    eval_filtered_count = 0
+    for s in eval_samples:
+        if count_prompt_tokens(s) <= max_prompt_tokens:
+            eval_samples_filtered.append(s)
+        else:
+            eval_filtered_count += 1
+    eval_samples = eval_samples_filtered
+
+    print(f"  Filtered out {train_filtered_count} train samples (prompt > {max_prompt_tokens} tokens)")
+    print(f"  Filtered out {eval_filtered_count} eval samples (prompt > {max_prompt_tokens} tokens)")
+    print(f"  Remaining: {len(train_samples)} train, {len(eval_samples)} eval")
+    print(f"  Max sequence length: {max_prompt_tokens + args.max_new_tokens} tokens")
+
+    samples_q: queue.Queue = queue.Queue()
+    for idx, s in enumerate(train_samples):
+        samples_q.put((idx, s))
+
+
 
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model,
@@ -476,7 +527,11 @@ def main():
     )
 
     train_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=1024),
+        sampling=SamplingParams(
+            temperature=args.train_temperature,
+            max_tokens=args.max_new_tokens,
+            stop=["</code>"],
+        ),
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
 
@@ -640,7 +695,11 @@ def main():
 
     # Create EngineEvaluator for eval set
     eval_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.eval_temperature, max_tokens=1024),
+        sampling=SamplingParams(
+            temperature=args.eval_temperature,
+            max_tokens=args.max_new_tokens,
+            stop=["</code>"],
+        ),
         return_=ReturnSpec.for_eval(return_token_ids=True),
     )
 
