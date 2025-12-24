@@ -1,48 +1,19 @@
 """
 Podman-HPC sandbox implementation for code execution on HPC clusters.
 
-This module provides:
+Provides:
   - PodmanConfig: Configuration for Podman containers
   - PodmanHPCSandbox: Async Podman container sandbox using subprocess
   - PodmanHPCSandboxPool: Pool of Podman sandboxes with caching
 
-Podman-HPC is a daemonless container runtime wrapper commonly available on HPC
-clusters (e.g., Isambard/BRiCS). Unlike Docker, it doesn't require a daemon and
-integrates with Slurm job scheduling.
+Podman-HPC is a daemonless container runtime wrapper for HPC clusters (e.g., Isambard).
+Uses asyncio.create_subprocess_exec instead of docker-py SDK.
 
-Key differences from Docker implementation:
-  - Uses asyncio.create_subprocess_exec instead of docker-py SDK
-  - File writing via tar pipe (no put_archive API)
-  - Container naming includes SLURM_JOB_ID to avoid conflicts between jobs
-
-Usage:
-  # On HPC cluster with podman-hpc available
-  pool = PodmanHPCSandboxPool(n_workers=4)
-  await pool.start()  # Pulls image and creates containers
-
-  sandbox = await pool.checkout()
-  result = await sandbox.execute("print('hello')")
-  await pool.release(sandbox)
-
-  await pool.shutdown()
-
-HPC Compatibility Note (Isambard/BRiCS - December 2024):
----------------------------------------------------------
-On some HPC systems (notably Isambard), podman-hpc converts pulled images to
-squashfs format for shared storage. This conversion can break the container's
-PATH environment variable, causing commands like `sleep`, `python`, etc. to
-fail with "executable file not found in $PATH" errors.
-
-**Workaround**: All commands in this module use absolute paths:
+**Important**: On some HPC systems (Isambard), podman-hpc's squashfs conversion
+breaks the PATH variable. All commands in this module use absolute paths:
   - /bin/sleep, /bin/mkdir, /bin/sh
-  - /usr/local/bin/python (for official Python Docker images)
+  - /usr/local/bin/python
   - /usr/bin/pkill
-
-If you encounter PATH-related errors on a new HPC system, verify paths with:
-  podman-hpc run --rm python:3.11-slim /bin/ls /bin/
-  podman-hpc run --rm python:3.11-slim /bin/ls /usr/local/bin/
-
-See: https://docs.isambard.ac.uk/user-documentation/guides/containers/podman-hpc/
 """
 
 from __future__ import annotations
@@ -54,13 +25,20 @@ import logging
 import math
 import os
 import re
+import shutil
 import tarfile
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator, Dict, List, Optional, Union
 
-from .cache import LRUCache
+from .parsing import (
+    get_batch_runner_script,
+    parse_batch_compile_result,
+    parse_batch_test_result,
+    parse_syntax_error,
+)
 from .pool import BaseSandboxPool
 from .sandbox import Sandbox, SandboxPool
 from .types import (
@@ -72,32 +50,6 @@ from .types import (
     RunStatus,
     TestCase,
 )
-
-# Import batch runner script using importlib.resources
-# This ensures the script is available regardless of installation method
-try:
-    from importlib.resources import files
-    _BATCH_RUNNER_SCRIPT: Optional[str] = None
-
-    def _get_batch_runner_script() -> str:
-        """Lazy-load the batch runner script from package resources."""
-        global _BATCH_RUNNER_SCRIPT
-        if _BATCH_RUNNER_SCRIPT is None:
-            _BATCH_RUNNER_SCRIPT = (
-                files("ludic.envs.code_exec")
-                .joinpath("batch_runner.py")
-                .read_text()
-            )
-        return _BATCH_RUNNER_SCRIPT
-
-except ImportError:
-    # Fallback for older Python versions
-    import pkg_resources
-
-    def _get_batch_runner_script() -> str:
-        return pkg_resources.resource_string(
-            "ludic.envs.code_exec", "batch_runner.py"
-        ).decode("utf-8")
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +99,14 @@ class PodmanHPCSandbox:
         config: PodmanConfig,
         python_version: str = "3.11",
         exec_semaphore: Optional[asyncio.Semaphore] = None,
+        workspace_host_dir: Optional[str] = None,
     ):
         self._container_name = container_name
         self._image = image
         self._config = config
         self._python_version = python_version
         self._exec_semaphore = exec_semaphore  # Shared across all sandboxes in pool
+        self._workspace_host_dir = workspace_host_dir
         self._started = False
 
     @property
@@ -182,6 +136,14 @@ class PodmanHPCSandbox:
         if self._config.extra_args:
             cmd.extend(self._config.extra_args)
 
+        # Add bind mount if workspace_host_dir is set
+        if self._workspace_host_dir:
+            logger.info(
+                f"[{self._container_name}] Using bind mount: "
+                f"{self._workspace_host_dir} -> {self._config.working_dir}"
+            )
+            cmd.extend(["-v", f"{self._workspace_host_dir}:{self._config.working_dir}:rw"])
+
         # Image and command (use full path for HPC compatibility)
         cmd.extend([self._image, "/bin/sleep", "infinity"])
 
@@ -189,11 +151,13 @@ class PodmanHPCSandbox:
         await self._run_podman(*cmd, capture=True)
 
         # Ensure workspace directory exists (use full path for HPC compatibility)
-        await self._run_podman(
-            "exec", self._container_name,
-            "/bin/mkdir", "-p", self._config.working_dir,
-            capture=True,
-        )
+        # Skip if using bind mount (host directory should already exist)
+        if not self._workspace_host_dir:
+            await self._run_podman(
+                "exec", self._container_name,
+                "/bin/mkdir", "-p", self._config.working_dir,
+                capture=True,
+            )
 
         self._started = True
 
@@ -209,6 +173,22 @@ class PodmanHPCSandbox:
     async def reset(self) -> None:
         """Clear workspace directory (in-place, no container restart)."""
         if not self._started:
+            return
+
+        if self._workspace_host_dir:
+            # Direct host filesystem cleanup - no podman exec, no semaphore
+            logger.debug(f"[{self._container_name}] reset() using direct host cleanup...")
+            start = time.perf_counter()
+
+            workspace_path = Path(self._workspace_host_dir)
+            for item in workspace_path.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink()
+
+            elapsed = time.perf_counter() - start
+            logger.debug(f"[{self._container_name}] reset() completed in {elapsed:.3f}s (direct)")
             return
 
         logger.debug(f"[{self._container_name}] reset() starting podman-hpc exec...")
@@ -256,7 +236,7 @@ class PodmanHPCSandbox:
 
             # Parse error message
             error_msg = proc.stderr or proc.stdout or ""
-            line, column, clean_msg = self._parse_syntax_error(error_msg)
+            line, column, clean_msg = parse_syntax_error(error_msg)
 
             # Classify error type
             status = CompileStatus.SYNTAX_ERROR
@@ -407,6 +387,13 @@ class PodmanHPCSandbox:
         Creates a tar archive in memory and pipes it to container.
         This is more robust than echo for handling special characters.
         """
+        if self._workspace_host_dir:
+            # Direct host filesystem write - no podman exec, no semaphore
+            path = Path(self._workspace_host_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+            return
+
         # Create tar archive in memory
         tar_buffer = io.BytesIO()
         with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
@@ -507,39 +494,6 @@ class PodmanHPCSandbox:
 
         return result
 
-    @staticmethod
-    def _parse_syntax_error(error_msg: str) -> tuple[Optional[int], Optional[int], str]:
-        """Parse Python syntax error to extract line, column, and clean message."""
-        line = None
-        column = None
-        clean_msg = ""
-
-        # Try to find line number
-        line_match = re.search(r'line (\d+)', error_msg)
-        if line_match:
-            line = int(line_match.group(1))
-
-        # Try to find column number
-        col_match = re.search(r'column (\d+)', error_msg)
-        if col_match:
-            column = int(col_match.group(1))
-
-        # Extract error type and message
-        error_type_match = re.search(
-            r'(SyntaxError|IndentationError|TabError):\s*(.+)', error_msg
-        )
-        if error_type_match:
-            error_type = error_type_match.group(1)
-            msg = error_type_match.group(2).strip()
-            clean_msg = f"{error_type}: {msg}"
-        else:
-            # Fall back to just extracting the last line
-            lines = [l.strip() for l in error_msg.split('\n') if l.strip()]
-            if lines:
-                clean_msg = lines[-1]
-
-        return line, column, clean_msg
-
     # -------------------------------------------------------------------------
     # Batch execution (reduces semaphore acquisitions from O(N) to O(1))
     # -------------------------------------------------------------------------
@@ -581,7 +535,7 @@ class PodmanHPCSandbox:
         tar_data = self._build_batch_tar(
             manifest=manifest,
             code=spec.code,
-            runner_script=_get_batch_runner_script(),
+            runner_script=get_batch_runner_script(),
             batch_dir=batch_dir,
         )
 
@@ -635,7 +589,7 @@ class PodmanHPCSandbox:
                         result_type = result.get("type")
 
                         if result_type == "compile":
-                            compile_result = self._parse_batch_compile_result(result)
+                            compile_result = parse_batch_compile_result(result)
                             streamed_results.append(("compile", compile_result))
                             if not compile_result.success:
                                 # Compilation failed, we're done
@@ -644,7 +598,7 @@ class PodmanHPCSandbox:
                         elif result_type == "test":
                             test_id = result.get("id", "unknown")
                             received_test_ids.add(test_id)
-                            exec_result = self._parse_batch_test_result(result, run_start)
+                            exec_result = parse_batch_test_result(result, run_start)
                             streamed_results.append(("test", exec_result))
 
                         elif result_type == "done":
@@ -771,6 +725,13 @@ class PodmanHPCSandbox:
 
         Similar to _write_file but takes raw tar bytes.
         """
+        if self._workspace_host_dir:
+            # Extract tar directly to host filesystem - no podman exec
+            buf = io.BytesIO(tar_data)
+            with tarfile.open(fileobj=buf, mode="r") as tar:
+                tar.extractall(path=self._workspace_host_dir)
+            return
+
         await asyncio.wait_for(
             self._run_podman(
                 "exec", "-i", self._container_name,
@@ -780,64 +741,6 @@ class PodmanHPCSandbox:
                 input_data=tar_data,
             ),
             timeout=timeout_s,
-        )
-
-    def _parse_batch_compile_result(self, result: dict) -> CompileResult:
-        """Parse compile result from batch runner JSON."""
-        status_str = result.get("status", "unknown_error")
-
-        if status_str == "success":
-            status = CompileStatus.SUCCESS
-        elif status_str == "syntax_error":
-            status = CompileStatus.SYNTAX_ERROR
-        elif status_str == "timeout":
-            status = CompileStatus.TIMEOUT
-        else:
-            status = CompileStatus.UNKNOWN_ERROR
-
-        return CompileResult(
-            status=status,
-            error_message=result.get("error_message"),
-            error_line=result.get("error_line"),
-            error_column=result.get("error_column"),
-            duration_ms=result.get("duration_ms", 0.0),
-        )
-
-    def _parse_batch_test_result(
-        self,
-        result: dict,
-        run_start: float,
-    ) -> ExecutionResult:
-        """Parse test result from batch runner JSON."""
-        status_str = result.get("status", "runtime_error")
-
-        if status_str == "success":
-            run_status = RunStatus.SUCCESS
-        elif status_str == "runtime_error":
-            run_status = RunStatus.RUNTIME_ERROR
-        elif status_str == "timeout":
-            run_status = RunStatus.TIMEOUT
-        elif status_str == "memory_exceeded":
-            run_status = RunStatus.MEMORY_EXCEEDED
-        elif status_str == "not_run":
-            run_status = RunStatus.NOT_RUN
-        elif status_str == "killed":
-            run_status = RunStatus.KILLED
-        else:
-            run_status = RunStatus.RUNTIME_ERROR
-
-        duration_ms = result.get("duration_ms", 0.0)
-        total_ms = (time.perf_counter() - run_start) * 1000
-
-        return ExecutionResult(
-            compile_result=CompileResult(status=CompileStatus.SUCCESS),
-            run_status=run_status,
-            stdout=result.get("stdout", ""),
-            stderr=result.get("stderr", ""),
-            exit_code=result.get("exit_code"),
-            run_duration_ms=duration_ms,
-            total_duration_ms=total_ms,
-            cache_key=result.get("id", ""),  # Pass test_id for matching in runner
         )
 
 
@@ -876,6 +779,7 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         auto_replace_failed: bool = True,
         max_consecutive_failures: int = 5,
         max_concurrent_ops: int = 8,
+        workspace_base_dir: str = "auto",
     ):
         """
         Initialize Podman-HPC sandbox pool.
@@ -889,6 +793,10 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             max_consecutive_failures: Maximum consecutive reset failures before raising
                 SandboxPoolExhaustedError (circuit breaker threshold)
             max_concurrent_ops: Maximum concurrent operations (resets, executions)
+            workspace_base_dir: Base directory for bind mounts. Options:
+                - "auto" (default): Auto-detect; use /local if on HPC, else None
+                - explicit path: Use specified directory for bind mounts
+                - None: Disable bind mounts, use tar-based I/O
         """
         super().__init__(
             n_workers=n_workers,
@@ -903,6 +811,17 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
 
         # Extract Python version from image name
         self._python_version = self._parse_python_version(image)
+
+        # Resolve workspace_base_dir
+        if workspace_base_dir == "auto":
+            # Auto-detect: use /local if on HPC, else None
+            slurm_job_id = os.environ.get("SLURM_JOB_ID")
+            if slurm_job_id and Path("/local").exists():
+                self._workspace_base_dir: Optional[str] = f"/local/ludic-{slurm_job_id}"
+            else:
+                self._workspace_base_dir = None
+        else:
+            self._workspace_base_dir = workspace_base_dir
 
     @property
     def python_version(self) -> str:
@@ -938,17 +857,32 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         )
         await proc.communicate()
 
+        # If using bind mounts, create base directory
+        if self._workspace_base_dir:
+            Path(self._workspace_base_dir).mkdir(parents=True, exist_ok=True)
+            logger.info(f"Bind mount enabled: {self._workspace_base_dir}")
+        else:
+            logger.info("Bind mount disabled, using tar-based I/O")
+
         # Create and start sandboxes in parallel
         container_prefix = _get_container_name_prefix()
 
         async def _create_and_start(i: int) -> PodmanHPCSandbox:
             container_name = f"{container_prefix}-{i}"
+
+            # Create per-sandbox host directory if using bind mounts
+            workspace_host_dir = None
+            if self._workspace_base_dir:
+                workspace_host_dir = f"{self._workspace_base_dir}/sandbox-{i}"
+                Path(workspace_host_dir).mkdir(parents=True, exist_ok=True)
+
             sandbox = PodmanHPCSandbox(
                 container_name=container_name,
                 image=self._image,
                 config=self._config,
                 python_version=self._python_version,
                 exec_semaphore=self._exec_semaphore,  # Shared across all sandboxes
+                workspace_host_dir=workspace_host_dir,
             )
             await sandbox.start()
             return sandbox
@@ -989,12 +923,19 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             # Use timestamp to ensure unique container name
             container_name = f"{container_prefix}-replacement-{int(time.time())}"
 
+            # Create per-sandbox host directory if using bind mounts
+            workspace_host_dir = None
+            if self._workspace_base_dir:
+                workspace_host_dir = f"{self._workspace_base_dir}/sandbox-replacement-{int(time.time())}"
+                Path(workspace_host_dir).mkdir(parents=True, exist_ok=True)
+
             sandbox = PodmanHPCSandbox(
                 container_name=container_name,
                 image=self._image,
                 config=self._config,
                 python_version=self._python_version,
                 exec_semaphore=self._exec_semaphore,  # Use shared semaphore
+                workspace_host_dir=workspace_host_dir,
             )
             await sandbox.start()
             logger.info(f"Created replacement Podman sandbox: {container_name}")
@@ -1002,6 +943,25 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         except Exception as e:
             logger.error(f"Failed to create replacement Podman sandbox: {e}")
             return None
+
+    async def shutdown(self) -> None:
+        """
+        Shutdown pool and clean up resources.
+
+        Stops all sandboxes and removes workspace directories if using bind mounts.
+        """
+        # Call parent shutdown to stop sandboxes
+        await super().shutdown()
+
+        # Clean up host workspace directories
+        if self._workspace_base_dir:
+            workspace_path = Path(self._workspace_base_dir)
+            if workspace_path.exists():
+                try:
+                    shutil.rmtree(self._workspace_base_dir, ignore_errors=True)
+                    logger.info(f"Cleaned up workspace directory: {self._workspace_base_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up workspace directory: {e}")
 
     # -------------------------------------------------------------------------
     # Helper methods

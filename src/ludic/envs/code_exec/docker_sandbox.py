@@ -36,6 +36,12 @@ except ImportError as e:
         "Docker is not installed. Install it with: pip install 'ludic[code-exec]'"
     ) from e
 
+from .parsing import (
+    get_batch_runner_script,
+    parse_batch_compile_result,
+    parse_batch_test_result,
+    parse_syntax_error,
+)
 from .pool import BaseSandboxPool
 from .sandbox import Sandbox, SandboxPool
 from .types import (
@@ -47,31 +53,6 @@ from .types import (
     RunStatus,
     TestCase,
 )
-
-# Import batch runner script using importlib.resources
-try:
-    from importlib.resources import files
-
-    _BATCH_RUNNER_SCRIPT: Optional[str] = None
-
-    def _get_batch_runner_script() -> str:
-        """Lazy-load the batch runner script from package resources."""
-        global _BATCH_RUNNER_SCRIPT
-        if _BATCH_RUNNER_SCRIPT is None:
-            _BATCH_RUNNER_SCRIPT = (
-                files("ludic.envs.code_exec")
-                .joinpath("batch_runner.py")
-                .read_text()
-            )
-        return _BATCH_RUNNER_SCRIPT
-
-except ImportError:
-    import pkg_resources
-
-    def _get_batch_runner_script() -> str:
-        return pkg_resources.resource_string(
-            "ludic.envs.code_exec", "batch_runner.py"
-        ).decode("utf-8")
 
 
 @dataclass
@@ -101,8 +82,6 @@ class DockerSandbox:
     Implements the Sandbox protocol with full async support.
     """
 
-    _memory_limit_warned = False
-
     def __init__(
         self,
         container: Container,
@@ -112,6 +91,7 @@ class DockerSandbox:
         self._container = container
         self._config = config
         self._executor = executor
+        self._memory_limit_warned = False
 
     @property
     def python_version(self) -> str:
@@ -176,7 +156,7 @@ class DockerSandbox:
 
             # Parse error message
             error_msg = (stderr or b"").decode("utf-8", errors="replace")
-            line, column, clean_msg = self._parse_syntax_error(error_msg)
+            line, column, clean_msg = parse_syntax_error(error_msg)
 
             # Classify error type
             status = CompileStatus.SYNTAX_ERROR
@@ -216,14 +196,14 @@ class DockerSandbox:
 
         Compiles first, then executes if compilation succeeds (unless skip_compile=True).
         """
-        # Log warning for memory_limit_mb if provided (only once)
-        if memory_limit_mb is not None and not DockerSandbox._memory_limit_warned:
+        # Log warning for memory_limit_mb if provided (only once per sandbox)
+        if memory_limit_mb is not None and not self._memory_limit_warned:
             logger.warning(
                 "Per-execution memory limits are not supported by docker exec. "
                 "Container-level memory limit (%s) is enforced instead.",
                 self._config.memory_limit,
             )
-            DockerSandbox._memory_limit_warned = True
+            self._memory_limit_warned = True
 
         # Step 1: Compile
         if skip_compile:
@@ -361,52 +341,6 @@ class DockerSandbox:
         tar_buffer.seek(0)
         self._container.put_archive(self._config.working_dir, tar_buffer)
 
-    @staticmethod
-    def _parse_syntax_error(error_msg: str) -> tuple[Optional[int], Optional[int], str]:
-        """
-        Parse Python syntax error to extract line, column, and clean message.
-
-        Python syntax errors typically look like:
-          File "_check.py", line 3
-            def foo(
-                   ^
-        SyntaxError: invalid syntax
-
-        Or:
-          File "_check.py", line 5, column 10
-        SyntaxError: invalid syntax
-
-        Returns:
-            (line, column, clean_message)
-        """
-        line = None
-        column = None
-        clean_msg = ""
-
-        # Try to find line number
-        line_match = re.search(r'line (\d+)', error_msg)
-        if line_match:
-            line = int(line_match.group(1))
-
-        # Try to find column number
-        col_match = re.search(r'column (\d+)', error_msg)
-        if col_match:
-            column = int(col_match.group(1))
-
-        # Extract error type and message
-        error_type_match = re.search(r'(SyntaxError|IndentationError|TabError):\s*(.+)', error_msg)
-        if error_type_match:
-            error_type = error_type_match.group(1)
-            msg = error_type_match.group(2).strip()
-            clean_msg = f"{error_type}: {msg}"
-        else:
-            # Fall back to just extracting the last line
-            lines = [l.strip() for l in error_msg.split('\n') if l.strip()]
-            if lines:
-                clean_msg = lines[-1]
-
-        return line, column, clean_msg
-
     # -------------------------------------------------------------------------
     # Batch execution (reduces ThreadPoolExecutor calls from O(N) to O(1))
     # -------------------------------------------------------------------------
@@ -449,7 +383,7 @@ class DockerSandbox:
         tar_data = self._build_batch_tar(
             manifest=manifest,
             code=spec.code,
-            runner_script=_get_batch_runner_script(),
+            runner_script=get_batch_runner_script(),
             batch_dir=batch_dir,
         )
 
@@ -499,7 +433,7 @@ class DockerSandbox:
                 result_type = result_dict.get("type")
 
                 if result_type == "compile":
-                    compile_result = self._parse_batch_compile_result(result_dict)
+                    compile_result = parse_batch_compile_result(result_dict)
                     yield compile_result
                     if not compile_result.success:
                         break
@@ -507,7 +441,7 @@ class DockerSandbox:
                 elif result_type == "test":
                     test_id = result_dict.get("id", "unknown")
                     received_test_ids.add(test_id)
-                    exec_result = self._parse_batch_test_result(result_dict, run_start)
+                    exec_result = parse_batch_test_result(result_dict, run_start)
                     yield exec_result
 
                 elif result_type == "done":
@@ -589,64 +523,6 @@ class DockerSandbox:
 
         buf.seek(0)
         return buf.read()
-
-    def _parse_batch_compile_result(self, result: dict) -> CompileResult:
-        """Parse compile result from batch runner JSON."""
-        status_str = result.get("status", "unknown_error")
-
-        if status_str == "success":
-            status = CompileStatus.SUCCESS
-        elif status_str == "syntax_error":
-            status = CompileStatus.SYNTAX_ERROR
-        elif status_str == "timeout":
-            status = CompileStatus.TIMEOUT
-        else:
-            status = CompileStatus.UNKNOWN_ERROR
-
-        return CompileResult(
-            status=status,
-            error_message=result.get("error_message"),
-            error_line=result.get("error_line"),
-            error_column=result.get("error_column"),
-            duration_ms=result.get("duration_ms", 0.0),
-        )
-
-    def _parse_batch_test_result(
-        self,
-        result: dict,
-        run_start: float,
-    ) -> ExecutionResult:
-        """Parse test result from batch runner JSON."""
-        status_str = result.get("status", "runtime_error")
-
-        if status_str == "success":
-            run_status = RunStatus.SUCCESS
-        elif status_str == "runtime_error":
-            run_status = RunStatus.RUNTIME_ERROR
-        elif status_str == "timeout":
-            run_status = RunStatus.TIMEOUT
-        elif status_str == "memory_exceeded":
-            run_status = RunStatus.MEMORY_EXCEEDED
-        elif status_str == "not_run":
-            run_status = RunStatus.NOT_RUN
-        elif status_str == "killed":
-            run_status = RunStatus.KILLED
-        else:
-            run_status = RunStatus.RUNTIME_ERROR
-
-        duration_ms = result.get("duration_ms", 0.0)
-        total_ms = (time.perf_counter() - run_start) * 1000
-
-        return ExecutionResult(
-            compile_result=CompileResult(status=CompileStatus.SUCCESS),
-            run_status=run_status,
-            stdout=result.get("stdout", ""),
-            stderr=result.get("stderr", ""),
-            exit_code=result.get("exit_code"),
-            run_duration_ms=duration_ms,
-            total_duration_ms=total_ms,
-            cache_key=result.get("id", ""),  # Pass test_id for matching in runner
-        )
 
 
 class DockerSandboxPool(BaseSandboxPool[DockerSandbox]):

@@ -36,6 +36,7 @@ async def create_sandbox_pool(
     python_version: str = "3.11",
     cache_size: int = 10000,
     max_concurrent_ops: int = 8,
+    workspace_base_dir: str = "auto",
     **backend_kwargs: Any,
 ) -> SandboxPool:
     """
@@ -53,6 +54,10 @@ async def create_sandbox_pool(
         cache_size: Maximum number of cached execution results
         max_concurrent_ops: Maximum concurrent sandbox operations (resets, exec
             calls). Prevents deadlock in HPC environments. Default 8.
+        workspace_base_dir: Base directory for host-mounted workspaces.
+            - "auto": Auto-detect (use /local on HPC if SLURM_JOB_ID set)
+            - explicit path: Use this directory
+            - None: Disable bind mounts, use tar-based I/O
         **backend_kwargs: Additional backend-specific configuration:
             - memory_limit (str): Memory limit (e.g., "256m", "1g")
             - cpu_quota (float): CPU limit as fraction (e.g., 0.5 = 50% of one CPU)
@@ -109,6 +114,7 @@ async def create_sandbox_pool(
             python_version=python_version,
             cache_size=cache_size,
             max_concurrent_ops=max_concurrent_ops,
+            workspace_base_dir=workspace_base_dir,
             **backend_kwargs,
         )
 
@@ -170,6 +176,7 @@ def _create_podman_hpc_pool(
     python_version: str,
     cache_size: int,
     max_concurrent_ops: int = 8,
+    workspace_base_dir: str = "auto",
     memory_limit: str = "256m",
     cpu_quota: Optional[float] = None,
     network_disabled: bool = True,
@@ -199,4 +206,5 @@ def _create_podman_hpc_pool(
         config=config,
         cache_size=cache_size,
         max_concurrent_ops=max_concurrent_ops,
+        workspace_base_dir=workspace_base_dir,
     )
