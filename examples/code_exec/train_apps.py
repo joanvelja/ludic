@@ -262,12 +262,16 @@ def main():
         "--partial-credit", action="store_true", help="Enable partial credit rewards"
     )
     parser.add_argument(
-        "--max-seq-len", type=int, default=2048,
-        help="Max tokens per sample (sequences are truncated to this)"
+        "--max-seq-len",
+        type=int,
+        default=2048,
+        help="Max tokens per sample (sequences are truncated to this)",
     )
     parser.add_argument(
-        "--micro-token-budget", type=int, default=16384,
-        help="Max padded tokens per micro-batch (replaces grad_accum_steps)"
+        "--micro-token-budget",
+        type=int,
+        default=16384,
+        help="Max padded tokens per micro-batch (replaces grad_accum_steps)",
     )
 
     # Evaluation
@@ -634,22 +638,7 @@ def main():
 
     # Configure logger (WandB or RichLive terminal dashboard)
     if args.wandb:
-        import wandb
-
-        run = wandb.init(
-            project=args.wandb_project,
-            config={
-                "model": args.model,
-                "lora_rank": args.lora_rank,
-                "lora_alpha": int(args.lora_rank * args.lora_alpha_mult),
-                "kl_coeff": args.kl_coeff,
-                "group_size": args.group_size,
-                "train_steps": args.train_steps,
-                "eval_samples": len(eval_samples),
-                "train_samples": len(train_samples),
-            },
-        )
-        train_logger = WandbLogger(run=run)
+        train_logger = WandbLogger(project=args.wandb_project, config=dict(vars(args)))
         print(f"WandB logging enabled: project={args.wandb_project}")
     else:
         train_logger = RichLiveLogger(
@@ -744,9 +733,7 @@ def main():
 
     # Close WandB if used
     if args.wandb:
-        import wandb
-
-        wandb.finish()
+        train_logger.close()
         print("WandB run finished.")
 
     print("Training complete.")

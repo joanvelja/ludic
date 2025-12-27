@@ -23,6 +23,7 @@ logs/
 *.log
 
 # Big jsonl files
+data/
 *.jsonl
 
 # Environment files (secrets)
