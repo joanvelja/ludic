@@ -42,7 +42,7 @@ echo "Log directory: $LOG_DIR"
 # This script trains Qwen 3B with LoRA on APPS code problems using:
 #   - 2 GPUs: 1 for vLLM inference server, 1 for training
 #   - Podman-HPC for sandboxed code execution
-#   - GRPO with optional KL regularization
+#   - CISPO algorithm (better for reasoning tokens)
 #
 # Prerequisites:
 #   1. Create a .env file with your HF_TOKEN in the repo root:
@@ -115,6 +115,7 @@ VLLM_PORT="${VLLM_PORT:-8000}"
 MAX_PROMPT_TOKENS="${MAX_PROMPT_TOKENS:-1024}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-4096}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-5120}"  # MAX_PROMPT_TOKENS + MAX_NEW_TOKENS
+MICRO_TOKEN_BUDGET="${MICRO_TOKEN_BUDGET:-32768}"  # Max padded tokens per micro-batch
 
 # Stop sequences (space-separated, e.g. STOP_SEQUENCES="'\`\`\`' '</answer>'")
 STOP_SEQUENCES="${STOP_SEQUENCES:-</code>}"
@@ -142,6 +143,8 @@ echo "  KL coefficient: $KL_COEFF"
 echo "  Max concurrent ops: $MAX_CONCURRENT_OPS"
 echo "  Sandbox workers: $SANDBOX_WORKERS"
 echo "  Concurrency: $CONCURRENCY"
+echo "  Max seq len: $MAX_SEQ_LEN"
+echo "  Micro token budget: $MICRO_TOKEN_BUDGET"
 echo "  WandB: $([ "$USE_WANDB" = "1" ] && echo "enabled" || echo "disabled")"
 echo "========================================"
 echo ""
@@ -299,6 +302,8 @@ TRAIN_CMD="$TRAIN_CMD --eval-before-start"
 TRAIN_CMD="$TRAIN_CMD --final-save"
 TRAIN_CMD="$TRAIN_CMD --max-prompt-tokens $MAX_PROMPT_TOKENS"
 TRAIN_CMD="$TRAIN_CMD --max-new-tokens $MAX_NEW_TOKENS"
+TRAIN_CMD="$TRAIN_CMD --max-seq-len $MAX_SEQ_LEN"
+TRAIN_CMD="$TRAIN_CMD --micro-token-budget $MICRO_TOKEN_BUDGET"
 TRAIN_CMD="$TRAIN_CMD --partial-credit"
 
 # Add stop sequences if specified

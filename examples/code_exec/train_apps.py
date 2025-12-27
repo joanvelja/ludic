@@ -77,15 +77,10 @@ from ludic.training import (
     RolloutRequest,
     EnvSpec,
     ProtocolSpec,
-    # KL regularization + algorithm building
-    CompositeLoss,
-    LossTerm,
-    ClippedSurrogateLoss,
-    KLLoss,
-    RLAlgorithm,
-    GroupNormalizedReturn,
+    # Algorithm
+    make_cispo,
 )
-from ludic.training import Reducer, RichLiveLogger
+from ludic.training import Reducer, RichLiveLogger, default_reducers
 from ludic.training.loggers import WandbLogger
 
 # Import CodeExecEnv components
@@ -265,6 +260,14 @@ def main():
     )
     parser.add_argument(
         "--partial-credit", action="store_true", help="Enable partial credit rewards"
+    )
+    parser.add_argument(
+        "--max-seq-len", type=int, default=2048,
+        help="Max tokens per sample (sequences are truncated to this)"
+    )
+    parser.add_argument(
+        "--micro-token-budget", type=int, default=16384,
+        help="Max padded tokens per micro-batch (replaces grad_accum_steps)"
     )
 
     # Evaluation
@@ -474,40 +477,14 @@ def main():
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    # Algorithm (GRPO with optional KL regularization)
-    credit_assigner = GroupNormalizedReturn(
+    # Algorithm (CISPO - better for reasoning tokens)
+    algo = make_cispo(
         group_size=args.group_size,
-        normalize_adv=True,
+        group_normalize_adv=True,
+        clip_eps_high=0.2,
+        length_normalize=True,
     )
-
-    # Build loss with optional KL penalty
-    if args.kl_coeff > 0:
-        # CompositeLoss: PPO + KL penalty
-        loss = CompositeLoss(
-            terms=[
-                LossTerm(
-                    name="policy",
-                    loss=ClippedSurrogateLoss(clip_eps=0.28, length_normalize=True),
-                    weight=1.0,
-                ),
-                LossTerm(
-                    name="kl",
-                    loss=KLLoss(coeff=args.kl_coeff),
-                    weight=1.0,
-                ),
-            ]
-        )
-        print(f"Using GRPO with KL penalty (coeff={args.kl_coeff})")
-    else:
-        # Standard GRPO (no KL penalty)
-        loss = ClippedSurrogateLoss(clip_eps=0.28, length_normalize=True)
-        print("Using standard GRPO (no KL penalty)")
-
-    algo = RLAlgorithm(
-        name="grpo" if args.kl_coeff == 0 else "grpo_kl",
-        credit_assigner=credit_assigner,
-        loss=loss,
-    )
+    print("Using CISPO algorithm (better for reasoning/self-correction tokens)")
 
     # Engine + batch source
     engine = RolloutEngine(
@@ -554,7 +531,8 @@ def main():
     cfg = TrainerConfig(
         model_device=device,
         lr=1e-5,
-        grad_accum_steps=4,
+        max_seq_len=args.max_seq_len,
+        micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.1,
         pad_token_id=tokenizer.pad_token_id,
         eval_at_start=bool(args.eval_before_start and eval_samples),
@@ -599,6 +577,7 @@ def main():
             kind="sum",
             source="completion_length",
         ),
+        **default_reducers(),
     }
 
     # Eval reducers (for held-out samples)
@@ -634,26 +613,23 @@ def main():
     # Logging metrics to track
     log_keys = [
         # Core training
-        "loss",
-        "avg_total_reward",
+        "train/loss",
+        "train/avg_total_reward",
         # APPS-specific
-        "all_passed_rate",
-        "compile_fail_rate",
-        "avg_pass_rate",
-        "parse_err_rate",
-        "avg_completion_length",
-        # KL stats (if enabled)
-        "kl/kl_mean",
-        "kl/loss",
-        # Eval metrics (auto-prefixed with eval_)
-        "eval_all_passed_rate",
-        "eval_compile_fail_rate",
-        "eval_avg_pass_rate",
-        "eval_parse_error_rate",
-        "eval_avg_completion_tokens",
+        "train/all_passed_rate",
+        "train/compile_fail_rate",
+        "train/avg_pass_rate",
+        "train/parse_err_rate",
+        "train/avg_completion_length",
+        # Eval metrics
+        "eval/all_passed_rate",
+        "eval/compile_fail_rate",
+        "eval/avg_pass_rate",
+        "eval/parse_error_rate",
+        "eval/avg_completion_tokens",
         # Counts
-        "num_rollouts",
-        "num_samples",
+        "train/target_rollouts",
+        "train/num_samples",
     ]
 
     # Configure logger (WandB or RichLive terminal dashboard)

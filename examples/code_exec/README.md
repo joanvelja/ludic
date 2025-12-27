@@ -143,8 +143,12 @@ EOF
 | `--port` | `8000` | vLLM server port |
 | `--train-steps` | `20` | Number of training steps |
 | `--batch-size` | `4` | Rollouts per training batch |
-| `--group-size` | `4` | GRPO group size (rollouts per prompt) |
+| `--group-size` | `4` | CISPO group size (rollouts per prompt) |
 | `--train-temperature` | `0.8` | Sampling temperature |
+| `--max-seq-len` | `2048` | Maximum tokens per sample (truncation limit) |
+| `--micro-token-budget` | `16384` | Maximum padded tokens per micro-batch |
+
+**Algorithm:** This script uses CISPO (Clipped Importance Sampling Policy Optimization) instead of standard GRPO. CISPO is better suited for code generation because it preserves gradient signal from reasoning and self-correction tokens, rather than discarding them through aggressive group-level advantage normalization.
 
 ### Dataset Flags
 
