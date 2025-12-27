@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import logging
+import statistics
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Protocol
+
+log = logging.getLogger(__name__)
 
 from jaxtyping import Float
 from torch import nn, Tensor
@@ -14,13 +19,22 @@ from ludic.training.loss import (
     ClippedSurrogateLoss,
     TokenClippedSurrogateLoss,
     CISPOLoss,
+    TokenKLLoss,
+    CompositeLoss,
+    LossTerm,
     MaskedCausalLMCrossEntropyLoss,
 )
-from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
+from ludic.training.credit_assignment import (
+    MonteCarloReturn,
+    GroupNormalizedReturn,
+    HybridNormalizedReturn,
+    ConstantCredit,
+)
 
 
 Batch = Mapping[str, Tensor]
 Logits = Float[Tensor, "B T V"]
+
 
 class PreprocessFn(Protocol):
     def __call__(self, saw_batch: SAWBatch) -> SAWBatch: ...
@@ -47,9 +61,19 @@ class RLAlgorithm:
         self,
         model: nn.Module,
         batch: Batch,
+        *,
+        cast_logits_to_fp32: bool = False,
     ) -> tuple[Tensor, Dict[str, Any]]:
         """
         Runs the forward pass once and delegates to the Loss object.
+
+        Args:
+            model: The trainable model.
+            batch: Collated batch tensors (input_ids, attention_mask, etc.).
+            cast_logits_to_fp32: If True, cast logits to FP32 before loss computation.
+                This improves importance sampling ratio stability for ratio-based
+                objectives (GRPO, CISPO, etc.) by reducing precision errors in
+                exp(log_ratio). Recommended by ScaleRL paper (arXiv:2510.13786).
         """
         # --- Run the forward pass ---
         input_ids = batch["input_ids"]
@@ -59,6 +83,10 @@ class RLAlgorithm:
             attention_mask=attention_mask,
         )
         logits: Logits = outputs.logits
+
+        # ScaleRL: FP32 logits prevent IS ratio precision issues in exp(logp_new - logp_old)
+        if cast_logits_to_fp32:
+            logits = logits.float()
 
         # Pass the resulting logits to the loss function
         return self.loss.compute(logits, batch)
@@ -128,11 +156,102 @@ def drop_zero_weight_samples(
     return saw_batch
 
 
+def filter_zero_variance_groups(
+    saw_batch: SAWBatch,
+    *,
+    eps: float = 1e-6,
+) -> SAWBatch:
+    """
+    Filter out groups where all samples have identical rewards (zero variance).
+
+    These groups contribute zero gradient in GRPO-style training because
+    A_i = R_i - mean(R_group) = 0 for all members when all R_i are equal.
+
+    Unlike drop_zero_weight_samples (which filters by computed advantage weight),
+    this filters entire groups by reward variance before training. This is the
+    DAPO-style "zero-variance prompt" (ZVP) filtering.
+
+    Args:
+        saw_batch: Batch of SAWItems to filter.
+        eps: Threshold for zero-variance detection. Groups with std <= eps are dropped.
+
+    Returns:
+        Filtered SAWBatch with zero-variance groups removed.
+        Sets saw_batch.meta["zvp_filter_frac"] to the fraction of groups dropped.
+    """
+    if eps < 0:
+        raise ValueError("eps must be >= 0.")
+
+    items = saw_batch.items
+    if not items:
+        return saw_batch
+
+    # Group items by group_id
+    groups: dict[str, list] = defaultdict(list)
+    for item in items:
+        group_id = item.meta.get("request_meta", {}).get("group_id")
+        if group_id is None:
+            # Items without group_id pass through (not part of GRPO-style grouping)
+            groups["__ungrouped__"].append(item)
+        else:
+            groups[group_id].append(item)
+
+    kept_items = []
+    total_groups = 0
+    dropped_groups = 0
+
+    for group_id, group_items in groups.items():
+        # Ungrouped items always pass through
+        if group_id == "__ungrouped__":
+            kept_items.extend(group_items)
+            continue
+
+        total_groups += 1
+        weights = [float(it.weight) for it in group_items]
+
+        # Compute std (need at least 2 items for meaningful variance)
+        if len(weights) < 2:
+            kept_items.extend(group_items)
+            continue
+
+        group_std = statistics.stdev(weights) if len(weights) > 1 else 0.0
+
+        if group_std <= eps:
+            # Zero-variance group: drop it
+            dropped_groups += 1
+            log.debug(
+                "filter_zero_variance_groups: dropping group_id=%r (std=%.2e <= eps=%.2e)",
+                group_id,
+                group_std,
+                eps,
+            )
+        else:
+            kept_items.extend(group_items)
+
+    # Track filter rate in batch metadata
+    if total_groups > 0:
+        zvp_frac = dropped_groups / total_groups
+        if saw_batch.meta is None:
+            saw_batch.meta = {}
+        saw_batch.meta["zvp_filter_frac"] = zvp_frac
+        if dropped_groups > 0:
+            log.debug(
+                "filter_zero_variance_groups: dropped %d/%d groups (%.1f%%)",
+                dropped_groups,
+                total_groups,
+                zvp_frac * 100,
+            )
+
+    saw_batch.items = kept_items
+    return saw_batch
+
+
 def compose_preprocess(*fns: PreprocessFn) -> PreprocessFn:
     def _composed(batch: SAWBatch) -> SAWBatch:
         for fn in fns:
             batch = fn(batch)
         return batch
+
     return _composed
 
 
@@ -166,7 +285,9 @@ def make_reinforce(
 
     preprocess = None
     if drop_zero_weight:
-        preprocess = lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+        preprocess = lambda batch: drop_zero_weight_samples(
+            batch, eps=drop_zero_weight_eps
+        )
 
     return RLAlgorithm(
         name=name,
@@ -208,7 +329,9 @@ def make_reinforce_baseline(
 
     preprocess = None
     if drop_zero_weight:
-        preprocess = lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+        preprocess = lambda batch: drop_zero_weight_samples(
+            batch, eps=drop_zero_weight_eps
+        )
 
     return RLAlgorithm(
         name=name,
@@ -270,7 +393,9 @@ def make_grpo(
     )
     preprocess_fns = []
     if drop_zero_weight:
-        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+        preprocess_fns.append(
+            lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+        )
     preprocess_fns.append(validate_actor_logps)
     preprocess = compose_preprocess(*preprocess_fns)
 
@@ -317,7 +442,9 @@ def make_gspo(
     )
     preprocess_fns = []
     if drop_zero_weight:
-        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+        preprocess_fns.append(
+            lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+        )
     preprocess_fns.append(validate_actor_logps)
     preprocess = compose_preprocess(*preprocess_fns)
 
@@ -337,6 +464,7 @@ def make_cispo(
     clip_eps_low: float = 1e6,
     clip_eps_high: float = 0.2,
     length_normalize: bool = True,
+    kl_coeff: float = 0.0,
     drop_zero_weight: bool = False,
     drop_zero_weight_eps: float = 1e-4,
     name: str = "cispo",
@@ -358,6 +486,9 @@ def make_cispo(
     Loss:
         L = - E[ sg(clip(r_t, 1-ε_low, 1+ε_high)) * A * log π(a_t|s_t) ]
 
+    When kl_coeff > 0, adds a token-level KL penalty for stability:
+        L_total = L_cispo + kl_coeff * KL(π_new || π_actor)
+
     Args:
         group_size: Number of rollouts per group for advantage normalization.
         group_normalize_adv: Whether to normalize advantages within each group.
@@ -366,6 +497,9 @@ def make_cispo(
             value (effectively no lower bound).
         clip_eps_high: Upper bound for IS weight clipping.
         length_normalize: Whether to normalize by number of action tokens.
+        kl_coeff: Coefficient for token-level KL penalty. Set > 0 for
+            additional stability (penalizes divergence from behavior policy).
+            Typical values: 0.01-0.1. Default 0.0 (no KL penalty).
         drop_zero_weight: Whether to drop zero-advantage samples.
         drop_zero_weight_eps: Epsilon for zero-weight detection.
         name: Algorithm name for logging.
@@ -381,14 +515,31 @@ def make_cispo(
         normalize_adv=group_normalize_adv,
         positive_only=positive_only,
     )
-    loss: Loss = CISPOLoss(
+
+    cispo_loss: Loss = CISPOLoss(
         clip_eps_low=clip_eps_low,
         clip_eps_high=clip_eps_high,
         length_normalize=length_normalize,
     )
+
+    # Optionally add token-level KL penalty for stability
+    # CompositeLoss now shares token_logp via SharedContext (memory-efficient)
+    if kl_coeff > 0:
+        kl_loss = TokenKLLoss(coeff=kl_coeff, length_normalize=length_normalize)
+        loss: Loss = CompositeLoss(
+            terms=[
+                LossTerm(name="cispo", loss=cispo_loss, weight=1.0),
+                LossTerm(name="kl", loss=kl_loss, weight=1.0),
+            ]
+        )
+    else:
+        loss = cispo_loss
+
     preprocess_fns = []
     if drop_zero_weight:
-        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+        preprocess_fns.append(
+            lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+        )
     preprocess_fns.append(validate_actor_logps)
     preprocess = compose_preprocess(*preprocess_fns)
 
@@ -449,4 +600,120 @@ def make_sft(
         name=name,
         credit_assigner=credit_assigner,
         loss=loss,
+    )
+
+
+# ---------------------------------------------------------------------------
+# ScaleRL (CISPO + Hybrid Normalization + ZVP Filtering)
+# ---------------------------------------------------------------------------
+
+
+def make_scalerl(
+    *,
+    group_size: int,
+    positive_only: bool = False,
+    clip_eps_low: float = 0.20,
+    clip_eps_high: float = 0.28,
+    length_normalize: bool = True,
+    kl_coeff: float = 0.0,
+    filter_zvp: bool = True,
+    zvp_filter_eps: float = 1e-6,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "scalerl",
+) -> RLAlgorithm:
+    """
+    ScaleRL recipe: CISPO loss + hybrid advantage normalization + ZVP filtering.
+
+    This combines the key sample-efficiency improvements from the ScaleRL paper:
+
+    1. **HybridNormalizedReturn**: Group-mean centering + batch-std scaling.
+       More robust than pure group-level normalization because it avoids
+       std=0 explosions in low-variance groups (easy prompts).
+
+    2. **CISPOLoss**: Truncated IS-weight policy gradient that preserves
+       gradient contributions from rare tokens (crucial for reflective
+       reasoning behaviors like "Wait", "However", "Recheck").
+
+    3. **Zero-variance group filtering**: Drops prompts where all generations
+       received the same reward (all correct OR all incorrect). These contribute
+       zero gradient but consume compute.
+
+    4. **FP32 logits** (via TrainerConfig.cast_logits_to_fp32=True):
+       Recommended for IS ratio stability. Not controlled by this preset—
+       set in TrainerConfig (default True).
+
+    Args:
+        group_size: Number of rollouts per group (required for credit assignment).
+        positive_only: If True, clip negative advantages to zero (REINFORCE-only).
+        clip_eps_low: Lower CISPO clipping bound. Default 0.20 per context-notes.md.
+        clip_eps_high: Upper CISPO clipping bound. Default 0.28 per context-notes.md.
+        length_normalize: Whether to normalize by number of action tokens.
+        kl_coeff: Coefficient for optional token-level KL penalty.
+            Set > 0 for additional stability. Typical: 0.01-0.1. Default 0.0.
+        filter_zvp: If True, filter zero-variance groups before training.
+        zvp_filter_eps: Epsilon for ZVP detection (groups with std <= eps are dropped).
+        drop_zero_weight: If True, additionally drop individual samples with ~zero weight.
+        drop_zero_weight_eps: Epsilon for zero-weight sample detection.
+        name: Algorithm name for logging/metrics.
+
+    Note: Rollouts must carry `group_id` in their metadata and each group
+    must have exactly `group_size` members. Use GRPORequestStrategy for
+    request expansion.
+
+    References:
+        - ScaleRL: arXiv:2510.13786
+        - DAPO (ZVP filtering): arXiv:2503.14476
+        - MiniMax-M1 (CISPO): arXiv:2506.13585
+    """
+    # HybridNormalizedReturn: group-mean baseline + batch-std scaling
+    credit_assigner: CreditAssigner = HybridNormalizedReturn(
+        group_size=group_size,
+        positive_only=positive_only,
+    )
+
+    # CISPO loss with asymmetric clipping
+    cispo_loss: Loss = CISPOLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+    )
+
+    # Optionally add token-level KL penalty for stability
+    if kl_coeff > 0:
+        kl_loss = TokenKLLoss(coeff=kl_coeff, length_normalize=length_normalize)
+        loss: Loss = CompositeLoss(
+            terms=[
+                LossTerm(name="cispo", loss=cispo_loss, weight=1.0),
+                LossTerm(name="kl", loss=kl_loss, weight=1.0),
+            ]
+        )
+    else:
+        loss = cispo_loss
+
+    # Build preprocessing pipeline (order matters)
+    preprocess_fns = []
+
+    # 1. Zero-variance group filter (DAPO-style)
+    if filter_zvp:
+        preprocess_fns.append(
+            lambda batch: filter_zero_variance_groups(batch, eps=zvp_filter_eps)
+        )
+
+    # 2. Drop individual zero-weight samples (optional, after credit assignment)
+    if drop_zero_weight:
+        preprocess_fns.append(
+            lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+        )
+
+    # 3. Validate actor logprobs (required for CISPO ratio computation)
+    preprocess_fns.append(validate_actor_logps)
+
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
     )
