@@ -142,7 +142,9 @@ class PodmanHPCSandbox:
                 f"[{self._container_name}] Using bind mount: "
                 f"{self._workspace_host_dir} -> {self._config.working_dir}"
             )
-            cmd.extend(["-v", f"{self._workspace_host_dir}:{self._config.working_dir}:rw"])
+            cmd.extend(
+                ["-v", f"{self._workspace_host_dir}:{self._config.working_dir}:rw"]
+            )
 
         # Image and command (use full path for HPC compatibility)
         cmd.extend([self._image, "/bin/sleep", "infinity"])
@@ -154,8 +156,11 @@ class PodmanHPCSandbox:
         # Skip if using bind mount (host directory should already exist)
         if not self._workspace_host_dir:
             await self._run_podman(
-                "exec", self._container_name,
-                "/bin/mkdir", "-p", self._config.working_dir,
+                "exec",
+                self._container_name,
+                "/bin/mkdir",
+                "-p",
+                self._config.working_dir,
                 capture=True,
             )
 
@@ -177,7 +182,9 @@ class PodmanHPCSandbox:
 
         if self._workspace_host_dir:
             # Direct host filesystem cleanup - no podman exec, no semaphore
-            logger.debug(f"[{self._container_name}] reset() using direct host cleanup...")
+            logger.debug(
+                f"[{self._container_name}] reset() using direct host cleanup..."
+            )
             start = time.perf_counter()
 
             workspace_path = Path(self._workspace_host_dir)
@@ -188,15 +195,20 @@ class PodmanHPCSandbox:
                     item.unlink()
 
             elapsed = time.perf_counter() - start
-            logger.debug(f"[{self._container_name}] reset() completed in {elapsed:.3f}s (direct)")
+            logger.debug(
+                f"[{self._container_name}] reset() completed in {elapsed:.3f}s (direct)"
+            )
             return
 
         logger.debug(f"[{self._container_name}] reset() starting podman-hpc exec...")
         start = time.perf_counter()
 
         await self._run_podman(
-            "exec", self._container_name,
-            "/bin/sh", "-c", f"rm -rf {self._config.working_dir}/*"
+            "exec",
+            self._container_name,
+            "/bin/sh",
+            "-c",
+            f"rm -rf {self._config.working_dir}/*",
         )
 
         elapsed = time.perf_counter() - start
@@ -218,10 +230,14 @@ class PodmanHPCSandbox:
             # Run py_compile (use full path for HPC compatibility)
             proc = await asyncio.wait_for(
                 self._run_podman(
-                    "exec", self._container_name,
-                    "/usr/local/bin/python", "-m", "py_compile",
+                    "exec",
+                    self._container_name,
+                    "/usr/local/bin/python",
+                    "-m",
+                    "py_compile",
                     f"{self._config.working_dir}/_check.py",
-                    check=False, capture=True
+                    check=False,
+                    capture=True,
                 ),
                 timeout=timeout_s,
             )
@@ -310,10 +326,13 @@ class PodmanHPCSandbox:
                 for key, val in env_vars.items():
                     exec_cmd.extend(["-e", f"{key}={val}"])
 
-            exec_cmd.extend([
-                self._container_name,
-                "/usr/local/bin/python", f"{self._config.working_dir}/{exec_filename}"
-            ])
+            exec_cmd.extend(
+                [
+                    self._container_name,
+                    "/usr/local/bin/python",
+                    f"{self._config.working_dir}/{exec_filename}",
+                ]
+            )
 
             # Run with timeout
             proc = await asyncio.wait_for(
@@ -358,9 +377,13 @@ class PodmanHPCSandbox:
             # Best-effort cleanup - goes through exec_semaphore so won't deadlock
             try:
                 await self._run_podman(
-                    "exec", self._container_name,
-                    "/usr/bin/pkill", "-9", "python",
-                    check=False, capture=True
+                    "exec",
+                    self._container_name,
+                    "/usr/bin/pkill",
+                    "-9",
+                    "python",
+                    check=False,
+                    capture=True,
                 )
             except Exception:
                 pass  # Best effort, reset() will clean up anyway
@@ -407,8 +430,12 @@ class PodmanHPCSandbox:
         # Pipe tar to container
         await asyncio.wait_for(
             self._run_podman(
-                "exec", "-i", self._container_name,
-                "tar", "-xC", self._config.working_dir,
+                "exec",
+                "-i",
+                self._container_name,
+                "tar",
+                "-xC",
+                self._config.working_dir,
                 check=True,
                 capture=True,
                 input_data=tar_buffer.read(),
@@ -482,8 +509,12 @@ class PodmanHPCSandbox:
 
         result = PodmanResult(
             returncode=proc.returncode or 0,
-            stdout=stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",
-            stderr=stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else "",
+            stdout=stdout_bytes.decode("utf-8", errors="replace")
+            if stdout_bytes
+            else "",
+            stderr=stderr_bytes.decode("utf-8", errors="replace")
+            if stderr_bytes
+            else "",
         )
 
         if check and result.returncode != 0:
@@ -556,15 +587,21 @@ class PodmanHPCSandbox:
         # With N workers: timeout = (ceil(N_tests / workers) × timeout_per_test) + buffer
         num_workers = 16  # Matches batch_runner.py default for HPC
         parallel_batches = math.ceil(len(spec.tests) / num_workers) if spec.tests else 1
-        aggregate_timeout = spec.timeout_s * parallel_batches + 60.0  # 60s buffer for HPC
+        aggregate_timeout = (
+            spec.timeout_s * parallel_batches + 60.0
+        )  # 60s buffer for HPC
 
         try:
             async with self._exec_semaphore:
                 proc = await asyncio.create_subprocess_exec(
-                    "podman-hpc", "exec",
-                    "--workdir", f"{self._config.working_dir}/{batch_dir}",
+                    "podman-hpc",
+                    "exec",
+                    "--workdir",
+                    f"{self._config.working_dir}/{batch_dir}",
                     self._container_name,
-                    "python", runner_path, manifest_path,
+                    "python",
+                    runner_path,
+                    manifest_path,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
@@ -648,9 +685,8 @@ class PodmanHPCSandbox:
                 if test_id not in received_test_ids:
                     run_ms = (time.perf_counter() - run_start) * 1000
                     yield ExecutionResult(
-                        compile_result=compile_result or CompileResult(
-                            status=CompileStatus.SUCCESS
-                        ),
+                        compile_result=compile_result
+                        or CompileResult(status=CompileStatus.SUCCESS),
                         run_status=RunStatus.SANDBOX_ERROR,
                         stdout="",
                         stderr="Batch execution terminated unexpectedly",
@@ -734,8 +770,12 @@ class PodmanHPCSandbox:
 
         await asyncio.wait_for(
             self._run_podman(
-                "exec", "-i", self._container_name,
-                "tar", "-xC", self._config.working_dir,
+                "exec",
+                "-i",
+                self._container_name,
+                "tar",
+                "-xC",
+                self._config.working_dir,
                 check=True,
                 capture=True,
                 input_data=tar_data,
@@ -747,6 +787,7 @@ class PodmanHPCSandbox:
 @dataclass
 class PodmanResult:
     """Result of a podman-hpc command."""
+
     returncode: int
     stdout: str
     stderr: str
@@ -754,6 +795,7 @@ class PodmanResult:
 
 class PodmanError(Exception):
     """Error from podman-hpc command."""
+
     pass
 
 
@@ -816,8 +858,12 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         if workspace_base_dir == "auto":
             # Auto-detect: use /local if on HPC, else None
             slurm_job_id = os.environ.get("SLURM_JOB_ID")
-            if slurm_job_id and Path("/local").exists():
-                self._workspace_base_dir: Optional[str] = f"/local/ludic-{slurm_job_id}"
+            if (
+                slurm_job_id and Path("/home/u5ds/joanv.u5ds").exists()
+            ):  # TODO [joan]: Remove hardcoding
+                self._workspace_base_dir: Optional[str] = (
+                    f"/home/u5ds/joanv.u5ds/sandbox/ludic-{slurm_job_id}"
+                )
             else:
                 self._workspace_base_dir = None
         else:
@@ -849,9 +895,13 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
         )
 
         # Pull image (podman-hpc pull auto-migrates to shared storage)
-        logger.info(f"Pulling image {self._image} (may take a moment for HPC migration)...")
+        logger.info(
+            f"Pulling image {self._image} (may take a moment for HPC migration)..."
+        )
         proc = await asyncio.create_subprocess_exec(
-            "podman-hpc", "pull", self._image,
+            "podman-hpc",
+            "pull",
+            self._image,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -887,9 +937,9 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             await sandbox.start()
             return sandbox
 
-        sandboxes = await asyncio.gather(*[
-            _create_and_start(i) for i in range(self._n_workers)
-        ])
+        sandboxes = await asyncio.gather(
+            *[_create_and_start(i) for i in range(self._n_workers)]
+        )
 
         logger.info(f"Podman-HPC sandbox pool ready ({self._n_workers} workers)")
         return sandboxes
@@ -926,7 +976,9 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             # Create per-sandbox host directory if using bind mounts
             workspace_host_dir = None
             if self._workspace_base_dir:
-                workspace_host_dir = f"{self._workspace_base_dir}/sandbox-replacement-{int(time.time())}"
+                workspace_host_dir = (
+                    f"{self._workspace_base_dir}/sandbox-replacement-{int(time.time())}"
+                )
                 Path(workspace_host_dir).mkdir(parents=True, exist_ok=True)
 
             sandbox = PodmanHPCSandbox(
@@ -959,7 +1011,9 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
             if workspace_path.exists():
                 try:
                     shutil.rmtree(self._workspace_base_dir, ignore_errors=True)
-                    logger.info(f"Cleaned up workspace directory: {self._workspace_base_dir}")
+                    logger.info(
+                        f"Cleaned up workspace directory: {self._workspace_base_dir}"
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to clean up workspace directory: {e}")
 
@@ -971,7 +1025,7 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
     def _parse_python_version(image: str) -> str:
         """Extract Python version from image name."""
         # Common patterns: python:3.11-slim, python:3.11, ghcr.io/.../python:3.11
-        match = re.search(r'python:(\d+\.\d+)', image)
+        match = re.search(r"python:(\d+\.\d+)", image)
         if match:
             return match.group(1)
         return "3.11"  # Default fallback
