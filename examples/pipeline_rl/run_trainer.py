@@ -23,6 +23,8 @@ VLLM_PORT = 8000
 VLLM_GROUP_PORT = 51216 
 REDIS_URL = "redis://localhost:6379/0"
 QUEUE_KEY = "ludic_tictactoe_queue"
+MAX_SEQ_LEN = 1024
+MICRO_TOKEN_BUDGET = 8192
 
 logging.basicConfig(level=logging.INFO)
 console = Console()
@@ -34,17 +36,20 @@ def create_dashboard(stats: dict, step: int) -> Table:
     table.add_column("Value", style="magenta")
     
     # RL Stats
-    table.add_row("💰 Avg Reward", f"{stats.get('avg_total_reward', 0.0):+.4f}")
-    table.add_row("📉 Loss", f"{stats.get('loss', 0.0):.4f}")
+    table.add_row("💰 Avg Reward", f"{stats.get('train/avg_total_reward', 0.0):+.4f}")
+    table.add_row("📉 Loss", f"{stats.get('train/loss', 0.0):.4f}")
     
     # Errors
-    syn_err = stats.get('err_syntax', 0.0)
-    sem_err = stats.get('err_semantic', 0.0)
+    syn_err = stats.get("train/err_syntax", 0.0)
+    sem_err = stats.get("train/err_semantic", 0.0)
     table.add_row("🚫 Syntax Errors", f"{syn_err:.1%}")
     table.add_row("⚠️ Illegal Moves", f"{sem_err:.1%}")
     
     # Throughput
-    table.add_row("📦 Batch Size", f"{stats.get('num_rollouts', 0)} rollouts / {stats.get('num_samples', 0)} samples")
+    table.add_row(
+        "📦 Batch Size",
+        f"{stats.get('train/target_rollouts', 0)} rollouts / {stats.get('train/num_samples', 0)} samples",
+    )
     return table
 
 def main():
@@ -92,7 +97,8 @@ def main():
         cfg=TrainerConfig(
             model_device="cuda:0",
             lr=1e-4,
-            grad_accum_steps=1,
+            max_seq_len=MAX_SEQ_LEN,
+            micro_token_budget=MICRO_TOKEN_BUDGET,
             sync_every_steps=1,
             max_lag=2
         )

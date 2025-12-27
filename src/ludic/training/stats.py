@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional
 
+import torch
+from torch import Tensor
+
 from ludic.training.types import SAWBatch, SAWItem
 
 
@@ -20,7 +23,7 @@ class Reducer:
               or a callable that accepts SAWItem and returns a value.
     - transform: optional post-processing of the raw value (e.g., lambda v: v == "win").
     - normalize_by: None | "samples" | "rollouts" — override denominator to
-      normalize by total samples or total rollouts.
+      normalize by total samples or total target rollouts.
     - as_percent: if True, callers may display this metric as a percentage.
     """
 
@@ -29,6 +32,24 @@ class Reducer:
     transform: Optional[Callable[[object], object]] = None
     normalize_by: NormalizeBy = None
     as_percent: bool = False
+
+
+def default_reducers() -> Mapping[str, Reducer]:
+    return {
+        "completion_truncated_rate": Reducer(
+            kind="count_true",
+            source="finish_reason",
+            transform=lambda v: v == "length",
+            normalize_by="samples",
+            as_percent=True,
+        ),
+        "seq_len_truncated_rate": Reducer(
+            kind="count_true",
+            source="seq_len_truncated",
+            normalize_by="samples",
+            as_percent=True,
+        ),
+    }
 
 
 def _get_value_from_source(item: SAWItem, source: str | Callable[[SAWItem], object]) -> object:
@@ -48,21 +69,24 @@ def _apply_transform(value: object, transform: Optional[Callable[[object], objec
 
 
 def aggregate_stats(
-    micro_stats_list: List[Dict[str, float]],
+    micro_stats_list: List[Dict[str, Tensor]],
     saw_batches: List[SAWBatch],
     *,
     reducers: Mapping[str, Reducer] | None = None,
+    micro_batch_sizes: Optional[List[int]] = None,
 ) -> Dict[str, float]:
     """
     Aggregate micro-batch stats with batch-level metadata and optional reducers.
 
     By default, micro-batch stats are averaged across micro-batches, except
     keys prefixed with ``gpu_`` which are reduced using ``max`` (since they
-    typically represent peaks).
+    typically represent peaks). If micro_batch_sizes is provided, stats are
+    weighted by micro-batch size.
 
     Core outputs (always present):
         - num_samples: total SAWItems across batches
-        - num_rollouts: total agent trajectories across batches
+        - target_rollouts: total agent trajectories across batches
+        - effective_rollouts: rollouts with at least one post-preprocess item
         - avg_total_reward: item-weighted average of batch.meta["avg_total_reward"]
         - avg_completion_length: item-weighted average of batch.meta["avg_completion_length"]
     Plus any keys produced by `reducers`.
@@ -70,38 +94,62 @@ def aggregate_stats(
     if not micro_stats_list:
         return {}
 
-    # 1) Standard loss/grad stats
+    # 1) Standard loss/grad stats - all values are tensors, aggregate on-device
     all_keys = {k for ms in micro_stats_list for k in ms.keys()}
     max_keys = {k for k in all_keys if k.startswith("gpu_")}
+    sum_keys = {"num_samples", "target_rollouts", "effective_rollouts", "total_completion_tokens"}
 
-    agg_stats: Dict[str, float] = {}
-    sum_counts: Dict[str, int] = {}
+    # Get device from first tensor value
+    device = next(iter(micro_stats_list[0].values())).device
+
+    # Initialize accumulators on-device
+    agg_tensors: Dict[str, Tensor] = {}
     for k in all_keys:
         if k in max_keys:
-            agg_stats[k] = float("-inf")
+            agg_tensors[k] = torch.tensor(float("-inf"), device=device)
         else:
-            agg_stats[k] = 0.0
-            sum_counts[k] = 0
+            agg_tensors[k] = torch.tensor(0.0, device=device)
 
-    for micro_stats in micro_stats_list:
+    # Compute weights tensor if provided
+    if micro_batch_sizes is not None:
+        if len(micro_batch_sizes) != len(micro_stats_list):
+            raise ValueError("micro_batch_sizes must match micro_stats_list length.")
+        weights = [float(v) for v in micro_batch_sizes]
+        total_weight = sum(weights)
+    else:
+        weights = None
+        total_weight = float(len(micro_stats_list))
+
+    # Aggregate on-device
+    for idx, micro_stats in enumerate(micro_stats_list):
+        w = weights[idx] if weights is not None else 1.0
         for k, v in micro_stats.items():
             if k in max_keys:
-                agg_stats[k] = max(agg_stats[k], v)
+                agg_tensors[k] = torch.maximum(agg_tensors[k], v)
+            elif k in sum_keys:
+                agg_tensors[k] = agg_tensors[k] + v
             else:
-                agg_stats[k] += v
-                sum_counts[k] += 1
+                agg_tensors[k] = agg_tensors[k] + v * w
 
-    for k in list(agg_stats.keys()):
+    # Transfer all tensors to CPU in one batch (single sync point)
+    keys = list(agg_tensors.keys())
+    stacked = torch.stack([agg_tensors[k] for k in keys])
+    values = stacked.cpu().tolist()
+
+    agg_stats: Dict[str, float] = {}
+    for k, val in zip(keys, values):
         if k in max_keys:
-            if agg_stats[k] == float("-inf"):
-                del agg_stats[k]
-            continue
-        denom = sum_counts.get(k, 0)
-        agg_stats[k] = agg_stats[k] / float(denom) if denom > 0 else 0.0
+            if val != float("-inf"):
+                agg_stats[k] = val
+        elif k in sum_keys:
+            agg_stats[k] = val
+        else:
+            agg_stats[k] = val / total_weight if total_weight > 0 else 0.0
 
     # 2) Batch metadata stats
     total_samples = 0.0
-    total_rollouts = 0.0
+    total_target_rollouts = 0.0
+    total_effective_rollouts = 0.0
     total_reward_sum = 0.0
     total_completion_len = 0.0
 
@@ -111,10 +159,14 @@ def aggregate_stats(
 
         # Each batch has N rollouts (agent trajectories)
         batch_rollouts = float(
-            batch.meta.get("num_rollouts")
+            batch.meta.get("target_rollouts")
             or batch.meta.get("batch_size", 0.0)  # fallback for older producers
         )
-        total_rollouts += batch_rollouts
+        total_target_rollouts += batch_rollouts
+        effective_rollouts = batch.meta.get("effective_rollouts")
+        if effective_rollouts is None:
+            effective_rollouts = batch_rollouts
+        total_effective_rollouts += float(effective_rollouts)
 
         # Weighted reward average
         avg_reward = float(batch.meta.get("avg_total_reward", 0.0))
@@ -125,7 +177,8 @@ def aggregate_stats(
         total_completion_len += avg_completion_len * num_items
 
     agg_stats["num_samples"] = total_samples
-    agg_stats["num_rollouts"] = total_rollouts
+    agg_stats["target_rollouts"] = total_target_rollouts
+    agg_stats["effective_rollouts"] = total_effective_rollouts
 
     if total_samples > 0:
         agg_stats["avg_total_reward"] = total_reward_sum / total_samples
@@ -161,7 +214,7 @@ def aggregate_stats(
             if reducer.normalize_by == "samples":
                 denom = total_samples
             elif reducer.normalize_by == "rollouts":
-                denom = total_rollouts
+                denom = total_target_rollouts
             else:
                 denom = None
 

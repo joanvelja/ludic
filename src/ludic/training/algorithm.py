@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Protocol
 
+from jaxtyping import Float
 from torch import nn, Tensor
 
 from ludic.training.types import CreditAssigner, SAWBatch
@@ -11,12 +12,15 @@ from ludic.training.loss import (
     ReinforceLoss,
     ReinforceBaselineLoss,
     ClippedSurrogateLoss,
+    TokenClippedSurrogateLoss,
+    CISPOLoss,
     MaskedCausalLMCrossEntropyLoss,
 )
 from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
 
 
 Batch = Mapping[str, Tensor]
+Logits = Float[Tensor, "B T V"]
 
 class PreprocessFn(Protocol):
     def __call__(self, saw_batch: SAWBatch) -> SAWBatch: ...
@@ -54,7 +58,7 @@ class RLAlgorithm:
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        logits: Tensor = outputs.logits
+        logits: Logits = outputs.logits
 
         # Pass the resulting logits to the loss function
         return self.loss.compute(logits, batch)
@@ -109,6 +113,29 @@ def validate_actor_logps(
     return saw_batch
 
 
+def drop_zero_weight_samples(
+    saw_batch: SAWBatch,
+    *,
+    eps: float = 1e-4,
+) -> SAWBatch:
+    """
+    Drop samples with near-zero credit weight before collation.
+    """
+    if eps < 0:
+        raise ValueError("eps must be >= 0.")
+    items = [it for it in saw_batch.items if abs(float(it.weight)) > eps]
+    saw_batch.items = items
+    return saw_batch
+
+
+def compose_preprocess(*fns: PreprocessFn) -> PreprocessFn:
+    def _composed(batch: SAWBatch) -> SAWBatch:
+        for fn in fns:
+            batch = fn(batch)
+        return batch
+    return _composed
+
+
 # ---------------------------------------------------------------------------
 # Presets: REINFORCE and REINFORCE+baseline
 # ---------------------------------------------------------------------------
@@ -117,6 +144,8 @@ def validate_actor_logps(
 def make_reinforce(
     *,
     gamma: float = 1.0,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
     name: str = "reinforce",
 ) -> RLAlgorithm:
     """
@@ -129,14 +158,21 @@ def make_reinforce(
     The orchestrator will use this algorithm's `credit_assigner` (MonteCarloReturn)
     to compute G_t per step, store it in SAWItem.weight, and collate that
     into `batch["weight"]` for the loss.
+
+    Set drop_zero_weight=True to drop zero-advantage samples before collation.
     """
     credit_assigner: CreditAssigner = MonteCarloReturn(gamma=gamma)
     loss: Loss = ReinforceLoss()
+
+    preprocess = None
+    if drop_zero_weight:
+        preprocess = lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
 
     return RLAlgorithm(
         name=name,
         credit_assigner=credit_assigner,
         loss=loss,
+        preprocess=preprocess,
     )
 
 
@@ -145,6 +181,8 @@ def make_reinforce_baseline(
     gamma: float = 1.0,
     name: str = "reinforce_baseline",
     normalize_adv: bool = False,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
 ) -> RLAlgorithm:
     """
     REINFORCE with batch-mean baseline:
@@ -160,16 +198,23 @@ def make_reinforce_baseline(
 
     If `normalize_adv=True`, A_t is additionally normalized to zero mean /
     unit variance within the batch before being used in the loss.
+
+    Set drop_zero_weight=True to drop zero-advantage samples before collation.
     """
     credit_assigner: CreditAssigner = MonteCarloReturn(gamma=gamma)
     loss: Loss = ReinforceBaselineLoss(
         normalize=normalize_adv,
     )
 
+    preprocess = None
+    if drop_zero_weight:
+        preprocess = lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+
     return RLAlgorithm(
         name=name,
         credit_assigner=credit_assigner,
         loss=loss,
+        preprocess=preprocess,
     )
 
 
@@ -178,12 +223,16 @@ def make_grpo(
     group_size: int,
     group_normalize_adv: bool = True,
     positive_only: bool = False,
-    clip_eps: float = 0.2,
+    clip_eps_low: float = 0.2,
+    clip_eps_high: float = 0.27,
     length_normalize: bool = False,
+    ratio_clip: Optional[float] = None,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
     name: str = "grpo",
 ) -> RLAlgorithm:
     """
-    GRPO-style preset (clipped surrogate):
+    GRPO-style preset (clipped surrogate, token-level ratios by default):
 
       - Credit assignment: group-normalized returns (per-group baseline)
       - Loss: PPO-style clipped surrogate (policy term only)
@@ -195,20 +244,153 @@ def make_grpo(
         group_size: Number of rollouts per group.
         group_normalize_adv: Whether to normalize advantages within each group.
         positive_only: If True, clip negative advantages to zero (reinforce-only).
-        clip_eps: PPO clipping epsilon for the surrogate objective.
+        clip_eps_low: Lower PPO clipping epsilon for the surrogate objective.
+            Defaults follow GSPO paper settings (https://arxiv.org/abs/2507.18071).
+        clip_eps_high: Upper PPO clipping epsilon for the surrogate objective.
+            Defaults follow GSPO paper settings (https://arxiv.org/abs/2507.18071).
         length_normalize: Whether to normalize log-probs by action length.
+        ratio_clip: Optional upper bound C for truncation (min(r, C)).
         name: Algorithm name for logging/metrics.
     Note: For the clipped ratio objective, we need behavior-policy logprobs.
     This preset installs a preprocessor that validates
     `item.actor_logps` is present.
+
+    drop_zero_weight defaults to True to skip zero-advantage samples.
     """
     credit_assigner: CreditAssigner = GroupNormalizedReturn(
         group_size=group_size,
         normalize_adv=group_normalize_adv,
         positive_only=positive_only,
     )
-    loss: Loss = ClippedSurrogateLoss(clip_eps=clip_eps, length_normalize=length_normalize)
-    preprocess = validate_actor_logps
+    loss: Loss = TokenClippedSurrogateLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+        ratio_clip=ratio_clip,
+    )
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
+def make_gspo(
+    *,
+    group_size: int,
+    group_normalize_adv: bool = True,
+    positive_only: bool = False,
+    clip_eps_low: float = 3e-4,
+    clip_eps_high: float = 4e-4,
+    length_normalize: bool = True,
+    ratio_clip: Optional[float] = None,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "gspo",
+) -> RLAlgorithm:
+    """
+    GSPO-style preset (sequence-level ratios with sequence-level clipping).
+
+    This mirrors GRPO's group-normalized advantages but uses a sequence-level
+    importance ratio. With length_normalize=True, this matches the geometric
+    mean ratio used in the GSPO paper (https://arxiv.org/abs/2507.18071).
+
+    drop_zero_weight defaults to True to skip zero-advantage samples.
+    """
+    credit_assigner: CreditAssigner = GroupNormalizedReturn(
+        group_size=group_size,
+        normalize_adv=group_normalize_adv,
+        positive_only=positive_only,
+    )
+    loss: Loss = ClippedSurrogateLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+        ratio_clip=ratio_clip,
+    )
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
+def make_cispo(
+    *,
+    group_size: int,
+    group_normalize_adv: bool = True,
+    positive_only: bool = False,
+    clip_eps_low: float = 1e6,
+    clip_eps_high: float = 0.2,
+    length_normalize: bool = True,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "cispo",
+) -> RLAlgorithm:
+    """
+    CISPO (Clipped IS-weight Policy Optimization) preset.
+
+    Unlike PPO/GRPO which clip token updates via the min operation, CISPO
+    clips the importance sampling weights themselves and uses them as
+    stop-gradient multipliers on the REINFORCE objective. This preserves
+    gradient contributions from all tokens, especially low-probability
+    tokens crucial for reflective reasoning behaviors.
+
+    Key insight from MiniMax-M1: Tokens like "However", "Recheck", "Wait"
+    are rare but crucial for learning reflective CoT behaviors. PPO/GRPO
+    clip these out after the first update, preventing them from contributing
+    to subsequent off-policy gradient updates. CISPO keeps all tokens.
+
+    Loss:
+        L = - E[ sg(clip(r_t, 1-ε_low, 1+ε_high)) * A * log π(a_t|s_t) ]
+
+    Args:
+        group_size: Number of rollouts per group for advantage normalization.
+        group_normalize_adv: Whether to normalize advantages within each group.
+        positive_only: If True, clip negative advantages to zero.
+        clip_eps_low: Lower bound for IS weight clipping. Paper uses large
+            value (effectively no lower bound).
+        clip_eps_high: Upper bound for IS weight clipping.
+        length_normalize: Whether to normalize by number of action tokens.
+        drop_zero_weight: Whether to drop zero-advantage samples.
+        drop_zero_weight_eps: Epsilon for zero-weight detection.
+        name: Algorithm name for logging.
+
+    Note: Rollouts must carry `group_id` in their metadata and each group
+    must have exactly `group_size` members. Use GRPORequestStrategy for
+    request expansion.
+
+    Reference: MiniMax-M1 paper (arXiv:2506.13585)
+    """
+    credit_assigner: CreditAssigner = GroupNormalizedReturn(
+        group_size=group_size,
+        normalize_adv=group_normalize_adv,
+        positive_only=positive_only,
+    )
+    loss: Loss = CISPOLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+    )
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
 
     return RLAlgorithm(
         name=name,

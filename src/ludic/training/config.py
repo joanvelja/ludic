@@ -28,10 +28,14 @@ class TrainerConfig:
 
     - max_grad_norm:
           Gradient clipping threshold; None disables clipping.
+
+    - max_seq_len:
+          Max token length for any single sample. Trainer raises if exceeded.
           
-    - grad_accum_steps:
-          Number of micro-batches to accumulate gradients over before 
-          performing one optimizer step (the 'macro-step' size).
+    - micro_token_budget:
+          Max padded tokens per micro-batch (roughly batch_size * max_seq_len).
+          Trainer splits macro-batches into micro-batches that fit this budget.
+          Must be >= max_seq_len.
           
     - sync_every_steps:
           Frequency (in macro-steps) at which to push updated policy 
@@ -56,6 +60,14 @@ class TrainerConfig:
     - reduce_stats_across_ranks:
           If True (and torch.distributed is initialized), Trainer will all-reduce
           the per-rank stats dict before logging/returning it.
+
+    ==========================
+    Logging / Profiling
+    ==========================
+
+    - profile_memory:
+          If True, capture CUDA peak-memory stats during forward/backward.
+          This adds device synchronizations and can slow training.
 
     ==========================
     Evaluation
@@ -90,13 +102,16 @@ class TrainerConfig:
     max_grad_norm: Optional[float] = 1.0
 
     # FSDP/RLHF specific settings
-    grad_accum_steps: int = 16
+    max_seq_len: int = 1024
+    micro_token_budget: int = 8192
     sync_every_steps: int = 1
     mixed_precision_dtype: Optional[str] = "bf16"
 
     # PipelineRL specific settings
     max_lag: Optional[int] = None  # Drop batches older than N steps
     reduce_stats_across_ranks: bool = False
+    profile_memory: bool = False
+    log_every: int = 1
 
     # ----- collation ------------------------------
     pad_token_id: int = 0

@@ -41,13 +41,13 @@ from ludic.training import (
     TrainerConfig,
     CheckpointConfig,
     make_dataset_queue_requests_fn,
-    make_grpo,
+    make_gspo,
     RequestsExhausted,
     RolloutRequest,
     EnvSpec,
     ProtocolSpec,
 )
-from ludic.training import Reducer, RichLiveLogger
+from ludic.training import Reducer, RichLiveLogger, PrintLogger, TeeLogger, WandbLogger, default_reducers
 
 
 def configure_logging(*, rank: int, level: str) -> None:
@@ -91,7 +91,6 @@ def init_dist(*, local_rank: int) -> int:
 
 def shard_samples(samples: List[Dict[str, Any]], rank: int, world_size: int) -> List[Dict[str, Any]]:
     return [s for i, s in enumerate(samples) if i % world_size == rank]
-
 
 MATH_TRAIN_DATASET = "qwedsacf/competition_math"
 MATH_EVAL_DATASET = "HuggingFaceH4/MATH-500"
@@ -166,7 +165,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--train-steps", type=int, default=100, help="Number of trainer steps.")
     parser.add_argument("--group-size", type=int, default=8)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--rollouts-per-update",
+        type=int,
+        default=8,
+        help="Total rollouts per update (must be divisible by --group-size).",
+    )
     parser.add_argument("--concurrency", type=int, default=11)
     parser.add_argument("--train-temperature", type=float, default=1.0)
     parser.add_argument(
@@ -190,14 +194,21 @@ def main() -> None:
     parser.add_argument("--eval-limit", type=int, default=100, help="Number of test samples for eval (0 disables).")
     parser.add_argument("--eval-concurrency", type=int, default=32)
     parser.add_argument("--eval-temperature", type=float, default=0.0)
+    parser.add_argument("--max-seq-len", type=int, default=1024, help="Max tokens per sample.")
+    parser.add_argument("--micro-token-budget", type=int, default=8192, help="Max padded tokens per micro-batch.")
     parser.add_argument(
-        "--max-tokens",
+        "--max-completion-tokens",
         type=int,
-        default=1024,
+        default=512,
         help="Max tokens per completion (train + eval).",
     )
     parser.add_argument("--log-level", type=str, default="INFO")
-    parser.add_argument("--logger", choices=["rich", "print", "none"], default="rich")
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="rich",
+        help="Comma-separated loggers: rich, print, wandb, none.",
+    )
     parser.add_argument(
         "--rank0-only-output",
         action=argparse.BooleanOptionalAction,
@@ -206,6 +217,12 @@ def main() -> None:
     )
     parser.add_argument("--final-save", action="store_true", help="Save a final checkpoint after training completes.")
     args = parser.parse_args()
+    if args.rollouts_per_update <= 0:
+        raise ValueError("--rollouts-per-update must be > 0.")
+    if args.rollouts_per_update % args.group_size != 0:
+        raise ValueError("--rollouts-per-update must be divisible by --group-size.")
+    if args.max_completion_tokens > args.max_seq_len:
+        raise ValueError("--max-completion-tokens must be <= --max-seq-len.")
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     rank = init_dist(local_rank=env_local_rank)
@@ -295,11 +312,10 @@ def main() -> None:
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    algo = make_grpo(
-        name="grpo",
+    algo = make_gspo(
+        name="gspo",
         group_size=args.group_size,
         group_normalize_adv=True,
-        clip_eps=0.1,
         length_normalize=True,
     )
 
@@ -309,12 +325,16 @@ def main() -> None:
         jsonl_path=rollout_log_path,
     )
     train_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=args.max_tokens),
+        sampling=SamplingParams(
+            temperature=args.train_temperature,
+            max_tokens=args.max_completion_tokens,
+        ),
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
+    base_requests = args.rollouts_per_update // args.group_size
     requests_fn = make_dataset_queue_requests_fn(
         samples_q,
-        batch_size=args.batch_size,
+        batch_size=base_requests,
         env_kind="math",
         protocol_kind="single_agent",
         inference=train_inference,
@@ -339,7 +359,8 @@ def main() -> None:
 
     cfg = TrainerConfig(
         model_device=str(device),
-        grad_accum_steps=2,
+        max_seq_len=args.max_seq_len,
+        micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.5,
         pad_token_id=tokenizer.pad_token_id,
         reduce_stats_across_ranks=True,
@@ -367,45 +388,65 @@ def main() -> None:
             normalize_by="samples",
         ),
     }
+    reducers = {**default_reducers(), **reducers}
     train_logger = None
     if rank == 0:
-        if args.logger == "none":
-            train_logger = None
-        elif args.logger == "print" or not sys.stdout.isatty():
-            from ludic.training import PrintLogger
+        raw_logger = args.logger or "rich"
+        logger_tokens = [tok.strip().lower() for tok in raw_logger.replace("+", ",").split(",") if tok.strip()]
+        valid_loggers = {"rich", "print", "wandb", "none"}
+        unknown = [tok for tok in logger_tokens if tok not in valid_loggers]
+        if unknown:
+            raise SystemExit(f"Unknown logger(s): {unknown}. Valid: {sorted(valid_loggers)}")
+        if "none" in logger_tokens:
+            logger_tokens = ["none"]
 
-            train_logger = PrintLogger(
+        logger_keys = [
+            "train/loss",
+            "train/avg_total_reward",
+            "train/correct_rate",
+            "train/parse_err_rate",
+            "train/completion_truncated_rate",
+            "train/seq_len_truncated_rate",
+            "eval/accuracy",
+            "eval/parse_error_rate",
+            "eval/avg_completion_tokens",
+            "train/target_rollouts",
+            "train/num_samples",
+        ]
+        console_logger = None
+        if "print" in logger_tokens:
+            console_logger = PrintLogger(
                 prefix="[trainer]",
-                keys=[
-                    "loss",
-                    "avg_total_reward",
-                    "correct_rate",
-                    "parse_err_rate",
-                    "eval_accuracy",
-                    "eval_parse_error_rate",
-                    "eval_avg_completion_tokens",
-                    "num_rollouts",
-                    "num_samples",
-                ],
+                keys=logger_keys,
                 precision=4,
             )
-        else:
-            train_logger = RichLiveLogger(
-                keys=[
-                    "loss",
-                    "avg_total_reward",
-                    "correct_rate",
-                    "parse_err_rate",
-                    "eval_accuracy",
-                    "eval_parse_error_rate",
-                    "eval_avg_completion_tokens",
-                    "num_rollouts",
-                    "num_samples",
-                ],
-                spark_key="avg_total_reward",
-                history=100,
-                precision=4,
-            )
+        elif "rich" in logger_tokens:
+            if not sys.stdout.isatty():
+                console_logger = PrintLogger(
+                    prefix="[trainer]",
+                    keys=logger_keys,
+                    precision=4,
+                )
+            else:
+                console_logger = RichLiveLogger(
+                    keys=logger_keys,
+                    spark_key="train/avg_total_reward",
+                    history=100,
+                    precision=4,
+                )
+
+        wandb_logger = None
+        if "wandb" in logger_tokens:
+            wandb_config = dict(vars(args))
+            wandb_config["rank"] = rank
+            wandb_config["world_size"] = world_size
+            wandb_logger = WandbLogger(config=wandb_config)
+
+        if logger_tokens != ["none"]:
+            if console_logger and wandb_logger:
+                train_logger = TeeLogger(console_logger, wandb_logger)
+            else:
+                train_logger = console_logger or wandb_logger
 
     trainer = Trainer(
         model=model,
@@ -432,7 +473,7 @@ def main() -> None:
                         inference=InferenceSpec(
                             sampling=SamplingParams(
                                 temperature=float(args.eval_temperature),
-                                max_tokens=int(args.max_tokens),
+                                max_tokens=int(args.max_completion_tokens),
                             ),
                             return_=ReturnSpec.for_eval(return_token_ids=True),
                         ),
@@ -466,9 +507,10 @@ def main() -> None:
     def train_log(stats: Dict[str, float]) -> None:
         if rank != 0:
             return
-        step = int(stats.get("train_step", 0))
+        step = int(stats.get("train/step", 0))
         print(
-            f"[rank0 step {step}] loss={stats.get('loss'):.4f} reward={stats.get('avg_total_reward'):.4f}",
+            f"[rank0 step {step}] loss={stats.get('train/loss'):.4f} "
+            f"reward={stats.get('train/avg_total_reward'):.4f}",
             flush=True,
         )
 
