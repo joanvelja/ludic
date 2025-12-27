@@ -127,12 +127,7 @@ def code_block_parser(raw: str) -> ParseResult:
             action=code, reward=0.05, obs=None
         )  # Small bonus for proper formatting
 
-    # Fall back to raw text (strip leading/trailing whitespace)
-    code = raw.strip()
-    if code:
-        return ParseResult(action=code, reward=0.0, obs=None)
-
-    # Empty response
+    # Empty response if no code block found
     return ParseResult(action=None, reward=-0.1, obs="Please provide Python code.")
 
 
@@ -190,8 +185,12 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--host", default="127.0.0.1", help="vLLM server host")
     parser.add_argument("--port", type=int, default=8000, help="vLLM server port")
-    parser.add_argument("--max-prompt-tokens", type=int, default=1024, help="Max prompt tokens")
-    parser.add_argument("--max-new-tokens", type=int, default=4096, help="Max new tokens")
+    parser.add_argument(
+        "--max-prompt-tokens", type=int, default=1024, help="Max prompt tokens"
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=4096, help="Max new tokens"
+    )
     parser.add_argument(
         "--stop",
         nargs="*",
@@ -303,7 +302,7 @@ def main():
     )
 
     # Checkpoints
-    parser.add_argument("--rollout-log", default="apps_train_rollouts.jsonl")
+    parser.add_argument("--rollout-log", default="data/apps_train_rollouts.jsonl")
     parser.add_argument("--checkpoint-dir", default="checkpoints_apps")
     parser.add_argument("--checkpoint-every", type=int, default=25)
     parser.add_argument(
@@ -357,10 +356,14 @@ def main():
     all_samples = [s for s in all_samples if prompt_fits(s)]
     filtered_count = pre_filter_count - len(all_samples)
     if filtered_count > 0:
-        print(f"Filtered {filtered_count} samples exceeding {args.max_prompt_tokens} prompt tokens.")
+        print(
+            f"Filtered {filtered_count} samples exceeding {args.max_prompt_tokens} prompt tokens."
+        )
 
     if not all_samples:
-        print("ERROR: All samples filtered out by prompt length. Increase --max-prompt-tokens.")
+        print(
+            "ERROR: All samples filtered out by prompt length. Increase --max-prompt-tokens."
+        )
         return 1
 
     # Split: last N samples for eval (deterministic, reproducible)
@@ -484,7 +487,7 @@ def main():
             terms=[
                 LossTerm(
                     name="policy",
-                    loss=ClippedSurrogateLoss(clip_eps=0.1, length_normalize=True),
+                    loss=ClippedSurrogateLoss(clip_eps=0.28, length_normalize=True),
                     weight=1.0,
                 ),
                 LossTerm(
@@ -497,7 +500,7 @@ def main():
         print(f"Using GRPO with KL penalty (coeff={args.kl_coeff})")
     else:
         # Standard GRPO (no KL penalty)
-        loss = ClippedSurrogateLoss(clip_eps=0.1, length_normalize=True)
+        loss = ClippedSurrogateLoss(clip_eps=0.28, length_normalize=True)
         print("Using standard GRPO (no KL penalty)")
 
     algo = RLAlgorithm(
@@ -741,7 +744,6 @@ def main():
     print(f"  Concurrency: {args.concurrency}")
     print(f"  Sandbox workers: {args.sandbox_workers}")
     print(f"  Sandbox backend: {args.sandbox_backend}")
-    print(f"  Progress will be logged every training step.")
     print()
 
     try:

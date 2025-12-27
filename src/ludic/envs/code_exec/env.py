@@ -412,6 +412,8 @@ class CodeExecEnv(SingleAgentEnv):
                 ),
                 "compile_status": test_result.execution.compile_result.status.value,
                 "run_duration_ms": test_result.execution.run_duration_ms,
+                "stdout": test_result.execution.stdout,
+                "stderr": test_result.execution.stderr,
             }
 
             # Optionally include failure details
