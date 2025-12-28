@@ -6,5 +6,27 @@ dist/
 wheels/
 *.egg-info
 
+# mac specific crap
+.DS_Store
+
+# checkpoints
+checkpoints_*/
+
 # Virtual environments
 .venv
+
+# wandb files
+wandb/
+
+# Slurm logs
+logs/
+*.log
+
+# Big jsonl files
+data/
+*.jsonl
+
+# Environment files (secrets)
+.env
+.env.*
+.DS_Store

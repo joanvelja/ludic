@@ -16,11 +16,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from typing import List, Optional, Protocol, runtime_checkable
+import logging
+from typing import List, Optional, Protocol, Set, runtime_checkable
 
 from .adapters.base import OutputVerifier
 from .sandbox import Sandbox
 from .types import (
+    BatchExecutionSpec,
     BatchTestResult,
     CompileResult,
     CompileStatus,
@@ -29,6 +31,8 @@ from .types import (
     TestCase,
     TestResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def compute_hash(content: str) -> str:
@@ -132,6 +136,7 @@ class StdinStdoutRunner:
         self,
         default_timeout_s: float = 5.0,
         memory_limit_mb: Optional[int] = 256,
+        use_batch_execution: bool = True,
     ) -> None:
         """
         Initialize the runner with default resource limits.
@@ -140,9 +145,12 @@ class StdinStdoutRunner:
             default_timeout_s: Default execution timeout per test (seconds).
                               Tests can override via metadata["timeout_s"].
             memory_limit_mb: Memory limit for execution (None = no limit)
+            use_batch_execution: If True and sandbox supports it, use batched
+                                execution to reduce semaphore acquisitions.
         """
         self._default_timeout_s = default_timeout_s
         self._memory_limit_mb = memory_limit_mb
+        self._use_batch_execution = use_batch_execution
 
     async def run_tests(
         self,
@@ -178,10 +186,40 @@ class StdinStdoutRunner:
         Returns:
             BatchTestResult with results for each test
         """
+        import time
+
+        run_start = time.perf_counter()
+
         # Compute hashes for caching
         code_hash = compute_hash(code)
         tests_hash_val = hash_tests(tests)
 
+        # Use batch execution if enabled and sandbox supports it
+        has_batch = hasattr(sandbox, "execute_batch")
+        logger.debug(
+            f"run_tests: use_batch={self._use_batch_execution}, "
+            f"has_execute_batch={has_batch}, num_tests={len(tests)}"
+        )
+
+        if self._use_batch_execution and has_batch:
+            result = await self._run_tests_batched(
+                sandbox=sandbox,
+                code=code,
+                tests=tests,
+                verifier=verifier,
+                stop_on_first_failure=stop_on_first_failure,
+                compile_first=compile_first,
+                code_hash=code_hash,
+                tests_hash=tests_hash_val,
+            )
+            elapsed_ms = (time.perf_counter() - run_start) * 1000
+            logger.debug(
+                f"Batch execution completed: {len(tests)} tests in {elapsed_ms:.1f}ms, "
+                f"passed={result.passed_count}/{result.total_count}"
+            )
+            return result
+
+        # Non-batch execution
         # Step 1: Compile first if requested
         compile_result: Optional[CompileResult] = None
         if compile_first:
@@ -227,7 +265,7 @@ class StdinStdoutRunner:
                 # Stop on first failure
                 if not test_result.passed:
                     # Mark remaining tests as NOT_RUN
-                    for remaining_test in tests[len(results):]:
+                    for remaining_test in tests[len(results) :]:
                         not_run_result = self._create_not_run_result(
                             test_case=remaining_test,
                             code_hash=code_hash,
@@ -318,6 +356,144 @@ class StdinStdoutRunner:
             actual=actual_output,
             execution=execution,
             comparison_details=comparison_details,
+        )
+
+    async def _run_tests_batched(
+        self,
+        sandbox: Sandbox,
+        code: str,
+        tests: List[TestCase],
+        verifier: OutputVerifier,
+        stop_on_first_failure: bool,
+        compile_first: bool,
+        code_hash: str,
+        tests_hash: str,
+    ) -> BatchTestResult:
+        """
+        Run tests using batch execution API with crash resilience.
+
+        This method uses the sandbox's execute_batch() to run all tests
+        in a single podman exec call, reducing semaphore acquisitions
+        from O(2N) to O(2).
+
+        Args:
+            sandbox: Sandbox with execute_batch() method
+            code: Source code to test
+            tests: List of test cases
+            verifier: Output verifier for comparing results
+            stop_on_first_failure: If True, stop after first failure
+            compile_first: If True, compile before running tests
+            code_hash: Pre-computed hash of code
+            tests_hash: Pre-computed hash of tests
+
+        Returns:
+            BatchTestResult with results for each test
+        """
+        spec = BatchExecutionSpec(
+            code=code,
+            tests=tests,
+            compile_first=compile_first,
+            timeout_s=self._default_timeout_s,
+            stop_on_first_failure=stop_on_first_failure,
+        )
+
+        results: List[TestResult] = []
+        compile_result: Optional[CompileResult] = None
+        received_done = False
+        received_test_ids: Set[str] = set()
+
+        # Build lookup for test cases by ID
+        test_by_id = {t.id: t for t in tests}
+
+        try:
+            async for result in sandbox.execute_batch(spec):
+                if isinstance(result, CompileResult):
+                    compile_result = result
+                    if not result.success:
+                        # Compilation failed - return batch with all tests failed
+                        return self._create_all_failed_batch(
+                            tests=tests,
+                            code_hash=code_hash,
+                            tests_hash=tests_hash,
+                            compile_result=compile_result,
+                            reason="compilation_failed",
+                        )
+                elif isinstance(result, ExecutionResult):
+                    # This is a test result - find the matching test case
+                    # The execute_batch implementation tags results with test_id
+                    # in the cache_key field
+                    test_id = result.cache_key or ""
+                    received_test_ids.add(test_id)
+
+                    test_case = test_by_id.get(test_id)
+                    if test_case is None:
+                        logger.warning(
+                            f"Received result for unknown test_id: {test_id}"
+                        )
+                        continue
+
+                    # Build TestResult from ExecutionResult
+                    if not result.succeeded:
+                        # Execution failed
+                        test_result = TestResult(
+                            test_case=test_case,
+                            passed=False,
+                            actual=result.stdout,
+                            execution=result,
+                            comparison_details=self._get_execution_failure_details(
+                                result
+                            ),
+                        )
+                    else:
+                        # Execution succeeded, compare output
+                        actual_output = result.stdout
+                        expected_output = str(test_case.expected)
+                        passed, comparison_details = verifier.verify(
+                            actual_output, expected_output
+                        )
+                        test_result = TestResult(
+                            test_case=test_case,
+                            passed=passed,
+                            actual=actual_output,
+                            execution=result,
+                            comparison_details=comparison_details,
+                        )
+                    results.append(test_result)
+                elif isinstance(result, dict) and result.get("type") == "done":
+                    received_done = True
+                    break
+
+        except Exception as e:
+            # Stream broke unexpectedly (OOM, container killed, etc.)
+            logger.warning(f"Batch execution stream broke: {e}")
+
+        # Handle missing tests (stream truncated before "done")
+        if not received_done:
+            for test in tests:
+                if test.id not in received_test_ids:
+                    # Create SANDBOX_ERROR result for missing tests
+                    execution = ExecutionResult(
+                        compile_result=compile_result
+                        or CompileResult(status=CompileStatus.SUCCESS),
+                        run_status=RunStatus.SANDBOX_ERROR,
+                        stdout="",
+                        stderr="Batch execution terminated unexpectedly",
+                        exit_code=None,
+                    )
+                    results.append(
+                        TestResult(
+                            test_case=test,
+                            passed=False,
+                            actual="",
+                            execution=execution,
+                            comparison_details="Sandbox crashed before this test completed",
+                        )
+                    )
+
+        return BatchTestResult(
+            results=results,
+            code_hash=code_hash,
+            tests_hash=tests_hash,
         )
 
     def _get_execution_failure_details(self, execution: ExecutionResult) -> str:

@@ -1,4 +1,6 @@
 from __future__ import annotations
+import logging
+import time
 from typing import Callable, List, Optional
 
 from ludic.training.types import (
@@ -9,6 +11,8 @@ from ludic.training.types import (
     SampleFilter,
 )
 from .rollout_engine import RolloutEngine
+
+logger = logging.getLogger(__name__)
 
 
 class RolloutBatchSource(BatchSource):
@@ -53,7 +57,13 @@ class RolloutBatchSource(BatchSource):
         Pull requests -> Generate (blocking) -> Return Batch.
         """
         requests = self._requests_fn()
-        return await self._engine.generate_batch(
+        n_requests = len(requests)
+        logger.info(
+            f"Generating batch: {n_requests} rollouts with concurrency={self._concurrency}"
+        )
+        start_time = time.monotonic()
+
+        batch = await self._engine.generate_batch(
             requests=requests,
             max_steps=self._max_steps,
             credit_assigner=self._credit_assigner,
@@ -61,3 +71,10 @@ class RolloutBatchSource(BatchSource):
             concurrency=self._concurrency,
             sample_filter=self._sample_filter,
         )
+
+        elapsed = time.monotonic() - start_time
+        logger.info(
+            f"Batch complete: {len(batch.items)} samples from {n_requests} rollouts "
+            f"in {elapsed:.1f}s ({n_requests / elapsed:.1f} rollouts/s)"
+        )
+        return batch

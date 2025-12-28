@@ -23,6 +23,8 @@ from .algorithm import (
     make_reinforce,
     make_reinforce_baseline,
     make_grpo,
+    make_gspo,
+    make_cispo,
     make_sft,
 )
 from .credit_assignment import (
@@ -37,6 +39,8 @@ from .loss import (
     ReinforceLoss,
     ReinforceBaselineLoss,
     ClippedSurrogateLoss,
+    TokenClippedSurrogateLoss,
+    CISPOLoss,
     KLLoss,
     EntropyBonus,
     LossTerm,
@@ -61,8 +65,8 @@ from .batching import (
     make_dataset_sequence_requests_fn,
     make_chat_template_step_to_item,
 )
-from .stats import Reducer, apply_reducers_to_records
-from .loggers import TrainingLogger, PrintLogger, RichLiveLogger
+from .stats import Reducer, apply_reducers_to_records, default_reducers
+from .loggers import TrainingLogger, PrintLogger, RichLiveLogger, TeeLogger, WandbLogger
 
 if TYPE_CHECKING:  # pragma: no cover
     from .trainer import Trainer as Trainer
@@ -77,6 +81,8 @@ __all__ = [
     "make_reinforce",
     "make_reinforce_baseline",
     "make_grpo",
+    "make_gspo",
+    "make_cispo",
     "make_sft",
     # Credit assignment
     "GroupNormalizedReturn",
@@ -89,6 +95,8 @@ __all__ = [
     "ReinforceLoss",
     "ReinforceBaselineLoss",
     "ClippedSurrogateLoss",
+    "TokenClippedSurrogateLoss",
+    "CISPOLoss",
     "KLLoss",
     "EntropyBonus",
     "LossTerm",
@@ -125,9 +133,12 @@ __all__ = [
     # Stats + loggers
     "Reducer",
     "apply_reducers_to_records",
+    "default_reducers",
     "TrainingLogger",
     "PrintLogger",
     "RichLiveLogger",
+    "TeeLogger",
+    "WandbLogger",
 ]
 
 

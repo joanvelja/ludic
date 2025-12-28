@@ -12,6 +12,17 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
+class SandboxPoolExhaustedError(Exception):
+    """
+    Raised when sandbox pool experiences too many consecutive failures.
+
+    This indicates a systemic issue with sandbox creation/reset that
+    requires operator intervention.
+    """
+
+    pass
+
+
 class CompileStatus(Enum):
     """Status of code compilation/syntax checking."""
 
@@ -31,6 +42,7 @@ class RunStatus(Enum):
     MEMORY_EXCEEDED = "memory_exceeded"
     KILLED = "killed"
     NOT_RUN = "not_run"  # e.g., skipped due to earlier failure
+    SANDBOX_ERROR = "sandbox_error"  # sandbox crashed, not user code
 
 
 @dataclass
@@ -126,6 +138,23 @@ class TestCase:
     id: str = ""
     weight: float = 1.0  # for weighted partial credit
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class BatchExecutionSpec:
+    """
+    Specification for executing multiple tests in a single batch.
+
+    Used by execute_batch() to run all tests with minimal semaphore acquisitions.
+    The batch runner receives this as a manifest and executes tests sequentially
+    inside the container, streaming results back as JSONL.
+    """
+
+    code: str
+    tests: List[TestCase]
+    compile_first: bool = True
+    timeout_s: float = 5.0
+    stop_on_first_failure: bool = True
 
 
 @dataclass

@@ -3,7 +3,8 @@ import os
 import signal
 import sys
 from argparse import Namespace
-from typing import Any, Awaitable, Sequence, Set, Optional, Tuple
+from typing import Any, Sequence, Set, Optional, Tuple
+from collections.abc import Coroutine
 
 # Use V1 engine explicitly.
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -29,8 +30,9 @@ from vllm.entrypoints.openai.cli_args import (
     validate_parsed_serve_args,
 )
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import FlexibleArgumentParser, set_ulimit
-from vllm.transformers_utils.tokenizer import init_tokenizer_from_configs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.system_utils import set_ulimit
+from vllm.tokenizers import cached_tokenizer_from_config
 
 # V1 logits-processor interface
 from vllm.v1.sample.logits_processor.interface import (
@@ -52,7 +54,7 @@ RUNTIME_VERSION: int = 0
 RUNTIME_VERSION_LOCK = asyncio.Lock()
 
 
-def create_background_task(coro: Awaitable[Any]) -> asyncio.Task[Any]:
+def create_background_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
     """Create an async task and track it so we can wait/cancel on shutdown."""
     task = asyncio.create_task(coro)
     background_tasks.add(task)
@@ -106,9 +108,9 @@ class WeightSyncWorkerExtension:
         # --- DEBUG: Print internal vLLM parameter names ---
         # This executes on the worker process. We use Rank 0 to avoid duplicates.
         if self.pynccl_comm.rank == 0:
-            print("\n" + "="*60)
+            print("\n" + "=" * 60)
             print("🔍 [DEBUG] vLLM Internal Parameter Names (Worker Rank 0)")
-            print("="*60)
+            print("=" * 60)
             try:
                 # Access the underlying torch model
                 model_instance = self.model_runner.model
@@ -119,7 +121,7 @@ class WeightSyncWorkerExtension:
                 print(f"Total parameters found: {count}")
             except Exception as e:
                 print(f"⚠️ Could not print parameter names: {e}")
-            print("="*60 + "\n")
+            print("=" * 60 + "\n")
         # --------------------------------------------------
 
     def update_named_param(self, name: str, dtype: str, shape: Sequence[int]) -> None:
@@ -228,7 +230,7 @@ class GlobalThinkProcessor(V1LogitsProcessor):
                 self.req_state.pop(ridx, None)
 
         # 2) Handle additions
-        for (req_idx, params, prompt_ids, output_ids) in batch_update.added:
+        for req_idx, params, prompt_ids, output_ids in batch_update.added:
             assert isinstance(params, SamplingParams)
             extra_args = getattr(params, "extra_args", None)
 
@@ -246,7 +248,7 @@ class GlobalThinkProcessor(V1LogitsProcessor):
             }
 
         # 3) Handle moves
-        for (src, dst, direction) in batch_update.moved:
+        for src, dst, direction in batch_update.moved:
             if direction == MoveDirectionality.UNIDIRECTIONAL:
                 state = self.req_state.pop(src, None)
                 if state is not None:
@@ -337,9 +339,7 @@ async def run_server(args: Namespace) -> None:
     #    the engine will use. This is controller-side only.
     # --------------------------------------------------------------
     try:
-        tokenizer = init_tokenizer_from_configs(
-            model_config=vllm_config.model_config
-        )
+        tokenizer = cached_tokenizer_from_config(vllm_config.model_config)
         think_ids = tokenizer.encode("</think>", add_special_tokens=False)
         vllm_config.additional_config["think_ids"] = think_ids
     except Exception as e:
@@ -371,9 +371,7 @@ async def run_server(args: Namespace) -> None:
 
     @app.get("/get_world_size")
     async def get_world_size() -> dict[str, int]:
-        return {
-            "world_size": args.tensor_parallel_size * args.data_parallel_size
-        }
+        return {"world_size": args.tensor_parallel_size * args.data_parallel_size}
 
     @app.get("/runtime_version")
     async def runtime_version() -> dict[str, int]:
@@ -390,9 +388,7 @@ async def run_server(args: Namespace) -> None:
         world_size = data.get("world_size")
 
         create_background_task(
-            engine.collective_rpc(
-                "init_communicator", args=(host, port, world_size)
-            )
+            engine.collective_rpc("init_communicator", args=(host, port, world_size))
         )
         return {"status": "ok"}
 
@@ -433,18 +429,18 @@ async def run_server(args: Namespace) -> None:
         """
         data = await request.json()
         metadata = data.get("metadata", [])  # List of {name, dtype, shape}
-        
+
         # --- DEBUG: Verify what the server received ---
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print(f"📥 [SERVER DEBUG] Received Batch Metadata (Total: {len(metadata)})")
-        print("="*80)
+        print("=" * 80)
         for i, m in enumerate(metadata):
             # Print only first 10 to avoid spamming logs, or all if short
             if i < 10:
                 print(f"  • {m.get('name')} | {m.get('shape')}")
         if len(metadata) > 10:
-            print(f"  ... (+{len(metadata)-10} more)")
-        print("="*80 + "\n")
+            print(f"  ... (+{len(metadata) - 10} more)")
+        print("=" * 80 + "\n")
         # ----------------------------------------------
 
         # Check if an explicit version was provided by the Trainer
@@ -462,7 +458,7 @@ async def run_server(args: Namespace) -> None:
 
                 # Reset cache and bump version after full batch
                 await engine.reset_prefix_cache()
-                
+
                 global RUNTIME_VERSION
                 async with RUNTIME_VERSION_LOCK:
                     if forced_version is not None:
@@ -499,7 +495,7 @@ async def run_server(args: Namespace) -> None:
                     await engine.collective_rpc(
                         "update_named_param", args=(name, dtype, shape)
                     )
-                
+
                 global RUNTIME_VERSION
                 async with RUNTIME_VERSION_LOCK:
                     if requested_version is not None:
@@ -536,10 +532,11 @@ async def run_server(args: Namespace) -> None:
 
     # ------------------------ start HTTP server --------------------------
 
-    vllm_config_live = await engine.get_vllm_config()
-    print(vllm_config_live)
+    # vLLM 0.13: engine_client exposes vllm_config as an attribute
+    print(engine.vllm_config)
 
-    await init_app_state(engine, vllm_config_live, app.state, args)
+    # vLLM 0.13: init_app_state(engine_client, state, args)
+    await init_app_state(engine, app.state, args)
 
     shutdown_task = await serve_http(
         app,
@@ -568,13 +565,23 @@ def main() -> None:
         description="vLLM OpenAI-compatible server with weight synchronization"
     )
     parser = make_arg_parser(parser)
+    parser.add_argument(
+        "--batch-invariant",
+        action="store_true",
+        help="Enable vLLM batch-invariant kernels (sets VLLM_BATCH_INVARIANT=1).",
+    )
     argv = sys.argv[1:]
     # vLLM can silently override sampling params using the model's Hugging Face
     # `generation_config` unless `--generation-config vllm` is set. Defaulting
     # to `vllm` makes Ludic's SamplingParams the source of truth.
-    if not any(a == "--generation-config" or a.startswith("--generation-config=") for a in argv):
+    if not any(
+        a == "--generation-config" or a.startswith("--generation-config=") for a in argv
+    ):
         argv = [*argv, "--generation-config", "vllm"]
-    args = parser.parse_args(argv) or Namespace()
+    args = parser.parse_args(argv)
+    assert args is not None
+    if args.batch_invariant:
+        os.environ["VLLM_BATCH_INVARIANT"] = "1"
     validate_parsed_serve_args(args)
     print(args)
     uvloop.run(run_server(args))

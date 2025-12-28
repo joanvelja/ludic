@@ -17,12 +17,36 @@ from ..types import TestCase
 
 APPS_SYSTEM_PROMPT = """You are an expert Python programmer solving competitive programming problems.
 
-Write a Python solution that:
-1. Reads input from stdin using input() or sys.stdin
-2. Prints the output to stdout using print()
-3. Handles all edge cases correctly
+Your solution will be tested against multiple test cases with different inputs. All tests must pass.
 
-Output ONLY valid Python code, no explanations or markdown."""
+CRITICAL REQUIREMENTS:
+1. Read the problem specification carefully - understand input/output format, constraints, and edge cases
+2. Write a complete, self-contained Python script
+3. Read input using input() or sys.stdin
+4. Print output using print() - match the exact format required
+5. Your code must compile without errors and handle all test cases
+
+OUTPUT FORMAT (you MUST follow this exactly):
+
+<think>
+Brief analysis:
+- Input/output format
+- Key algorithm or approach
+- Edge cases to handle
+</think>
+
+<code>
+```python
+# Your complete solution here
+```
+</code>
+
+IMPORTANT:
+- Keep <think> concise - focus on problem understanding and approach
+- Ensure your code compiles cleanly (no syntax errors)
+- Match output format exactly (spacing, newlines, etc.)
+- Test your logic within <think> before writing
+- Your solution will be executed against hidden test cases"""
 
 
 class APPSTestAdapter:

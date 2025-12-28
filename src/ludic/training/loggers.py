@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Protocol, Sequence
+import logging
+import os
+from typing import Any, Dict, Optional, Protocol, Sequence
 
 from rich.console import Console
 from rich.live import Live
@@ -9,10 +11,17 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
 
+logger = logging.getLogger(__name__)
+
 
 class TrainingLogger(Protocol):
     """
     Interface for logging training stats to arbitrary backends.
+
+    Canonical stat prefixes:
+      - train/*: training metrics (loss, rewards, reducers, counts)
+      - eval/*: evaluation metrics
+      - perf/*: performance counters (e.g., GPU memory)
     """
 
     def log(self, step: int, stats: Dict[str, float]) -> None:
@@ -28,7 +37,7 @@ class PrintLogger:
         self,
         *,
         prefix: str = "[trainer]",
-        keys: Sequence[str] | None = None,
+        keys: Optional[Sequence[str]] = None,
         precision: int = 4,
         max_items_per_line: int = 6,
     ) -> None:
@@ -73,13 +82,13 @@ class RichLiveLogger:
     def __init__(
         self,
         *,
-        keys: Sequence[str] | None = None,
+        keys: Optional[Sequence[str]] = None,
         spark_key: str = "avg_total_reward",
         history: int = 100,
         spark_window: int = 50,
         precision: int = 4,
-        console: Console | None = None,
-        live: Live | None = None,
+        console: Optional[Console] = None,
+        live: Optional[Live] = None,
     ) -> None:
         self.keys = list(keys) if keys is not None else None
         self.spark_key = spark_key
@@ -89,7 +98,7 @@ class RichLiveLogger:
         self.console = console or Console()
         self.live = live or Live(console=self.console, refresh_per_second=4, transient=False)
         self.history_vals: list[float] = []
-        self._last_eval_step: int | None = None
+        self._last_eval_step: Optional[int] = None
         self._own_live = live is None
         self._started = False
 
@@ -110,7 +119,7 @@ class RichLiveLogger:
             return str(v)
         return str(v)
 
-    def _sparkline(self, max_len: int | None = None) -> tuple[str, float, float]:
+    def _sparkline(self, max_len: Optional[int] = None) -> tuple[str, float, float]:
         if not self.history_vals:
             return "", 0.0, 0.0
         vals = self.history_vals[-self.history :]
@@ -146,21 +155,31 @@ class RichLiveLogger:
 
         train_items = []
         eval_items = []
+        perf_items = []
         for k, v in sorted(stats.items()):
             if k in {"phase", "train_step", "eval_step"}:
                 continue
-            if allowed_keys is not None and k not in allowed_keys:
+            prefix = ""
+            name = k
+            if "/" in k:
+                prefix, name = k.split("/", 1)
+            if allowed_keys is not None and k not in allowed_keys and name not in allowed_keys:
                 continue
-            if k.startswith("eval_"):
-                eval_items.append((k.replace("eval_", "", 1), v))
+            if prefix == "eval" or k.startswith("eval_"):
+                eval_items.append((name.replace("eval_", "", 1), v))
+            elif prefix == "perf":
+                perf_items.append((name, v))
             else:
-                train_items.append((k, v))
+                train_items.append((name, v))
 
         train_table = _make_table(train_items) if train_items else Text("no train stats")
         eval_table = _make_table(eval_items) if eval_items else Text("no eval stats")
+        perf_table = _make_table(perf_items) if perf_items else Text("no perf stats")
 
         train_title = "train"
         train_step = stats.get("train_step")
+        if train_step is None:
+            train_step = stats.get("train/step")
         if train_step is None:
             train_step = step
         try:
@@ -203,6 +222,11 @@ class RichLiveLogger:
                 name="eval",
                 ratio=1,
             ),
+            Layout(
+                Panel(perf_table, title="perf", padding=(0, 0), expand=True),
+                name="perf",
+                ratio=1,
+            ),
         )
         bottom = Layout(
             Panel(spark_panel, padding=(0, 0), expand=True),
@@ -213,13 +237,22 @@ class RichLiveLogger:
         return root
 
     def log(self, step: int, stats: Dict[str, float]) -> None:
-        if "eval_step" in stats:
+        if "eval/step" in stats:
+            try:
+                self._last_eval_step = int(stats["eval/step"])
+            except Exception:
+                self._last_eval_step = step
+        elif "eval_step" in stats:
             try:
                 self._last_eval_step = int(stats["eval_step"])
             except Exception:
                 self._last_eval_step = step
+        elif any(k.startswith("eval/") or k.startswith("eval_") for k in stats):
+            self._last_eval_step = step
 
         spark_val = stats.get(self.spark_key)
+        if spark_val is None and "/" not in self.spark_key:
+            spark_val = stats.get(f"train/{self.spark_key}")
         if isinstance(spark_val, (int, float)):
             self.history_vals.append(float(spark_val))
             if len(self.history_vals) > self.history:
@@ -231,19 +264,83 @@ class RichLiveLogger:
 
         table = self._render(step, stats)
         self.live.update(table)
+
+
+class TeeLogger:
+    """
+    Fan-out logger that forwards stats to multiple loggers.
+    """
+
+    def __init__(self, *loggers: TrainingLogger) -> None:
+        self.loggers = [log for log in loggers if log is not None]
+
+    def log(self, step: int, stats: Dict[str, float]) -> None:
+        for log in self.loggers:
+            try:
+                log.log(step, stats)
+            except Exception:
+                logger.exception("Logger %s failed at step %s", log.__class__.__name__, step)
+
+
 class WandbLogger:
     """
     Minimal Weights & Biases logger. Lazily imports wandb.
     """
 
-    def __init__(self, *, run: Any | None = None, init_kwargs: Dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        init_kwargs: Optional[Dict[str, Any]] = None,
+        project: Optional[str] = None,
+        name: Optional[str] = None,
+        group: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        notes: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        dir: Optional[str] = None,
+        mode: Optional[str] = None,
+    ) -> None:
         try:
             import wandb
         except ImportError as exc:  # pragma: no cover - soft dependency
             raise ImportError("WandbLogger requires the 'wandb' package installed.") from exc
 
         self._wandb = wandb
-        self._run = run or wandb.init(**(init_kwargs or {}))
+        kwargs = dict(init_kwargs or {})
+        kwargs.update(
+            {
+                k: v
+                for k, v in {
+                    "project": project,
+                    "name": name,
+                    "group": group,
+                    "tags": None if tags is None else list(tags),
+                    "notes": notes,
+                    "config": None if config is None else dict(config),
+                    "dir": dir,
+                    "mode": mode,
+                }.items()
+                if v is not None
+            }
+        )
+        if "project" not in kwargs and not os.environ.get("WANDB_PROJECT"):
+            kwargs["project"] = "Ludic"
+
+        self._run = wandb.init(**kwargs)
 
     def log(self, step: int, stats: Dict[str, float]) -> None:
         self._wandb.log(stats, step=step)
+
+    def close(self) -> None:
+        if self._run is not None:
+            try:
+                self._run.finish()
+            except Exception:
+                logger.exception("Failed to finish wandb run")
+            self._run = None
+
+    def __enter__(self) -> "WandbLogger":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

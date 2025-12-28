@@ -15,7 +15,7 @@ from typing import Dict, Generic, List, Optional, Set, TypeVar
 
 from .cache import LRUCache
 from .sandbox import Sandbox
-from .types import BatchTestResult
+from .types import BatchTestResult, SandboxPoolExhaustedError
 
 logger = logging.getLogger(__name__)
 
@@ -27,27 +27,16 @@ class BaseSandboxPool(ABC, Generic[S]):
     """
     Abstract base class for sandbox pools with background reset.
 
-    Implements the common pool logic:
-      - Queue-based checkout/release
-      - Background reset on release (off critical path)
-      - Pending task tracking for clean shutdown
-      - LRU cache for execution results
-      - Error handling for failed resets
+    Provides queue-based checkout/release with sandboxes reset in background
+    tasks (off critical path). Includes LRU caching, pending task tracking,
+    and error handling for failed resets.
 
-    Subclasses must implement:
-      - _create_sandboxes(): Create backend-specific sandbox instances
-      - _stop_sandbox(sandbox): Stop a single sandbox (for shutdown)
-      - python_version property: Return the Python version
+    Subclasses must implement: _create_sandboxes(), _stop_sandbox(), python_version.
 
     Background Reset Pattern:
-      When a sandbox is released, instead of blocking the caller with a reset,
-      we spawn a background task that:
-        1. Resets the sandbox (cleans filesystem, kills processes)
-        2. Returns the sandbox to the available queue
-        3. On failure, discards the sandbox and optionally creates a replacement
-
-      This means checkout() gets an already-clean sandbox instantly, and the
-      reset latency is completely hidden from the rollout generation loop.
+      Released sandboxes are reset asynchronously and returned to the queue.
+      checkout() receives already-clean sandboxes instantly, hiding reset latency.
+      Failed resets discard the sandbox and optionally create a replacement.
     """
 
     def __init__(
@@ -55,6 +44,8 @@ class BaseSandboxPool(ABC, Generic[S]):
         n_workers: int = 4,
         cache_size: int = 10000,
         auto_replace_failed: bool = True,
+        max_consecutive_failures: int = 5,
+        max_concurrent_ops: int = 8,
     ):
         """
         Initialize the pool.
@@ -63,16 +54,23 @@ class BaseSandboxPool(ABC, Generic[S]):
             n_workers: Number of sandboxes to create
             cache_size: Maximum entries in the execution cache
             auto_replace_failed: If True, create new sandbox when reset fails
+            max_consecutive_failures: Maximum consecutive reset failures before raising
+                SandboxPoolExhaustedError (circuit breaker threshold)
+            max_concurrent_ops: Maximum concurrent sandbox operations (resets, exec
+                calls). Prevents podman/docker deadlock with too many simultaneous calls.
         """
         self._n_workers = n_workers
         self._cache = LRUCache(max_size=cache_size)
         self._auto_replace_failed = auto_replace_failed
+        self._max_consecutive_failures = max_consecutive_failures
+        self._max_concurrent_ops = max_concurrent_ops
 
         self._sandboxes: List[S] = []
         self._queue: Optional[asyncio.Queue[S]] = None
         self._pending_resets: Set[asyncio.Task] = set()
         self._started = False
         self._shutting_down = False
+        self._consecutive_failures = 0
 
     # -------------------------------------------------------------------------
     # Abstract methods (must be implemented by subclasses)
@@ -155,6 +153,14 @@ class BaseSandboxPool(ABC, Generic[S]):
         if self._started:
             return
 
+        # Limits concurrent background reset TASKS (admission control)
+        # Prevents podman/docker deadlock with too many simultaneous operations
+        self._ops_semaphore = asyncio.Semaphore(self._max_concurrent_ops)
+        logger.info(
+            f"Pool starting: n_workers={self._n_workers}, "
+            f"max_concurrent_ops={self._max_concurrent_ops}"
+        )
+
         # Create sandboxes (backend-specific)
         self._sandboxes = await self._create_sandboxes()
 
@@ -164,6 +170,10 @@ class BaseSandboxPool(ABC, Generic[S]):
             await self._queue.put(sandbox)
 
         self._started = True
+        logger.info(
+            f"Pool started: {len(self._sandboxes)} sandboxes ready, "
+            f"queue_size={self._queue.qsize()}"
+        )
 
     async def shutdown(self) -> None:
         """
@@ -191,6 +201,58 @@ class BaseSandboxPool(ABC, Generic[S]):
         self._queue = None
         self._shutting_down = False
 
+    async def drain_pending_resets(self, timeout_s: float = 60.0) -> int:
+        """
+        Wait for all pending reset tasks to complete.
+
+        Call this before switching between high-concurrency phases
+        (e.g., before eval after training step) to ensure all sandboxes
+        are available in the queue.
+
+        Uses asyncio.wait() instead of wait_for(gather()) to avoid
+        cancelling tasks on timeout (which would destroy sandboxes).
+
+        Args:
+            timeout_s: Maximum time to wait for resets to complete
+
+        Returns:
+            Number of resets that completed
+        """
+        if not self._pending_resets:
+            logger.debug("Drain called but no pending resets")
+            return 0
+
+        # Snapshot the current tasks (set may change during await)
+        tasks = list(self._pending_resets)
+        count = len(tasks)
+        logger.info(
+            f"Draining {count} pending resets... "
+            f"queue: {self.available}/{self._n_workers}"
+        )
+
+        import time
+        start = time.time()
+
+        # Use wait() instead of wait_for(gather()) - doesn't cancel on timeout
+        done, pending = await asyncio.wait(tasks, timeout=timeout_s)
+
+        elapsed = time.time() - start
+
+        if pending:
+            logger.warning(
+                f"Drain timeout after {elapsed:.1f}s! "
+                f"Completed: {len(done)}, still pending: {len(pending)}, "
+                f"queue: {self.available}/{self._n_workers}"
+            )
+        else:
+            logger.info(
+                f"Drain complete in {elapsed:.1f}s: "
+                f"{len(done)} resets finished, "
+                f"queue: {self.available}/{self._n_workers}"
+            )
+
+        return len(done)
+
     # -------------------------------------------------------------------------
     # Checkout / Release with background reset
     # -------------------------------------------------------------------------
@@ -201,6 +263,9 @@ class BaseSandboxPool(ABC, Generic[S]):
 
         The returned sandbox is guaranteed to be in a clean state (reset
         was performed in the background after the previous release).
+
+        Waits on the queue for a sandbox to become available. Background
+        resets are rate-limited by semaphore to prevent backend deadlock.
 
         Args:
             timeout_s: Maximum time to wait for a sandbox
@@ -215,18 +280,59 @@ class BaseSandboxPool(ABC, Generic[S]):
         if not self._started or self._queue is None:
             raise RuntimeError("Pool not started. Call start() first.")
 
-        try:
-            sandbox = await asyncio.wait_for(
-                self._queue.get(),
-                timeout=timeout_s,
-            )
-            return sandbox
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"No sandbox available after {timeout_s}s. "
-                f"Pool size: {self._n_workers}, available: {self.available}, "
-                f"pending resets: {self.pending_resets}"
-            )
+        import time
+
+        start_time = time.monotonic()
+        deadline = start_time + timeout_s
+        attempt = 0
+
+        while True:
+            remaining = deadline - time.monotonic()
+            attempt += 1
+
+            if remaining <= 0:
+                # Detailed timeout diagnostics
+                semaphore_free = self._ops_semaphore._value if self._ops_semaphore else 0
+                logger.error(
+                    f"CHECKOUT TIMEOUT after {timeout_s}s! "
+                    f"Pool: {self._n_workers}, available: {self.available}, "
+                    f"pending_resets: {self.pending_resets}, "
+                    f"semaphore: {semaphore_free}/{self._max_concurrent_ops} free, "
+                    f"attempts: {attempt}"
+                )
+                raise TimeoutError(
+                    f"No sandbox available after {timeout_s}s. "
+                    f"Pool size: {self._n_workers}, available: {self.available}, "
+                    f"pending resets: {self.pending_resets}"
+                )
+
+            # Log if we're waiting with empty queue
+            if self._queue.empty() and attempt == 1:
+                logger.info(
+                    f"Checkout waiting: queue empty, "
+                    f"pending_resets: {self.pending_resets}"
+                )
+
+            try:
+                sandbox = await asyncio.wait_for(
+                    self._queue.get(),
+                    timeout=min(remaining, 5.0),  # Short timeout to recheck
+                )
+                wait_time = time.monotonic() - start_time
+                if wait_time > 1.0:
+                    logger.info(
+                        f"Checkout OK after {wait_time:.2f}s wait, "
+                        f"queue now: {self._queue.qsize()}/{self._n_workers}"
+                    )
+                return sandbox
+            except asyncio.TimeoutError:
+                # Log periodic status during long waits
+                elapsed = time.monotonic() - start_time
+                logger.warning(
+                    f"Checkout still waiting after {elapsed:.1f}s: "
+                    f"available: {self.available}, pending: {self.pending_resets}"
+                )
+                continue
 
     async def release(self, sandbox: Sandbox) -> None:
         """
@@ -261,25 +367,72 @@ class BaseSandboxPool(ABC, Generic[S]):
         """
         Reset sandbox and return to queue (runs in background).
 
+        Uses semaphore to limit concurrent reset operations (prevents
+        podman deadlock with too many simultaneous exec calls).
+
         On success, the sandbox is returned to the available queue.
         On failure, the sandbox is discarded and optionally replaced.
         """
-        try:
-            await sandbox.reset()
-            # Only return to queue if we're not shutting down
-            if self._queue is not None and not self._shutting_down:
-                await self._queue.put(sandbox)
-        except Exception as e:
-            await self._handle_reset_failure(sandbox, e)
+        import time
+
+        sandbox_id = id(sandbox) % 10000  # Short ID for logging
+        wait_start = time.time()
+
+        # Limit concurrent ops to prevent podman/docker deadlock
+        async with self._ops_semaphore:
+            wait_elapsed = time.time() - wait_start
+            if wait_elapsed > 0.1:
+                logger.debug(f"[SB-{sandbox_id}] Semaphore acquired after {wait_elapsed:.2f}s wait")
+
+            reset_start = time.time()
+            try:
+                await sandbox.reset()
+                reset_elapsed = time.time() - reset_start
+                total_elapsed = time.time() - wait_start
+
+                if self._queue is not None and not self._shutting_down:
+                    await self._queue.put(sandbox)
+                    logger.debug(
+                        f"[SB-{sandbox_id}] Reset OK: {reset_elapsed:.2f}s reset, "
+                        f"{total_elapsed:.2f}s total. "
+                        f"Queue now: {self._queue.qsize()}/{self._n_workers}"
+                    )
+            except Exception as e:
+                reset_elapsed = time.time() - reset_start
+                logger.error(
+                    f"[SB-{sandbox_id}] Reset FAILED after {reset_elapsed:.2f}s: {e}"
+                )
+                await self._handle_reset_failure(sandbox, e)
 
     async def _handle_reset_failure(self, sandbox: S, error: Exception) -> None:
         """
         Handle a sandbox that failed to reset.
 
         Logs the error, removes the sandbox from the pool, and optionally
-        creates a replacement.
+        creates a replacement. Implements circuit breaker pattern to detect
+        systemic failures.
+
+        Raises:
+            SandboxPoolExhaustedError: If consecutive failures exceed threshold
         """
-        logger.warning(f"Sandbox reset failed: {error}. Discarding sandbox.")
+        # Increment failure counter
+        self._consecutive_failures += 1
+
+        logger.warning(
+            f"Sandbox reset failed: {error}. Discarding sandbox. "
+            f"Consecutive failures: {self._consecutive_failures}/{self._max_consecutive_failures}"
+        )
+
+        # Check circuit breaker threshold
+        if self._consecutive_failures >= self._max_consecutive_failures:
+            logger.error(
+                f"Circuit breaker triggered: {self._consecutive_failures} consecutive "
+                f"sandbox reset failures. Pool is exhausted."
+            )
+            raise SandboxPoolExhaustedError(
+                f"Sandbox pool exhausted after {self._consecutive_failures} consecutive "
+                f"reset failures. This indicates a systemic issue requiring operator intervention."
+            )
 
         # Remove from tracked sandboxes
         if sandbox in self._sandboxes:
@@ -299,7 +452,12 @@ class BaseSandboxPool(ABC, Generic[S]):
                     self._sandboxes.append(replacement)
                     if self._queue is not None:
                         await self._queue.put(replacement)
-                    logger.info("Created replacement sandbox after reset failure")
+                    # Reset failure counter on successful replacement
+                    self._consecutive_failures = 0
+                    logger.info(
+                        "Created replacement sandbox after reset failure. "
+                        "Consecutive failure counter reset."
+                    )
             except Exception as create_error:
                 logger.warning(f"Failed to create replacement sandbox: {create_error}")
 

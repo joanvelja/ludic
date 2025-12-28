@@ -1,33 +1,47 @@
 """
-APPS code generation training scaffold using CodeExecEnv.
+APPS code generation training scaffold using CodeExecEnv with LoRA.
 
 This wires together:
   - HuggingFace datasets for APPS code samples
   - CodeExecEnv with sandboxed execution (Docker or Podman-HPC)
   - SingleAgentProtocol with async env support
-  - RolloutBatchSource + MonteCarloReturn credit
-  - Trainer with REINFORCE or GRPO loss
+  - LoRA adapters via PEFT for efficient fine-tuning
+  - GRPO with optional KL regularization
+  - Baseline + periodic evaluation on held-out samples
+  - RichLiveLogger (terminal dashboard) or WandB (cloud logging)
 
 Requirements:
   - Container runtime: Docker daemon OR Podman-HPC (auto-detected)
-  - pip install docker>=7.0.0 datasets (for Docker backend)
+  - pip install docker>=7.0.0 datasets peft (for Docker backend)
   - GPU(s) for training (optional for rollout-only mode)
 
 Usage:
   # Start vLLM server (in one terminal)
   CUDA_VISIBLE_DEVICES=0 uv run python -m ludic.inference.vllm_server \\
-      --model Qwen/Qwen2.5-Coder-0.5B-Instruct
+      --model Qwen/Qwen2.5-3B-Instruct
 
-  # Run training with Docker (local, default)
+  # Run training with terminal dashboard (default)
   CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/code_exec/train_apps.py \\
-      --model Qwen/Qwen2.5-Coder-0.5B-Instruct \\
-      --limit 100 --train-steps 10
+      --model Qwen/Qwen2.5-3B-Instruct \\
+      --limit 500 --eval-samples 200 --train-steps 100 --final-save
 
-  # Run training with Podman-HPC (HPC cluster)
+  # Run training with KL regularization
   CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/code_exec/train_apps.py \\
-      --model Qwen/Qwen2.5-Coder-0.5B-Instruct \\
-      --sandbox-backend podman-hpc \\
-      --limit 100 --train-steps 10
+      --model Qwen/Qwen2.5-3B-Instruct \\
+      --limit 500 --eval-samples 200 --train-steps 100 \\
+      --kl-coeff 0.01 --final-save
+
+  # Run training with WandB logging
+  CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. uv run python examples/code_exec/train_apps.py \\
+      --model Qwen/Qwen2.5-3B-Instruct \\
+      --limit 500 --eval-samples 200 --train-steps 100 \\
+      --wandb --wandb-project ludic-apps --final-save
+
+Key Features:
+  - LoRA: rank=8, alpha=16, target_modules="all-linear" (configurable)
+  - Eval: Baseline before training, periodic eval every N steps
+  - Logging: Terminal sparkline dashboard or WandB cloud tracking
+  - KL regularization: Optional penalty to prevent policy drift
 
 See README.md for detailed setup instructions.
 """
@@ -43,6 +57,7 @@ from typing import Any, Dict, List
 import torch
 from datasets import load_dataset  # type: ignore
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import get_peft_model, LoraConfig, TaskType
 
 from ludic.agent import Agent
 from ludic.context import FullDialog
@@ -50,6 +65,7 @@ from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, Retur
 from ludic.interaction import SingleAgentProtocol
 from ludic.parsers import ParseResult
 from ludic.distributed.adapters import create_vllm_publisher
+from ludic.eval import EngineEvaluator
 from ludic.training import (
     RolloutEngine,
     RolloutBatchSource,
@@ -57,10 +73,16 @@ from ludic.training import (
     TrainerConfig,
     CheckpointConfig,
     make_dataset_queue_requests_fn,
-    make_grpo,
     RequestsExhausted,
+    RolloutRequest,
+    EnvSpec,
+    ProtocolSpec,
+    # Algorithm
+    make_cispo,
 )
-from ludic.training import Reducer, RichLiveLogger
+from ludic.training import Reducer, RichLiveLogger, default_reducers
+from ludic.training.loggers import WandbLogger
+from ludic.training.hardware import configure_flash_attention, log_hardware_info
 
 # Import CodeExecEnv components
 from ludic.envs.code_exec import (
@@ -70,6 +92,12 @@ from ludic.envs.code_exec import (
     SandboxBackend,
 )
 from ludic.envs.code_exec.adapters.apps import APPSTestAdapter, APPS_SYSTEM_PROMPT
+
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 
 
 def code_block_parser(raw: str) -> ParseResult:
@@ -86,19 +114,16 @@ def code_block_parser(raw: str) -> ParseResult:
     import re
 
     # Try to extract from markdown code block
-    code_block_pattern = r"```(?:python)?\s*\n(.*?)\n```"
+    code_block_pattern = r"```(?:python)?\s*\n(.*?)(?:\n)?```"
     match = re.search(code_block_pattern, raw, re.DOTALL)
 
     if match:
         code = match.group(1).strip()
-        return ParseResult(action=code, reward=0.05, obs=None)  # Small bonus for proper formatting
+        return ParseResult(
+            action=code, reward=0.05, obs=None
+        )  # Small bonus for proper formatting
 
-    # Fall back to raw text (strip leading/trailing whitespace)
-    code = raw.strip()
-    if code:
-        return ParseResult(action=code, reward=0.0, obs=None)
-
-    # Empty response
+    # Empty response if no code block found
     return ParseResult(action=None, reward=-0.1, obs="Please provide Python code.")
 
 
@@ -131,13 +156,15 @@ def load_apps_samples(
         if row.get("is_nondeterministic", False):
             continue
 
-        samples.append({
-            "problem_id": row.get("problem_id", str(idx)),
-            "question": row["question"],
-            "inputs": row.get("inputs", []),
-            "outputs": row.get("outputs", []),
-            "difficulty": row.get("difficulty", "unknown"),
-        })
+        samples.append(
+            {
+                "problem_id": row.get("problem_id", str(idx)),
+                "question": row["question"],
+                "inputs": row.get("inputs", []),
+                "outputs": row.get("outputs", []),
+                "difficulty": row.get("difficulty", "unknown"),
+            }
+        )
 
         if limit is not None and len(samples) >= limit:
             break
@@ -145,15 +172,50 @@ def load_apps_samples(
     return samples
 
 
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Train on APPS code generation dataset")
+    parser = argparse.ArgumentParser(
+        description="Train on APPS code generation dataset with LoRA"
+    )
 
     # Model and inference
-    parser.add_argument("--model", default="Qwen/Qwen2.5-Coder-0.5B-Instruct")
+    parser.add_argument("--model", default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--host", default="127.0.0.1", help="vLLM server host")
     parser.add_argument("--port", type=int, default=8000, help="vLLM server port")
+    parser.add_argument(
+        "--max-prompt-tokens", type=int, default=1024, help="Max prompt tokens"
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=4096, help="Max new tokens"
+    )
+    parser.add_argument(
+        "--stop",
+        nargs="*",
+        default=None,
+        help="Stop sequences (e.g. --stop '```' '</answer>')",
+    )
+
+    # LoRA configuration
+    parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
+    parser.add_argument(
+        "--lora-alpha", type=int, default=32, help="LoRA alpha"
+    )
+    parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout")
+    parser.add_argument("--lora-use-rslora", action="store_true", help="Use RSLora")
+
+    # Attention configuration
+    parser.add_argument(
+        "--disable-flash-attn",
+        action="store_true",
+        help="Disable Flash Attention (fall back to SDPA)",
+    )
+
+    # KL regularization
+    parser.add_argument(
+        "--kl-coeff",
+        type=float,
+        default=0.0,
+        help="KL penalty coefficient (0 = disabled)",
+    )
 
     # Data
     parser.add_argument("--split", default="train", help="Dataset split")
@@ -161,33 +223,122 @@ def main():
     parser.add_argument("--difficulty", default=None, help="Filter by difficulty")
 
     # Sandbox
-    parser.add_argument("--sandbox-workers", type=int, default=4, help="Number of sandbox containers")
-    parser.add_argument("--sandbox-backend", default="auto",
-                        choices=["auto", "docker", "podman-hpc"],
-                        help="Sandbox backend (default: auto-detect)")
-    parser.add_argument("--python-version", default="3.11", help="Python version in sandbox")
-    parser.add_argument("--timeout-per-test", type=float, default=5.0, help="Timeout per test (seconds)")
+    parser.add_argument(
+        "--max-concurrent-ops",
+        type=int,
+        default=8,
+        help="Max concurrent sandbox operations (prevents deadlock in HPC environments)",
+    )
+    parser.add_argument(
+        "--sandbox-workers", type=int, default=4, help="Number of sandbox containers"
+    )
+    parser.add_argument(
+        "--sandbox-backend",
+        default="auto",
+        choices=["auto", "docker", "podman-hpc"],
+        help="Sandbox backend (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--python-version", default="3.11", help="Python version in sandbox"
+    )
+    parser.add_argument(
+        "--minimal-sandbox",
+        action="store_true",
+        help="Use minimal sandbox config (no memory/network limits) for HPC compatibility",
+    )
+    parser.add_argument(
+        "--timeout-per-test", type=float, default=2.0, help="Timeout per test (seconds)"
+    )
 
     # Training
-    parser.add_argument("--concurrency", type=int, default=32, help="Rollout concurrency")
-    parser.add_argument("--batch-size", type=int, default=4, help="Rollout requests per batch")
-    parser.add_argument("--train-steps", type=int, default=20, help="Training steps (0=run until exhausted)")
-    parser.add_argument("--group-size", type=int, default=4, help="GRPO group size")
-    parser.add_argument("--train-temperature", type=float, default=0.8, help="Sampling temperature")
-    parser.add_argument("--partial-credit", action="store_true", help="Enable partial credit rewards")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument(
+        "--concurrency", type=int, default=32, help="Rollout concurrency"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=4, help="Rollout requests per batch"
+    )
+    parser.add_argument(
+        "--train-steps",
+        type=int,
+        default=100,
+        help="Training steps (0=run until exhausted)",
+    )
+    parser.add_argument("--group-size", type=int, default=8, help="GRPO group size")
+    parser.add_argument(
+        "--train-temperature", type=float, default=0.8, help="Sampling temperature"
+    )
+    parser.add_argument(
+        "--partial-credit", action="store_true", help="Enable partial credit rewards"
+    )
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=2048,
+        help="Max tokens per sample (sequences are truncated to this)",
+    )
+    parser.add_argument(
+        "--micro-token-budget",
+        type=int,
+        default=16384,
+        help="Max padded tokens per micro-batch (replaces grad_accum_steps)",
+    )
 
-    # Logging and checkpoints
-    parser.add_argument("--rollout-log", default="apps_train_rollouts.jsonl")
+    # Evaluation
+    parser.add_argument(
+        "--eval-samples",
+        type=int,
+        default=200,
+        help="Number of samples to hold out for eval",
+    )
+    parser.add_argument(
+        "--eval-every", type=int, default=25, help="Eval every N training steps"
+    )
+    parser.add_argument(
+        "--eval-before-start",
+        action="store_true",
+        default=True,
+        help="Run baseline eval",
+    )
+    parser.add_argument(
+        "--eval-concurrency", type=int, default=32, help="Eval concurrency"
+    )
+    parser.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=0.5,
+        help="Eval sampling temperature",
+    )
+
+    # Logging
+    parser.add_argument(
+        "--wandb", action="store_true", help="Enable Weights & Biases logging"
+    )
+    parser.add_argument(
+        "--wandb-project", type=str, default="ludic-apps", help="WandB project name"
+    )
+
+    # Checkpoints
+    parser.add_argument("--rollout-log", default="data/apps_train_rollouts.jsonl")
     parser.add_argument("--checkpoint-dir", default="checkpoints_apps")
     parser.add_argument("--checkpoint-every", type=int, default=25)
+    parser.add_argument(
+        "--final-save", action="store_true", help="Save final checkpoint after training"
+    )
 
     args = parser.parse_args()
 
     # Warn about concurrency/pool mismatch
     if args.concurrency > args.sandbox_workers:
-        print(f"WARNING: concurrency ({args.concurrency}) > sandbox-workers ({args.sandbox_workers})")
-        print(f"  This means {args.concurrency - args.sandbox_workers} tasks will wait for sandboxes.")
-        print(f"  Consider: --sandbox-workers={args.concurrency} OR --concurrency={args.sandbox_workers}")
+        print(
+            f"WARNING: concurrency ({args.concurrency}) > sandbox-workers ({args.sandbox_workers})"
+        )
+        print(
+            f"  This means {args.concurrency - args.sandbox_workers} tasks will wait for sandboxes."
+        )
+        print(
+            f"  Consider: --sandbox-workers={args.concurrency} OR --concurrency={args.sandbox_workers}"
+        )
         print()
 
     # Setup rollout log
@@ -195,38 +346,121 @@ def main():
     os.makedirs(os.path.dirname(rollout_log_path) or ".", exist_ok=True)
     open(rollout_log_path, "a", encoding="utf-8").close()
 
-    # Load data
+    # Load tokenizer early (needed for prompt length filtering)
+    print(f"Loading tokenizer: {args.model}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Load data and split into train/eval sets
     print(f"Loading APPS samples (split={args.split}, limit={args.limit})...")
-    train_samples = load_apps_samples(args.split, args.limit, args.difficulty)
-    if not train_samples:
+    all_samples = load_apps_samples(args.split, args.limit, args.difficulty)
+    if not all_samples:
         print("ERROR: No APPS samples loaded.")
         return 1
-    print(f"Loaded {len(train_samples)} samples.")
+
+    # Filter out samples with prompts that exceed max_prompt_tokens
+    # This ensures max_new_tokens can fit within the model's context window
+    def prompt_fits(sample: Dict[str, Any]) -> bool:
+        messages = [
+            {"role": "system", "content": APPS_SYSTEM_PROMPT},
+            {"role": "user", "content": sample["question"]},
+        ]
+        token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        return len(token_ids) <= args.max_prompt_tokens
+
+    pre_filter_count = len(all_samples)
+    all_samples = [s for s in all_samples if prompt_fits(s)]
+    filtered_count = pre_filter_count - len(all_samples)
+    if filtered_count > 0:
+        print(
+            f"Filtered {filtered_count} samples exceeding {args.max_prompt_tokens} prompt tokens."
+        )
+
+    if not all_samples:
+        print(
+            "ERROR: All samples filtered out by prompt length. Increase --max-prompt-tokens."
+        )
+        return 1
+
+    # Split: last N samples for eval (deterministic, reproducible)
+    if args.eval_samples > 0 and len(all_samples) > args.eval_samples:
+        train_samples = all_samples[: -args.eval_samples]
+        eval_samples = all_samples[-args.eval_samples :]
+    else:
+        train_samples = all_samples
+        eval_samples = []
+
+    print(f"Loaded {len(all_samples)} total samples (after filtering).")
+    print(f"  Train: {len(train_samples)} samples")
+    print(f"  Eval:  {len(eval_samples)} samples (held out)")
 
     samples_q: queue.Queue = queue.Queue()
     for idx, s in enumerate(train_samples):
         samples_q.put((idx, s))
 
-    # Tokenizer + model
+    # Load model with LoRA
     print(f"Loading model: {args.model}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16)
+
+    # Configure Flash Attention (auto-detects optimal implementation)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    attn_impl = configure_flash_attention(device, disable_flash_attn=args.disable_flash_attn)
+    log_hardware_info()
+    print(f"Attention implementation: {attn_impl}")
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation=attn_impl,
+    )
+
+    # Apply LoRA adapter
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        use_rslora=False,
+        bias="none",
+        # target_modules="all-linear",
+        target_modules=[
+            "q_proj",  # Attention: Query projection
+            "k_proj",  # Attention: Key projection
+            "v_proj",  # Attention: Value projection
+            "o_proj",  # Attention: Output projection
+            "gate_proj",  # MLP: Gating projection
+            "up_proj",  # MLP: Up projection
+            "down_proj",  # MLP: Down projection
+        ],
+    )
+    model = get_peft_model(base_model, lora_config)
     model.to(device)
-    print(f"Model loaded on {device}.")
+    model.print_trainable_parameters()
+    print(
+        f"Model loaded on {device} with LoRA (rank={args.lora_rank}, alpha={args.lora_alpha})."
+    )
 
     # Setup sandbox pool
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # Build backend kwargs (minimal mode skips memory/network limits for HPC compatibility)
+    backend_kwargs = {}
+    if args.minimal_sandbox:
+        backend_kwargs["memory_limit"] = None
+        backend_kwargs["network_disabled"] = False
+
     try:
         sandbox_pool = loop.run_until_complete(
             create_sandbox_pool(
                 n_workers=args.sandbox_workers,
                 backend=args.sandbox_backend,
                 python_version=args.python_version,
+                max_concurrent_ops=args.max_concurrent_ops,
                 cache_size=10000,
+                **backend_kwargs,
             )
         )
     except RuntimeError as e:
@@ -237,7 +471,7 @@ def main():
     test_adapter = APPSTestAdapter()
     env_config = CodeExecConfig(
         timeout_per_test_s=args.timeout_per_test,
-        stop_on_first_failure=True,
+        stop_on_first_failure=False,
         compile_first=True,
         partial_credit=args.partial_credit,
         compile_failure_reward=-0.1,
@@ -272,14 +506,16 @@ def main():
 
     protocol_registry = {"single_agent": protocol_factory}
 
-    # Algorithm (GRPO with group-relative advantages)
-    algo = make_grpo(
-        name="grpo",
+    # Algorithm (CISPO - better for reasoning tokens)
+    algo = make_cispo(
         group_size=args.group_size,
         group_normalize_adv=True,
-        clip_eps=0.1,
+        clip_eps_high=0.2,
         length_normalize=True,
+        kl_coeff=args.kl_coeff,
     )
+    print("Using CISPO algorithm (better for reasoning/self-correction tokens)")
+    print(f"KL coefficient: {args.kl_coeff}")
 
     # Engine + batch source
     engine = RolloutEngine(
@@ -289,7 +525,11 @@ def main():
     )
 
     train_inference = InferenceSpec(
-        sampling=SamplingParams(temperature=args.train_temperature, max_tokens=1024),
+        sampling=SamplingParams(
+            temperature=args.train_temperature,
+            max_tokens=args.max_new_tokens,
+            stop=args.stop,
+        ),
         return_=ReturnSpec.for_rl(top_logprobs_k=1),
     )
 
@@ -318,12 +558,22 @@ def main():
         concurrency=args.concurrency,
     )
 
-    # Trainer config
+    # Trainer config with eval settings
     cfg = TrainerConfig(
         model_device=device,
-        grad_accum_steps=8,
-        max_grad_norm=0.5,
+        lr=args.lr,
+        max_seq_len=args.max_seq_len,
+        micro_token_budget=args.micro_token_budget,
+        max_grad_norm=0.1,
         pad_token_id=tokenizer.pad_token_id,
+        eval_at_start=bool(args.eval_before_start and eval_samples),
+        eval_every_n_steps=(
+            args.eval_every
+            if args.eval_every and args.eval_every > 0 and eval_samples
+            else None
+        ),
+        eval_concurrency=args.eval_concurrency,
+        eval_max_steps=1,
     )
 
     checkpoint_cfg = CheckpointConfig(
@@ -333,6 +583,7 @@ def main():
         save_optimizer=True,
     )
 
+    # Training reducers
     reducers = {
         "all_passed_rate": Reducer(
             kind="count_true",
@@ -357,24 +608,113 @@ def main():
             kind="sum",
             source="completion_length",
         ),
+        **default_reducers(),
     }
 
-    train_logger = RichLiveLogger(
-        keys=[
-            "loss",
-            "avg_total_reward",
-            "all_passed_rate",
-            "compile_fail_rate",
-            "avg_pass_rate",
-            "parse_err_rate",
-            "avg_completion_length",
-            "num_rollouts",
-            "num_samples",
-        ],
-        spark_key="avg_total_reward",
-        history=100,
-        precision=4,
+    # Eval reducers (for held-out samples)
+    eval_reducers = {
+        "all_passed_rate": Reducer(
+            kind="count_true",
+            source="all_passed",
+            normalize_by="rollouts",
+            as_percent=True,
+        ),
+        "compile_fail_rate": Reducer(
+            kind="count_true",
+            source="compile_failed",
+            normalize_by="rollouts",
+            as_percent=True,
+        ),
+        "avg_pass_rate": Reducer(
+            kind="mean",
+            source="pass_rate",
+        ),
+        "parse_error_rate": Reducer(
+            kind="count_true",
+            source="parse_error",
+            normalize_by="samples",
+            as_percent=True,
+        ),
+        "avg_completion_tokens": Reducer(
+            kind="mean",
+            source="completion_length",
+        ),
+    }
+
+    # Logging metrics to track
+    log_keys = [
+        # Core training
+        "train/loss",
+        "train/avg_total_reward",
+        # APPS-specific
+        "train/all_passed_rate",
+        "train/compile_fail_rate",
+        "train/avg_pass_rate",
+        "train/parse_err_rate",
+        "train/avg_completion_length",
+        # Eval metrics
+        "eval/all_passed_rate",
+        "eval/compile_fail_rate",
+        "eval/avg_pass_rate",
+        "eval/parse_error_rate",
+        "eval/avg_completion_tokens",
+        # Counts
+        "train/target_rollouts",
+        "train/num_samples",
+    ]
+
+    # Configure logger (WandB or RichLive terminal dashboard)
+    if args.wandb:
+        train_logger = WandbLogger(project=args.wandb_project, config=dict(vars(args)))
+        print(f"WandB logging enabled: project={args.wandb_project}")
+    else:
+        train_logger = RichLiveLogger(
+            keys=log_keys,
+            spark_key="avg_total_reward",
+            history=100,
+            precision=4,
+        )
+
+    # Create EngineEvaluator for eval set
+    eval_inference = InferenceSpec(
+        sampling=SamplingParams(
+            temperature=args.eval_temperature,
+            max_tokens=args.max_new_tokens,
+            stop=args.stop,
+        ),
+        return_=ReturnSpec.for_eval(return_token_ids=True),
     )
+
+    evaluator = None
+    if eval_samples:
+        evaluator = EngineEvaluator(
+            engine=RolloutEngine(
+                env_registry=env_registry, protocol_registry=protocol_registry
+            ),
+            requests_fn=lambda: [
+                RolloutRequest(
+                    env=EnvSpec(kind="apps", kwargs={"sample": sample}),
+                    protocol=ProtocolSpec(kind="single_agent"),
+                    env_seed=idx,
+                    sampling_seed=idx,
+                    inference=eval_inference,
+                    num_episodes=1,
+                    meta={
+                        "eval_idx": idx,
+                        "problem_id": sample.get("problem_id", idx),
+                        "difficulty": sample.get("difficulty", "unknown"),
+                    },
+                )
+                for idx, sample in enumerate(eval_samples)
+            ],
+            reducers=eval_reducers,
+            max_steps=1,
+            timeout_s=cfg.eval_timeout_s,
+            concurrency=cfg.eval_concurrency,
+        )
+        print(
+            f"Eval configured: {len(eval_samples)} samples, every {args.eval_every} steps"
+        )
 
     trainer = Trainer(
         model=model,
@@ -386,6 +726,7 @@ def main():
         checkpoint_config=checkpoint_cfg,
         train_logger=train_logger,
         reducers=reducers,
+        evaluator=evaluator,
     )
 
     print(f"\nStarting training for {args.train_steps} steps...")
@@ -398,7 +739,7 @@ def main():
     print()
 
     try:
-        trainer.train_sync(args.train_steps)
+        loop.run_until_complete(trainer.train(args.train_steps))
     except RequestsExhausted:
         print("Training samples exhausted; stopping.")
     except KeyboardInterrupt:
@@ -408,6 +749,19 @@ def main():
         print("Shutting down sandbox pool...")
         loop.run_until_complete(sandbox_pool.shutdown())
         loop.close()
+
+    # Save final checkpoint if requested
+    if args.final_save:
+        try:
+            ckpt_path = trainer.save_checkpoint(metadata={"final": True})
+            print(f"Final checkpoint saved: {ckpt_path}")
+        except RuntimeError:
+            pass  # No checkpointer configured
+
+    # Close WandB if used
+    if args.wandb:
+        train_logger.close()
+        print("WandB run finished.")
 
     print("Training complete.")
     return 0
