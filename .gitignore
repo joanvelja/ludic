@@ -30,3 +30,9 @@ data/
 .env
 .env.*
 .DS_Store
+
+# HPC specific files
+examples/code_exec/hpc/
+
+# personal research directory
+research/
