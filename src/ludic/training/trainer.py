@@ -578,7 +578,7 @@ class Trainer:
                 loss, stats = self.algo.compute_loss(
                     self.model,
                     batch_tensors,
-                    cast_logits_to_fp32=self.config.cast_logits_to_fp32,
+                    cast_logits_to_fp32=self.cfg.cast_logits_to_fp32,
                 )
 
                 # Scale loss by micro-batch size to preserve macro-batch mean.

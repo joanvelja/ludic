@@ -336,7 +336,7 @@ async def main():
         protocol_registry={"single": protocol_factory},
     )
 
-    algo = make_cispo(group_size=8, clip_eps_high=0.2, length_normalize=True)
+    algo = make_cispo(group_size=8, clip_eps_high=5.0, length_normalize=True)
 
     batch_source = RolloutBatchSource(
         orchestrator=engine,

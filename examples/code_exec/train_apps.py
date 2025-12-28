@@ -82,6 +82,7 @@ from ludic.training import (
 )
 from ludic.training import Reducer, RichLiveLogger, default_reducers
 from ludic.training.loggers import WandbLogger
+from ludic.training.hardware import configure_flash_attention, log_hardware_info
 
 # Import CodeExecEnv components
 from ludic.envs.code_exec import (
@@ -196,9 +197,17 @@ def main():
     # LoRA configuration
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA rank")
     parser.add_argument(
-        "--lora-alpha-mult", type=float, default=2.0, help="LoRA alpha = rank * mult"
+        "--lora-alpha", type=int, default=32, help="LoRA alpha"
     )
     parser.add_argument("--lora-dropout", type=float, default=0.0, help="LoRA dropout")
+    parser.add_argument("--lora-use-rslora", action="store_true", help="Use RSLora")
+
+    # Attention configuration
+    parser.add_argument(
+        "--disable-flash-attn",
+        action="store_true",
+        help="Disable Flash Attention (fall back to SDPA)",
+    )
 
     # KL regularization
     parser.add_argument(
@@ -238,10 +247,11 @@ def main():
         help="Use minimal sandbox config (no memory/network limits) for HPC compatibility",
     )
     parser.add_argument(
-        "--timeout-per-test", type=float, default=1.0, help="Timeout per test (seconds)"
+        "--timeout-per-test", type=float, default=2.0, help="Timeout per test (seconds)"
     )
 
     # Training
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument(
         "--concurrency", type=int, default=32, help="Rollout concurrency"
     )
@@ -296,8 +306,8 @@ def main():
     parser.add_argument(
         "--eval-temperature",
         type=float,
-        default=0.0,
-        help="Eval sampling temperature (greedy)",
+        default=0.5,
+        help="Eval sampling temperature",
     )
 
     # Logging
@@ -392,10 +402,17 @@ def main():
     # Load model with LoRA
     print(f"Loading model: {args.model}")
 
+    # Configure Flash Attention (auto-detects optimal implementation)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    attn_impl = configure_flash_attention(device, disable_flash_attn=args.disable_flash_attn)
+    log_hardware_info()
+    print(f"Attention implementation: {attn_impl}")
+
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
+        attn_implementation=attn_impl,
     )
 
     # Apply LoRA adapter
@@ -403,18 +420,26 @@ def main():
         task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
         r=args.lora_rank,
-        lora_alpha=int(args.lora_rank * args.lora_alpha_mult),
+        lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        use_rslora=False,
         bias="none",
-        target_modules="all-linear",
+        # target_modules="all-linear",
+        target_modules=[
+            "q_proj",  # Attention: Query projection
+            "k_proj",  # Attention: Key projection
+            "v_proj",  # Attention: Value projection
+            "o_proj",  # Attention: Output projection
+            "gate_proj",  # MLP: Gating projection
+            "up_proj",  # MLP: Up projection
+            "down_proj",  # MLP: Down projection
+        ],
     )
     model = get_peft_model(base_model, lora_config)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     model.print_trainable_parameters()
     print(
-        f"Model loaded on {device} with LoRA (rank={args.lora_rank}, alpha={int(args.lora_rank * args.lora_alpha_mult)})."
+        f"Model loaded on {device} with LoRA (rank={args.lora_rank}, alpha={args.lora_alpha})."
     )
 
     # Setup sandbox pool
@@ -487,8 +512,10 @@ def main():
         group_normalize_adv=True,
         clip_eps_high=0.2,
         length_normalize=True,
+        kl_coeff=args.kl_coeff,
     )
     print("Using CISPO algorithm (better for reasoning/self-correction tokens)")
+    print(f"KL coefficient: {args.kl_coeff}")
 
     # Engine + batch source
     engine = RolloutEngine(
@@ -534,7 +561,7 @@ def main():
     # Trainer config with eval settings
     cfg = TrainerConfig(
         model_device=device,
-        lr=1e-5,
+        lr=args.lr,
         max_seq_len=args.max_seq_len,
         micro_token_budget=args.micro_token_budget,
         max_grad_norm=0.1,

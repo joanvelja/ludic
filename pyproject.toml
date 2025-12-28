@@ -25,6 +25,8 @@ dependencies = [
     "torch-c-dlpack-ext>=0.1.4",
     "vllm>=0.12.0; sys_platform == 'linux'",
     "wandb>=0.23.1",
+    # Flash Attention for efficient attention computation (Linux-only, requires CUDA)
+    "flash-attn>=2.7.0; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -79,6 +81,17 @@ testpaths = ["tests"]
 # =============================================================================
 
 [tool.uv]
+# Flash Attention build configuration:
+# - Disable build isolation so torch is available during compilation
+# - Declare build-time dependencies explicitly
+# - Set MAX_JOBS for parallel compilation
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch", "packaging", "ninja"]
+
+[tool.uv.extra-build-variables]
+flash-attn = { MAX_JOBS = "16" }
 
 # Platform-based torch source selection:
 # - Linux: Use CUDA 12.8 wheels (supports both x86_64 and aarch64)

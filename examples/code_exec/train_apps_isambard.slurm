@@ -3,6 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --gpus=2
 #SBATCH --time=01:00:00
+#SBATCH --exclude=nid010435
 
 # Logging directory tree:
 #   logs/
@@ -89,24 +90,61 @@ set -e
 #   - Linux: CUDA 12.8 wheels from pytorch-cu128 index
 #   - macOS/Windows: CPU wheels from pytorch-cpu index
 # -----------------------------------------------------------------------------
+# HuggingFace cache on Lustre (high-quota storage)
+export HF_HOME="${SCRATCH}/.cache/huggingface"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+mkdir -p "$HF_HOME"
+
+# CUDA environment for flash-attn compilation
+# This job has GPUs allocated, so CUDA toolkit should be available.
+# Load nvidia module to get nvcc in PATH.
+echo "Setting up CUDA environment for flash-attn build..."
+module load nvidia 2>/dev/null || true
+
+# Find CUDA_HOME from nvcc or known HPC paths
+if command -v nvcc &> /dev/null; then
+    export CUDA_HOME="$(dirname $(dirname $(which nvcc)))"
+    echo "CUDA_HOME set from nvcc: $CUDA_HOME"
+elif [ -d "/opt/nvidia/hpc_sdk" ]; then
+    # NVIDIA HPC SDK on aarch64 (common on GH200)
+    CUDA_HOME=$(ls -d /opt/nvidia/hpc_sdk/Linux_aarch64/*/cuda/12* 2>/dev/null | tail -1)
+    if [ -n "$CUDA_HOME" ]; then
+        export CUDA_HOME
+        export PATH="$CUDA_HOME/bin:$PATH"
+        echo "CUDA_HOME set from HPC SDK: $CUDA_HOME"
+    fi
+elif [ -d "/usr/local/cuda" ]; then
+    export CUDA_HOME="/usr/local/cuda"
+    echo "CUDA_HOME set to: $CUDA_HOME"
+fi
+
+if [ -z "$CUDA_HOME" ]; then
+    echo "WARNING: Could not find CUDA toolkit. Flash-attn may fail to build."
+    echo "Available module options:"
+    module avail 2>&1 | grep -i cuda || true
+fi
+
 echo "Syncing Python environment..."
 uv python install 3.12
-uv sync
+uv sync --preview-features extra-build-dependencies
 
 # -----------------------------------------------------------------------------
 # Configuration (override via environment variables)
 # -----------------------------------------------------------------------------
-MODEL="${MODEL:-Qwen/Qwen2.5-3B-Instruct}"
-LIMIT="${LIMIT:-310}"
-EVAL_SAMPLES="${EVAL_SAMPLES:-1}"
-TRAIN_STEPS="${TRAIN_STEPS:-300}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
-GROUP_SIZE="${GROUP_SIZE:-4}"
-MAX_CONCURRENT_OPS="${MAX_CONCURRENT_OPS:-16}"
-SANDBOX_WORKERS="${SANDBOX_WORKERS:-32}"
-CONCURRENCY="${CONCURRENCY:-32}"
+MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
+LIMIT="${LIMIT:-2000}"
+EVAL_SAMPLES="${EVAL_SAMPLES:-100}"
+TRAIN_STEPS="${TRAIN_STEPS:-2000}"
+LR="${LR:-1e-5}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+GROUP_SIZE="${GROUP_SIZE:-8}"
+MAX_CONCURRENT_OPS="${MAX_CONCURRENT_OPS:-32}"
+SANDBOX_WORKERS="${SANDBOX_WORKERS:-48}"
+CONCURRENCY="${CONCURRENCY:-48}"
 LORA_RANK="${LORA_RANK:-8}"
-KL_COEFF="${KL_COEFF:-0.0}"
+LORA_ALPHA="${LORA_ALPHA:-32}"
+USE_RSLORA="${USE_RSLORA:-0}"
+KL_COEFF="${KL_COEFF:-0.01}"
 USE_WANDB="${USE_WANDB:-1}"
 WANDB_PROJECT="${WANDB_PROJECT:-ludic-apps}"
 VLLM_PORT="${VLLM_PORT:-8000}"
@@ -136,9 +174,12 @@ echo "Configuration:"
 echo "  Model: $MODEL"
 echo "  Samples: $LIMIT (train) + $EVAL_SAMPLES (eval)"
 echo "  Train steps: $TRAIN_STEPS"
+echo "  Learning rate: $LR"
 echo "  Batch size: $BATCH_SIZE"
 echo "  Group size: $GROUP_SIZE"
 echo "  LoRA rank: $LORA_RANK"
+echo "  LoRA alpha: $LORA_ALPHA"
+echo "  Use RSLORA: $([ "$USE_RSLORA" = "1" ] && echo "enabled" || echo "disabled")"
 echo "  KL coefficient: $KL_COEFF"
 echo "  Max concurrent ops: $MAX_CONCURRENT_OPS"
 echo "  Sandbox workers: $SANDBOX_WORKERS"
@@ -207,6 +248,7 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null
 # Assign GPUs: GPU 0 for vLLM, GPU 1 for training
 export VLLM_GPU=0
 export TRAIN_GPU=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 echo ""
 echo "GPU assignment:"
@@ -289,6 +331,7 @@ TRAIN_CMD="$TRAIN_CMD --limit $LIMIT"
 TRAIN_CMD="$TRAIN_CMD --difficulty introductory"
 TRAIN_CMD="$TRAIN_CMD --eval-samples $EVAL_SAMPLES"
 TRAIN_CMD="$TRAIN_CMD --train-steps $TRAIN_STEPS"
+TRAIN_CMD="$TRAIN_CMD --lr $LR"
 TRAIN_CMD="$TRAIN_CMD --batch-size $BATCH_SIZE"
 TRAIN_CMD="$TRAIN_CMD --group-size $GROUP_SIZE"
 TRAIN_CMD="$TRAIN_CMD --sandbox-workers $SANDBOX_WORKERS"
@@ -297,7 +340,8 @@ TRAIN_CMD="$TRAIN_CMD --minimal-sandbox"
 TRAIN_CMD="$TRAIN_CMD --concurrency $CONCURRENCY"
 TRAIN_CMD="$TRAIN_CMD --max-concurrent-ops $MAX_CONCURRENT_OPS"
 TRAIN_CMD="$TRAIN_CMD --lora-rank $LORA_RANK"
-TRAIN_CMD="$TRAIN_CMD --eval-every 25"
+TRAIN_CMD="$TRAIN_CMD --lora-alpha $LORA_ALPHA"
+TRAIN_CMD="$TRAIN_CMD --eval-every 10"
 TRAIN_CMD="$TRAIN_CMD --eval-before-start"
 TRAIN_CMD="$TRAIN_CMD --final-save"
 TRAIN_CMD="$TRAIN_CMD --max-prompt-tokens $MAX_PROMPT_TOKENS"
@@ -314,6 +358,11 @@ fi
 # Add KL coefficient if non-zero
 if [ "$KL_COEFF" != "0.0" ] && [ "$KL_COEFF" != "0" ]; then
     TRAIN_CMD="$TRAIN_CMD --kl-coeff $KL_COEFF"
+fi
+
+# Add RSLora if enabled
+if [ "$USE_RSLORA" = "1" ]; then
+    TRAIN_CMD="$TRAIN_CMD --lora-use-rslora"
 fi
 
 # Add WandB if enabled
