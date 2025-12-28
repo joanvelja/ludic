@@ -33,7 +33,7 @@ from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, Retur
 from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.types import Rollout
+from ludic.types import Rollout, EnvironmentStep, AgentStep
 
 from environments.tic_tac_toe import TicTacToeEnv
 
@@ -56,16 +56,15 @@ def build_system_prompt() -> str:
 
 def get_result(r: Rollout) -> str | None:
     """Get the game result from the final step's info."""
-    if not r.steps:
+    env_steps = [s for s in r.steps if isinstance(s, EnvironmentStep)]
+    if not env_steps:
         return None
-    return r.steps[-1].info.get("result")
+    return env_steps[-1].info.get("result")
 
 
 def is_win(r: Rollout) -> bool:
     """Check if rollout ended in a win."""
     return get_result(r) == "win"
-
-
 STRICT_THINK_PATTERN = re.compile(
     r"^(\s*<think>)(.*?)(</think>\s*)(.+)$",
     flags=re.DOTALL | re.IGNORECASE,
@@ -132,15 +131,26 @@ def apply_prompt_format(
     if system_prompt:
         history.append({"role": "system", "content": system_prompt})
 
-    for s in rollout.steps:
-        full_messages: List[dict[str, str]] = list(history)
-        # Ensure current observation is present as the latest user turn
-        if (
-            not full_messages
-            or full_messages[-1].get("role") != "user"
-            or full_messages[-1].get("content") != s.prev_obs
-        ):
-            full_messages.append({"role": "user", "content": s.prev_obs})
+    agent_steps = {s.id: s for s in rollout.steps if isinstance(s, AgentStep)}
+    env_steps = [s for s in rollout.steps if isinstance(s, EnvironmentStep)]
+    for s in env_steps:
+        source_agent = agent_steps.get(s.source_agent_step_id)
+        used_agent_prompt = False
+        if source_agent and source_agent.prompt_messages:
+            full_messages = list(source_agent.prompt_messages)
+            used_agent_prompt = True
+            if system_prompt and not any(msg.get("role") == "system" for msg in full_messages):
+                full_messages = [{"role": "system", "content": system_prompt}] + full_messages
+        else:
+            full_messages = list(history)
+        if not used_agent_prompt:
+            # Ensure current observation is present as the latest user turn
+            if (
+                not full_messages
+                or full_messages[-1].get("role") != "user"
+                or full_messages[-1].get("content") != s.prev_obs
+            ):
+                full_messages.append({"role": "user", "content": s.prev_obs})
 
         include_step = True
         if min_completion_tokens > 0 or max_completion_tokens > 0:
@@ -167,19 +177,28 @@ def apply_prompt_format(
             prompt_text = _messages_to_prompt(chat_messages)
 
             step_dict: Dict[str, Any] = {
+                "id": s.id,
                 "index": s.index,
+                "kind": s.kind,
                 "prev_obs": prompt_text,
                 "action": s.action,
+                "parsed_action": s.parsed_action,
+                "next_obs": s.next_obs,
+                "source_agent_step_id": s.source_agent_step_id,
+                "agent_step_ids": s.agent_step_ids,
                 "reward": s.reward,
+                "reward_components": s.reward_components,
                 "truncated": s.truncated,
                 "terminated": s.terminated,
+                "trace": s.trace.to_dict(),
             }
             if not lean:
                 step_dict.update(
                     {
-                        "next_obs": s.next_obs,
                         "info": s.info,
                         "ts_ns": s.ts_ns,
+                        "turn_id": s.turn_id,
+                        "parent_id": s.parent_id,
                     }
                 )
             else:
@@ -207,7 +226,7 @@ def apply_prompt_format(
             {
                 "meta": rollout.meta,
                 "total_reward": rollout.total_reward,
-                "length": rollout.length,
+                "length": len(steps),
                 "duration_ns": rollout.duration_ns,
             }
         )

@@ -26,6 +26,11 @@ class MockChatTemplate(ChatTemplate):
     """
     A mock ChatTemplate that returns predictable token IDs.
     Used for testing the token-in API without requiring a real tokenizer.
+
+    Token generation uses character-based encoding to simulate real tokenization:
+    - Each character maps to a consistent token ID
+    - The prompt grows as messages are added
+    - This enables turn concatenation tests to work correctly
     """
 
     def __init__(self, tool_parser: Optional[ToolParser] = None) -> None:
@@ -50,10 +55,16 @@ class MockChatTemplate(ChatTemplate):
             text_parts.append(f"[{msg.get('role', 'unknown')}]")
             if msg.get("content"):
                 text_parts.append(str(msg["content"]))
+            # Include tool_calls content if present
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    if isinstance(tc, dict):
+                        text_parts.append(str(tc.get("function", {}).get("name", "")))
         prompt_text = " ".join(text_parts)
 
-        # Simple mock: each character becomes a token ID
-        prompt_token_ids = [ord(c) % 1000 for c in prompt_text[:50]]
+        # Simple mock: each character becomes a deterministic token ID
+        # Same character = same token ID, enabling proper turn concatenation
+        prompt_token_ids = [(ord(c) % 500) + 1 for c in prompt_text]
 
         return TemplateResult(
             prompt_token_ids=prompt_token_ids,
@@ -77,6 +88,15 @@ def calculator_tool(a: int, b: int) -> int:
     """Adds two numbers."""
     return a + b
 
+
+def mock_tokenize(text: str) -> List[int]:
+    """
+    Convert text to token IDs matching MockChatTemplate's tokenization.
+    Same character = same token ID, enabling proper turn concatenation.
+    """
+    return [(ord(c) % 500) + 1 for c in text]
+
+
 # ---- Mock client ---------------------------------------------------------
 
 class MockClient(ChatClient):
@@ -95,11 +115,13 @@ class MockClient(ChatClient):
         request: TokenCompletionRequest,
     ) -> tuple[ChatResponse, Dict[str, Any]]:
         """Token-in API: complete from pre-tokenized prompt."""
+        # Use consistent tokenization matching MockChatTemplate
+        completion_token_ids = mock_tokenize(self._text)
         resp = ChatResponse(
             text=self._text,
             finish_reason=self._finish_reason,
             prompt_token_ids=request.prompt_token_ids,
-            completion_token_ids=[100, 101, 102],  # Mock completion tokens
+            completion_token_ids=completion_token_ids,
         )
         return resp, {"mode": "token_in", "prompt_text": request.prompt_text}
 

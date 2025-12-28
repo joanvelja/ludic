@@ -65,11 +65,12 @@ async def test_tool_agent_helpers_and_execution():
             },
         }
     ]
-    agent._run_tool_calls(tool_calls_payload)
+    results = agent._run_tool_calls(tool_calls_payload)
 
     assert ctx.messages[-1]["role"] == "tool"
     assert ctx.messages[-1]["content"] == "5"
     assert ctx.messages[-1]["tool_call_id"] == "call_1"
+    assert results[0]["tool_name"] == "calculator_tool"
 
 
 @pytest.mark.asyncio

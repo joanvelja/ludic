@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import pytest
 from typing import Any, List, Dict, Optional, Tuple
 
@@ -103,7 +104,10 @@ async def test_react_agent_happy_path_single_tool():
         chat_template=chat_template,
     )
 
-    parse_result, raw_text, _, _ = await agent.act()
+    act_result = await agent.act()
+    final_step = act_result.final_step
+    parse_result = final_step.parse_result
+    raw_text = final_step.action
 
     # Assert Final Output
     assert parse_result.action == "4"
@@ -118,6 +122,46 @@ async def test_react_agent_happy_path_single_tool():
     assert len(tool_msg) == 1
     assert tool_msg[0]["content"] == "4"
     assert tool_msg[0]["tool_call_id"] == "call_0"
+
+
+@pytest.mark.asyncio
+async def test_react_agent_records_internal_steps():
+    """Test that ReActAgent records internal tool call steps separately from final answer."""
+    # Step 1: Tool call in Hermes format
+    step_1 = (
+        "Calling tool.\n"
+        "<tool_call>\n"
+        '{"name": "calculator_tool", "arguments": {"a": 2, "b": 3}}\n'
+        "</tool_call>"
+    )
+    # Step 2: Final answer
+    step_2 = "Final <move>5</move>"
+
+    client = ReplayMockClient([step_1, step_2])
+    chat_template = MockChatTemplate(tool_parser=HermesToolParser())
+
+    agent = ReActAgent(
+        client=client,
+        model="mock",
+        ctx=FullDialog(),
+        parser=xml_tag_parser("move"),
+        tools=[calculator_tool],
+        chat_template=chat_template,
+        max_react_steps=2,
+    )
+
+    act_result = await agent.act()
+    assert len(act_result.steps) == 2
+
+    internal_step = act_result.steps[0]
+    final_step = act_result.steps[1]
+
+    assert internal_step.action_target == "internal"
+    assert internal_step.tool_calls is not None
+    assert internal_step.tool_results is not None
+    assert internal_step.tool_results[0]["content"] == "5"
+    assert final_step.action_target == "env"
+    assert final_step.parse_result.action == "5"
 
 
 @pytest.mark.asyncio
@@ -153,7 +197,8 @@ async def test_react_agent_shot_clock_fallback():
         max_react_steps=2,  # Strict limit
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
 
     # 1. Did it finish?
     assert result.action == "Sunny"
@@ -255,10 +300,11 @@ async def test_react_agent_records_bad_json_tool_arguments():
         max_react_steps=3,
     )
 
-    result, raw_text, info, _ = await agent.act()
-    assert result.action is None
-    assert info.get("tool_parse_error") is True
-    assert raw_text == step_1
+    act_result = await agent.act()
+    final_step = act_result.final_step
+    assert final_step.parse_result.action is None
+    assert final_step.info.get("tool_parse_error") is True
+    assert final_step.action == step_1
 
 
 @pytest.mark.asyncio
@@ -293,7 +339,8 @@ async def test_react_agent_records_tool_execution_exception():
         max_react_steps=3,
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
     assert result.action == "ok"
 
     ctx_messages = agent._ctx.messages
@@ -333,7 +380,8 @@ async def test_react_agent_handles_multiple_tool_calls_in_one_turn():
         max_react_steps=3,
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
     assert result.action == "4 and Sunny in NYC"
 
     ctx_messages = agent._ctx.messages
@@ -375,7 +423,8 @@ async def test_react_agent_multi_tool_calls_continue_on_error():
         max_react_steps=3,
     )
 
-    result, _, _, _ = await agent.act()
+    act_result = await agent.act()
+    result = act_result.final_step.parse_result
     assert result.action == "ok"
 
     ctx_messages = agent._ctx.messages
@@ -408,6 +457,167 @@ async def test_react_agent_no_tool_call_returns_immediately():
         chat_template=chat_template,
     )
 
-    result, raw_text, _, _ = await agent.act()
-    assert result.action == "42"
+    act_result = await agent.act()
+    assert act_result.final_step.parse_result.action == "42"
     assert client.call_count == 1  # Only one call needed
+
+
+# ---------------------------------------------------------------------
+# Env Tools Tests
+# ---------------------------------------------------------------------
+
+
+def move_tool(direction: str) -> str:
+    """Move in a direction (env tool - not executed by agent)."""
+    return f"moved {direction}"
+
+
+@pytest.mark.asyncio
+async def test_react_agent_env_tool_returns_immediately():
+    """
+    When an env tool is called, the agent should return immediately
+    with action_target='env' without executing the tool locally.
+    """
+    # Agent calls an env tool
+    step_1 = (
+        "I will move north.\n"
+        "<tool_call>\n"
+        '{"name": "move_tool", "arguments": {"direction": "north"}}\n'
+        "</tool_call>"
+    )
+
+    client = ReplayMockClient([step_1])
+    chat_template = MockChatTemplate(tool_parser=HermesToolParser())
+
+    agent = ReActAgent(
+        client=client,
+        model="mock",
+        ctx=FullDialog(),
+        parser=xml_tag_parser("move"),
+        tools=[calculator_tool],           # calculator is internal
+        external_tools=[move_tool],        # move is external (handled by protocol)
+        chat_template=chat_template,
+        max_react_steps=3,
+    )
+
+    act_result = await agent.act()
+
+    # Should return immediately with one step
+    assert len(act_result.steps) == 1
+    step = act_result.steps[0]
+
+    # Step should target external (protocol will handle)
+    assert step.action_target == "external"
+    assert step.tool_calls is not None
+    assert len(step.tool_calls) == 1
+    assert step.tool_calls[0]["function"]["name"] == "move_tool"
+
+    # Tool should NOT be executed (no tool_results for external tools)
+    assert step.tool_results is None
+
+    # External tool calls have parse_result=None - they're not final actions.
+    # The protocol handles them and feeds results back to the agent.
+    assert step.parse_result is None
+
+    # Only one inference call (no loop continuation)
+    assert client.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_react_agent_internal_tool_continues_loop():
+    """
+    Internal tools should be executed and the loop should continue.
+    """
+    # Step 1: Internal tool call (calculator)
+    step_1 = (
+        "Let me calculate.\n"
+        "<tool_call>\n"
+        '{"name": "calculator_tool", "arguments": {"a": 2, "b": 3}}\n'
+        "</tool_call>"
+    )
+    # Step 2: Final answer
+    step_2 = "The answer is <move>5</move>"
+
+    client = ReplayMockClient([step_1, step_2])
+    chat_template = MockChatTemplate(tool_parser=HermesToolParser())
+
+    agent = ReActAgent(
+        client=client,
+        model="mock",
+        ctx=FullDialog(),
+        parser=xml_tag_parser("move"),
+        tools=[calculator_tool],
+        external_tools=[move_tool],
+        chat_template=chat_template,
+        max_react_steps=3,
+    )
+
+    act_result = await agent.act()
+
+    # Should have two steps: internal tool + final answer
+    assert len(act_result.steps) == 2
+
+    # First step: internal tool (executed)
+    internal_step = act_result.steps[0]
+    assert internal_step.action_target == "internal"
+    assert internal_step.tool_calls is not None
+    assert internal_step.tool_results is not None
+    assert internal_step.tool_results[0]["content"] == "5"
+
+    # Second step: final answer to environment
+    final_step = act_result.steps[1]
+    assert final_step.action_target == "env"
+    assert final_step.parse_result is not None
+    assert final_step.parse_result.action == "5"
+
+    # Two inference calls
+    assert client.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_react_agent_mixed_tool_calls_executes_internal_first():
+    """
+    When both internal and env tools are called together,
+    internal tools should be executed but env tools should not.
+    """
+    # Agent calls both calculator (internal) and move (env) in one turn
+    step_1 = (
+        "Calculating and moving.\n"
+        "<tool_call>\n"
+        '{"name": "calculator_tool", "arguments": {"a": 1, "b": 1}}\n'
+        "</tool_call>\n"
+        "<tool_call>\n"
+        '{"name": "move_tool", "arguments": {"direction": "east"}}\n'
+        "</tool_call>"
+    )
+
+    client = ReplayMockClient([step_1])
+    chat_template = MockChatTemplate(tool_parser=HermesToolParser())
+
+    agent = ReActAgent(
+        client=client,
+        model="mock",
+        ctx=FullDialog(),
+        parser=xml_tag_parser("move"),
+        tools=[calculator_tool],
+        external_tools=[move_tool],
+        chat_template=chat_template,
+        max_react_steps=3,
+    )
+
+    act_result = await agent.act()
+
+    # Should return immediately (external tool present)
+    assert len(act_result.steps) == 1
+    step = act_result.steps[0]
+    assert step.action_target == "external"
+
+    # Both tool calls should be recorded
+    assert step.tool_calls is not None
+    assert len(step.tool_calls) == 2
+
+    # Only internal tool should have been executed
+    assert step.tool_results is not None
+    assert len(step.tool_results) == 1
+    assert step.tool_results[0]["tool_name"] == "calculator_tool"
+    assert step.tool_results[0]["content"] == "2"

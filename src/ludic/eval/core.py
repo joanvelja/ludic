@@ -4,7 +4,8 @@ Evaluation helpers built on RolloutEngine.
 This module is intentionally training-agnostic: it consumes RolloutEngine and
 RolloutRequests and produces reduced metrics over step-level eval items.
 
-Eval items are dicts shaped like training `SAWItem.meta` (one per step).
+Eval items are dicts shaped like training `SAWItem.meta` (eval uses env steps,
+while training batches concatenate full turns into one item).
 """
 
 from __future__ import annotations
@@ -21,11 +22,14 @@ def _eval_items_from_rollout(rollout: Rollout) -> List[Dict[str, Any]]:
     """
     Convert a rollout into eval "items" that match the training reducer mental model.
 
-    Each item is a dict that mirrors the structure of `SAWItem.meta` produced by
-    `RolloutEngine.generate_batch()`: one item per step, with rollout.meta merged.
+Each item is a dict that mirrors the structure of `SAWItem.meta` produced by
+`RolloutEngine.generate_batch()`: evaluation records only env steps, while
+training batches concatenate full turns into one item.
     """
     items: List[Dict[str, Any]] = []
     for step in rollout.steps:
+        if step.kind != "env":
+            continue
         info = step.info or {}
         trace = step.trace
         completion_ids = trace.completion_token_ids if trace is not None else []
@@ -35,12 +39,14 @@ def _eval_items_from_rollout(rollout: Rollout) -> List[Dict[str, Any]]:
             "rollout_id": rollout.id,
             "step_index": step.index,
             "reward": float(step.reward),
-            "prev_obs": step.prev_obs,
+            "prev_obs": step.prev_obs if hasattr(step, "prev_obs") else "",
             "action": step.action,
             "total_reward": float(rollout.total_reward),
             "completion_length": int(comp_len),
             "truncated": bool(step.truncated),
             "terminated": bool(step.terminated),
+            "step_kind": step.kind,
+            "turn_id": step.turn_id,
             **(rollout.meta),
         }
         meta.update(info)
