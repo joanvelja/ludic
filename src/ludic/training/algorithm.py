@@ -62,7 +62,7 @@ class RLAlgorithm:
         model: nn.Module,
         batch: Batch,
         *,
-        cast_logits_to_fp32: bool = False,
+        cast_logits_to_fp32: bool = True,
     ) -> tuple[Tensor, Dict[str, Any]]:
         """
         Runs the forward pass once and delegates to the Loss object.

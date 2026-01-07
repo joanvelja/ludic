@@ -449,7 +449,7 @@ def main():
         stop_on_first_failure=False,
         compile_first=True,
         partial_credit=args.partial_credit,
-        compile_failure_reward=-0.1,
+        compile_failure_reward=-0.5,
         use_cache=True,
     )
 
