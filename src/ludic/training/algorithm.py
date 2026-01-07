@@ -282,6 +282,63 @@ def make_grpo(
     )
 
 
+def make_dr_grpo(
+    *,
+    group_size: int,
+    positive_only: bool = False,
+    clip_eps_low: float = 0.2,
+    clip_eps_high: float = 0.27,
+    length_normalize: bool = False,
+    ratio_clip: Optional[float] = None,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "dr_grpo",
+) -> RLAlgorithm:
+    """
+    Dr. GRPO (GRPO Done Right): removes per-response length normalization and
+    per-group std normalization while keeping the GRPO-style clipped surrogate.
+
+      - Credit assignment: group-mean baseline only (no std normalization)
+      - Loss: token-level PPO-style clipped surrogate (Token-TIS)
+
+    This corresponds to the unbiased GRPO variant described in
+    "Understanding R1-Zero-Like Training: A Critical Perspective".
+
+    Args:
+        group_size: Number of rollouts per group.
+        positive_only: If True, clip negative advantages to zero.
+        clip_eps_low: Lower PPO clipping epsilon for the surrogate objective.
+        clip_eps_high: Upper PPO clipping epsilon for the surrogate objective.
+        length_normalize: If True, normalizes by number of action tokens.
+            This reintroduces length normalization and deviates from Dr. GRPO.
+        ratio_clip: Optional upper bound C for truncation (min(r, C)).
+        name: Algorithm name for logging/metrics.
+    """
+    credit_assigner: CreditAssigner = GroupNormalizedReturn(
+        group_size=group_size,
+        normalize_adv=False,
+        positive_only=positive_only,
+    )
+    loss: Loss = TokenClippedSurrogateLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+        ratio_clip=ratio_clip,
+    )
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
 def make_gspo(
     *,
     group_size: int,
