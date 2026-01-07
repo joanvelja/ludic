@@ -395,9 +395,21 @@ class ClippedSurrogateLoss:
         obj = torch.min(unclipped, clipped)
         loss = -obj.mean()
 
-        ppo_clip_frac = (
-            (ratio > 1.0 + self.clip_eps_high) | (ratio < 1.0 - self.clip_eps_low)
-        ).float().mean()
+        # Token-weighted clip fraction: counts tokens in sequences where the
+        # clipped branch is active (sequence-level GSPO-style metric).
+        token_mask = action_mask[:, 1:].to(dtype=ratio.dtype)
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)
+        adv_pos = advantages >= 0
+        seq_clipped = torch.where(
+            adv_pos,
+            ratio > 1.0 + self.clip_eps_high,
+            ratio < 1.0 - self.clip_eps_low,
+        )
+        total_tokens = token_counts.sum()
+        if total_tokens > 0:
+            ppo_clip_frac = (seq_clipped.to(token_counts.dtype) * token_counts).sum() / total_tokens
+        else:
+            ppo_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
         if self.ratio_clip is not None:
             ratio_clip_frac = (ratio >= self.ratio_clip).float().mean()
         else:
