@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
@@ -20,6 +19,9 @@ from ludic.training.loss import (
     SAPOLoss,
     GMPOLoss,
     MaskedCausalLMCrossEntropyLoss,
+    CompositeLoss,
+    LossTerm,
+    TokenKLLoss,
 )
 from ludic.training.credit_assignment import (
     MonteCarloReturn,
@@ -149,6 +151,78 @@ def drop_zero_weight_samples(
         raise ValueError("eps must be >= 0.")
     items = [it for it in saw_batch.items if abs(float(it.weight)) > eps]
     saw_batch.items = items
+    return saw_batch
+
+
+def filter_zero_variance_groups(
+    saw_batch: SAWBatch,
+    *,
+    eps: float = 1e-6,
+) -> SAWBatch:
+    """
+    Drop groups whose rollout rewards have near-zero variance.
+
+    Groups are keyed by request_meta.group_id (fallback to top-level group_id).
+    Rewards are read from item.meta["total_reward"] (fallback to "reward").
+    """
+    if eps < 0:
+        raise ValueError("eps must be >= 0.")
+
+    rewards_by_group: Dict[str, Dict[str, float]] = defaultdict(dict)
+    missing_group: list[int] = []
+
+    for i, it in enumerate(saw_batch.items):
+        request_meta = it.meta.get("request_meta", {})
+        group_id = request_meta.get("group_id") or it.meta.get("group_id")
+        if group_id is None:
+            missing_group.append(i)
+            continue
+
+        rollout_id = it.meta.get("rollout_id", f"idx-{i}")
+        reward = it.meta.get("total_reward", it.meta.get("reward"))
+        if reward is None:
+            raise ValueError(
+                f"Missing total_reward/reward for item index {i} in group_id={group_id!r}."
+            )
+        reward_val = float(reward)
+        prior = rewards_by_group[group_id].get(rollout_id)
+        if prior is not None and prior != reward_val:
+            raise ValueError(
+                f"Inconsistent reward for rollout_id={rollout_id!r} in group_id={group_id!r}: "
+                f"{prior} vs {reward_val}."
+            )
+        rewards_by_group[group_id][rollout_id] = reward_val
+
+    if missing_group:
+        raise ValueError(
+            "Missing group_id for zero-variance filtering. "
+            f"Missing indices: {missing_group}."
+        )
+
+    drop_groups = set()
+    for group_id, rewards in rewards_by_group.items():
+        reward_vals = list(rewards.values())
+        if not reward_vals:
+            continue
+        if len(reward_vals) == 1:
+            std = 0.0
+        else:
+            std = statistics.pstdev(reward_vals)
+        if std <= eps:
+            drop_groups.add(group_id)
+
+    if not drop_groups:
+        return saw_batch
+
+    before_count = len(saw_batch.items)
+    saw_batch.items = [
+        it
+        for it in saw_batch.items
+        if (it.meta.get("request_meta", {}).get("group_id") or it.meta.get("group_id"))
+        not in drop_groups
+    ]
+    saw_batch.meta["zvp_dropped_groups"] = len(drop_groups)
+    saw_batch.meta["zvp_dropped_items"] = before_count - len(saw_batch.items)
     return saw_batch
 
 

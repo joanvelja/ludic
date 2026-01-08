@@ -27,7 +27,7 @@ from environments.gsm8k import GSM8KEnv
 from ludic.agent import Agent
 from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
-from ludic.interaction import SingleAgentSyncProtocol
+from ludic.interaction import SingleAgentProtocol
 from ludic.parsers import boxed_parser
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.eval import EngineEvaluator

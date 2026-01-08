@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Any, Callable, Dict, Optional, List
+import inspect
 import logging
 import uuid
 
@@ -18,10 +19,15 @@ logger = logging.getLogger(__name__)
 ExternalToolHandler = Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
 
 
-
 def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
+    reset = getattr(env, "env_reset", None)
+    step = getattr(env, "env_step", None)
+    return inspect.iscoroutinefunction(reset), inspect.iscoroutinefunction(step)
+
+
+class SingleAgentProtocol(InteractionProtocol):
     """
-    Implements the standard single-agent, synchronous interaction loop.
+    Implements the standard single-agent interaction loop.
 
     This protocol consumes a LudicEnv but ASSUMES it has exactly
     one agent and that this agent is active every step.
@@ -47,6 +53,9 @@ def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
       Uses the context's default_system_prompt if present; otherwise falls
       back to env.suggested_sysprompt. There is no protocol-level prompt
       override.
+
+    Async environment support:
+      If env.env_reset / env.env_step are async, this protocol awaits them.
     """
 
     def __init__(
@@ -85,7 +94,7 @@ def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
         inference: Optional[InferenceSpec] = None,
         timeout_s: Optional[float] = None,
     ) -> List[Rollout]:
-        
+
         agent = self.agent
         inf = inference or InferenceSpec()
 
@@ -109,7 +118,7 @@ def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
         else:
             obs_info_dict = env.reset(seed=env_seed)
             obs, info = obs_info_dict[agent_id]
-        
+
         # 3. --- Reset Agent & Feed First Obs ---
         # Choose system prompt: prefer the context's default if set, else env suggestion.
         ctx_default_prompt = getattr(getattr(agent, "_ctx", None), "default_system_prompt", None)
@@ -118,7 +127,7 @@ def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
 
         agent.reset(system_prompt=sys_prompt)
         agent.on_env_reset(obs, info)
-        
+
         # Accumulate steps locally first
         steps: List[Step] = []
         step_index = 0
@@ -129,15 +138,15 @@ def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
         # 4. --- Run Interaction Loop ---
         for t in range(max_steps):
             parse_halt = False
-            
+
             # Check that our agent is the one expected to act
             active_agents = env.active_agents
             if agent_id not in active_agents:
                 # This env is not a simple single-agent env, stop.
-                break 
+                break
 
             current_obs_for_step = obs
-            
+
             # --- A. Call the Agent ---
             act_result = await agent.act(
                 inference=inf,
@@ -304,8 +313,11 @@ def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
                 parse_error=False,
             )
             actions_dict = {agent_id: parsed_action}
-            outcomes_dict = env.step(actions_dict)
-            env_outcome = outcomes_dict[agent_id]
+            if has_async_step:
+                env_outcome = await env.env_step(parsed_action)  # type: ignore[union-attr]
+            else:
+                outcomes_dict = env.step(actions_dict)
+                env_outcome = outcomes_dict[agent_id]
 
             step_info = merge_step_info(
                 client_info=final_step.info,
@@ -390,3 +402,6 @@ def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
             }
         )
         return [rollout]
+
+
+SingleAgentSyncProtocol = SingleAgentProtocol

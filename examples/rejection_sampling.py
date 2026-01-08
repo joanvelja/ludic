@@ -19,7 +19,7 @@ from transformers import AutoTokenizer
 from ludic.agent import Agent
 from ludic.context import FullDialog
 from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, HFChatTemplate
-from ludic.interaction import SingleAgentSyncProtocol
+from ludic.interaction import SingleAgentProtocol
 from ludic.parsers import xml_tag_parser
 from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
 from ludic.types import Rollout, EnvironmentStep

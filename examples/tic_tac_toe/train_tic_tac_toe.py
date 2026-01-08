@@ -25,7 +25,7 @@ from environments.tic_tac_toe import TicTacToeEnv
 from ludic.agent import Agent
 from ludic.context import FullDialog, TruncatedThinkingContext
 from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, ReturnSpec, HFChatTemplate
-from ludic.interaction import SingleAgentSyncProtocol
+from ludic.interaction import SingleAgentProtocol
 from ludic.distributed.adapters import create_vllm_publisher
 from ludic.parsers import compose_parsers, think_prefix_parser, xml_tag_parser
 from ludic.eval import EngineEvaluator

@@ -591,16 +591,6 @@ class Trainer:
                 else:
                     forward_mem_stats, alloc_after_forward, forward_peak = {}, None, None
 
-                # Scale loss by micro-batch size to preserve macro-batch mean.
-                scaled_loss = loss * (item_count / total_items)
-                if profile_memory:
-                    # Forward memory stats before backward frees activations
-                    forward_mem_stats, alloc_after_forward, forward_peak = (
-                        self._capture_forward_memory_stats(device, pre_forward_alloc)
-                    )
-                else:
-                    forward_mem_stats, alloc_after_forward, forward_peak = {}, None, None
-
                 scaled_loss.backward()
             finally:
                 if grad_sync_disabled and isinstance(self.model, fsdp.FSDPModule):
