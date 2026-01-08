@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import statistics
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Protocol
 
@@ -151,78 +149,6 @@ def drop_zero_weight_samples(
         raise ValueError("eps must be >= 0.")
     items = [it for it in saw_batch.items if abs(float(it.weight)) > eps]
     saw_batch.items = items
-    return saw_batch
-
-
-def filter_zero_variance_groups(
-    saw_batch: SAWBatch,
-    *,
-    eps: float = 1e-6,
-) -> SAWBatch:
-    """
-    Drop groups whose rollout rewards have near-zero variance.
-
-    Groups are keyed by request_meta.group_id (fallback to top-level group_id).
-    Rewards are read from item.meta["total_reward"] (fallback to "reward").
-    """
-    if eps < 0:
-        raise ValueError("eps must be >= 0.")
-
-    rewards_by_group: Dict[str, Dict[str, float]] = defaultdict(dict)
-    missing_group: list[int] = []
-
-    for i, it in enumerate(saw_batch.items):
-        request_meta = it.meta.get("request_meta", {})
-        group_id = request_meta.get("group_id") or it.meta.get("group_id")
-        if group_id is None:
-            missing_group.append(i)
-            continue
-
-        rollout_id = it.meta.get("rollout_id", f"idx-{i}")
-        reward = it.meta.get("total_reward", it.meta.get("reward"))
-        if reward is None:
-            raise ValueError(
-                f"Missing total_reward/reward for item index {i} in group_id={group_id!r}."
-            )
-        reward_val = float(reward)
-        prior = rewards_by_group[group_id].get(rollout_id)
-        if prior is not None and prior != reward_val:
-            raise ValueError(
-                f"Inconsistent reward for rollout_id={rollout_id!r} in group_id={group_id!r}: "
-                f"{prior} vs {reward_val}."
-            )
-        rewards_by_group[group_id][rollout_id] = reward_val
-
-    if missing_group:
-        raise ValueError(
-            "Missing group_id for zero-variance filtering. "
-            f"Missing indices: {missing_group}."
-        )
-
-    drop_groups = set()
-    for group_id, rewards in rewards_by_group.items():
-        reward_vals = list(rewards.values())
-        if not reward_vals:
-            continue
-        if len(reward_vals) == 1:
-            std = 0.0
-        else:
-            std = statistics.pstdev(reward_vals)
-        if std <= eps:
-            drop_groups.add(group_id)
-
-    if not drop_groups:
-        return saw_batch
-
-    before_count = len(saw_batch.items)
-    saw_batch.items = [
-        it
-        for it in saw_batch.items
-        if (it.meta.get("request_meta", {}).get("group_id") or it.meta.get("group_id"))
-        not in drop_groups
-    ]
-    saw_batch.meta["zvp_dropped_groups"] = len(drop_groups)
-    saw_batch.meta["zvp_dropped_items"] = before_count - len(saw_batch.items)
     return saw_batch
 
 
@@ -818,14 +744,11 @@ def make_scalerl(
     clip_eps_high: float = 0.28,
     length_normalize: bool = True,
     kl_coeff: float = 0.0,
-    filter_zvp: bool = True,
-    zvp_filter_eps: float = 1e-6,
-    drop_zero_weight: bool = False,
     drop_zero_weight_eps: float = 1e-4,
     name: str = "scalerl",
 ) -> RLAlgorithm:
     """
-    ScaleRL recipe: CISPO loss + hybrid advantage normalization + ZVP filtering.
+    ScaleRL recipe: CISPO loss + hybrid advantage normalization + zero-weight filtering.
 
     This combines the key sample-efficiency improvements from the ScaleRL paper:
 
@@ -837,9 +760,8 @@ def make_scalerl(
        gradient contributions from rare tokens (crucial for reflective
        reasoning behaviors like "Wait", "However", "Recheck").
 
-    3. **Zero-variance group filtering**: Drops prompts where all generations
-       received the same reward (all correct OR all incorrect). These contribute
-       zero gradient but consume compute.
+    3. **Drop zero-weight samples**: After credit assignment, drop samples with
+       near-zero weight to reduce no-op updates.
 
     4. **FP32 logits** (via TrainerConfig.cast_logits_to_fp32=True):
        Recommended for IS ratio stability. Not controlled by this preset—
@@ -853,9 +775,6 @@ def make_scalerl(
         length_normalize: Whether to normalize by number of action tokens.
         kl_coeff: Coefficient for optional token-level KL penalty.
             Set > 0 for additional stability. Typical: 0.01-0.1. Default 0.0.
-        filter_zvp: If True, filter zero-variance groups before training.
-        zvp_filter_eps: Epsilon for ZVP detection (groups with std <= eps are dropped).
-        drop_zero_weight: If True, additionally drop individual samples with ~zero weight.
         drop_zero_weight_eps: Epsilon for zero-weight sample detection.
         name: Algorithm name for logging/metrics.
 
@@ -865,7 +784,7 @@ def make_scalerl(
 
     References:
         - ScaleRL: arXiv:2510.13786
-        - DAPO (ZVP filtering): arXiv:2503.14476
+        - DAPO (zero-weight filtering): arXiv:2503.14476
         - MiniMax-M1 (CISPO): arXiv:2506.13585
     """
     # HybridNormalizedReturn: group-mean baseline + batch-std scaling
@@ -896,19 +815,12 @@ def make_scalerl(
     # Build preprocessing pipeline (order matters)
     preprocess_fns = []
 
-    # 1. Zero-variance group filter (DAPO-style)
-    if filter_zvp:
-        preprocess_fns.append(
-            lambda batch: filter_zero_variance_groups(batch, eps=zvp_filter_eps)
-        )
+    # 1. Drop individual zero-weight samples (after credit assignment)
+    preprocess_fns.append(
+        lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+    )
 
-    # 2. Drop individual zero-weight samples (optional, after credit assignment)
-    if drop_zero_weight:
-        preprocess_fns.append(
-            lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
-        )
-
-    # 3. Validate actor logprobs (required for CISPO ratio computation)
+    # 2. Validate actor logprobs (required for CISPO ratio computation)
     preprocess_fns.append(validate_actor_logps)
 
     preprocess = compose_preprocess(*preprocess_fns)
