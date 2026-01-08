@@ -31,6 +31,141 @@ logger.info(
 )
 
 
+# ---------------------------------------------------------------------------
+# Shared context for memory-efficient loss composition
+# ---------------------------------------------------------------------------
+
+
+class SharedContext:
+    """
+    Lazy-computed shared tensors for memory-efficient loss composition.
+
+    When multiple losses are combined via CompositeLoss, each typically needs
+    the same expensive intermediate tensors (e.g., token_logp from log_softmax).
+    Without sharing, each loss computes these independently, creating separate
+    autograd graphs that store duplicate [B, T, V] activations for backward.
+
+    SharedContext solves this by computing expensive tensors ONCE on first access
+    and caching them for subsequent uses. All losses receive the same tensor
+    objects, sharing a single autograd graph.
+
+    Memory savings example (7B model, V=32K, B=8, T=4096):
+        - Without sharing (2 losses): 2× [B, T, V] ≈ 4GB activations
+        - With sharing (2 losses):    1× [B, T, V] ≈ 2GB activations
+
+    Usage:
+        # Created by CompositeLoss, passed to each child loss
+        shared = SharedContext(logits, batch)
+
+        # In CISPOLoss.compute():
+        token_logp = shared.token_logp  # Computes and caches on first access
+
+        # In TokenKLLoss.compute():
+        token_logp = shared.token_logp  # Returns cached tensor (same object!)
+
+    Note: Properties that depend on batch["actor_logps"] will raise KeyError
+    if that key is missing. This is intentional - not all loss combinations
+    need actor logprobs.
+    """
+
+    __slots__ = ("logits", "batch", "_cache")
+
+    def __init__(self, logits: Logits, batch: Batch) -> None:
+        self.logits = logits
+        self.batch = batch
+        self._cache: Dict[str, Tensor] = {}
+
+    @property
+    def input_ids(self) -> TokenIds:
+        """Token IDs from batch (not cached, just a convenience accessor)."""
+        return self.batch["input_ids"]
+
+    @property
+    def action_mask(self) -> Mask:
+        """Action mask from batch (not cached, just a convenience accessor)."""
+        return self.batch["action_mask"]
+
+    @property
+    def token_logp(self) -> Float[Tensor, "B T-1"]:
+        """
+        Per-token log probabilities: log π(a_t|s_t) for each position.
+
+        THIS IS THE EXPENSIVE OPERATION - calls selective_log_softmax which
+        requires storing [B, T, V] activations for backward. Caching this
+        is the primary memory optimization.
+        """
+        if "token_logp" not in self._cache:
+            # Import here to avoid circular dependency (compute_token_logp defined later)
+            self._cache["token_logp"] = compute_token_logp(self.logits, self.input_ids)
+        return self._cache["token_logp"]
+
+    @property
+    def token_mask(self) -> Float[Tensor, "B T-1"]:
+        """Action mask aligned with token_logp (shifted by 1 for next-token prediction)."""
+        if "token_mask" not in self._cache:
+            self._cache["token_mask"] = self.action_mask[:, 1:].to(
+                self.token_logp.dtype
+            )
+        return self._cache["token_mask"]
+
+    @property
+    def token_counts(self) -> Float[Tensor, "B"]:
+        """Number of action tokens per sample (for length normalization)."""
+        if "token_counts" not in self._cache:
+            self._cache["token_counts"] = self.token_mask.sum(dim=-1).clamp(min=1.0)
+        return self._cache["token_counts"]
+
+    @property
+    def actor_logps_shifted(self) -> Float[Tensor, "B T-1"]:
+        """
+        Behavior policy log probs aligned with token_logp.
+
+        Raises:
+            KeyError: If batch["actor_logps"] is not present.
+        """
+        if "actor_logps_shifted" not in self._cache:
+            if "actor_logps" not in self.batch:
+                raise KeyError(
+                    "SharedContext.actor_logps_shifted requires batch['actor_logps']. "
+                    "Ensure your rollouts include actor_logps for ratio-based objectives."
+                )
+            self._cache["actor_logps_shifted"] = self.batch["actor_logps"][:, 1:]
+        return self._cache["actor_logps_shifted"]
+
+    @property
+    def log_ratio(self) -> Float[Tensor, "B T-1"]:
+        """Log importance ratio: log(π_new/π_old) per token."""
+        if "log_ratio" not in self._cache:
+            self._cache["log_ratio"] = self.token_logp - self.actor_logps_shifted
+        return self._cache["log_ratio"]
+
+    @property
+    def ratio(self) -> Float[Tensor, "B T-1"]:
+        """Importance ratio: π_new/π_old per token."""
+        if "ratio" not in self._cache:
+            self._cache["ratio"] = torch.exp(self.log_ratio)
+        return self._cache["ratio"]
+
+    def logp_action(self, *, length_normalize: bool = False) -> Float[Tensor, "B"]:
+        """
+        Sequence-level log probability (sum over action tokens).
+
+        Unlike token_logp, this is a cheap derivation that doesn't require
+        additional [B, T, V] storage. The length_normalize flag controls
+        whether to divide by number of action tokens.
+
+        Args:
+            length_normalize: If True, return mean log prob instead of sum.
+
+        Returns:
+            [B] tensor of per-sample log probabilities.
+        """
+        masked_logp = (self.token_logp * self.token_mask).sum(dim=-1)
+        if length_normalize:
+            return masked_logp / self.token_counts
+        return masked_logp
+
+
 class Loss(Protocol):
     """
     Generic loss: given model outputs (logits) and a collated batch, return

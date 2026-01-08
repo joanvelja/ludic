@@ -49,9 +49,19 @@ class RLAlgorithm:
         self,
         model: nn.Module,
         batch: Batch,
+        *,
+        cast_logits_to_fp32: bool = False,
     ) -> tuple[Tensor, Dict[str, Any]]:
         """
         Runs the forward pass once and delegates to the Loss object.
+
+        Args:
+            model: The trainable model.
+            batch: Collated batch tensors (input_ids, attention_mask, etc.).
+            cast_logits_to_fp32: If True, cast logits to FP32 before loss computation.
+                This improves importance sampling ratio stability for ratio-based
+                objectives (GRPO, CISPO, etc.) by reducing precision errors in
+                exp(log_ratio). Recommended by ScaleRL paper (arXiv:2510.13786).
         """
         # --- Run the forward pass ---
         input_ids = batch["input_ids"]
@@ -61,6 +71,10 @@ class RLAlgorithm:
             attention_mask=attention_mask,
         )
         logits: Logits = outputs.logits
+
+        # ScaleRL: FP32 logits prevent IS ratio precision issues in exp(logp_new - logp_old)
+        if cast_logits_to_fp32:
+            logits = logits.float()
 
         # Pass the resulting logits to the loss function
         return self.loss.compute(logits, batch)
