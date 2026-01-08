@@ -193,8 +193,10 @@ class Loss(Protocol):
 # We define this as a standalone helper so torch.compile can cache it cleanly.
 # dynamic=True is critical for varying sequence lengths (preventing recompilation).
 @jaxtyped(typechecker=typechecker)
-@torch.compile(dynamic=True)
-def selective_log_softmax(logits: Logits, index: TokenIds) -> Float[Tensor, "B T"]:
+def _selective_log_softmax_impl(
+    logits: Logits,
+    index: TokenIds,
+) -> Float[Tensor, "B T"]:
     """
     Fused kernel for log_softmax + gather.
 
@@ -205,6 +207,30 @@ def selective_log_softmax(logits: Logits, index: TokenIds) -> Float[Tensor, "B T
     # This looks naive, but the compiler fuses it into a single read/write op.
     logprobs = logits.log_softmax(dim=-1)
     return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+
+
+_USE_TORCH_COMPILE = os.getenv("LUDIC_DISABLE_TORCH_COMPILE", "0") != "1"
+_USE_COMPILED_SELECTIVE_LOG_SOFTMAX = _USE_TORCH_COMPILE
+if _USE_TORCH_COMPILE:
+    _selective_log_softmax_compiled = torch.compile(
+        _selective_log_softmax_impl, dynamic=True
+    )
+else:
+    _selective_log_softmax_compiled = _selective_log_softmax_impl
+
+
+def selective_log_softmax(logits: Logits, index: TokenIds) -> Float[Tensor, "B T"]:
+    global _USE_COMPILED_SELECTIVE_LOG_SOFTMAX
+    if _USE_COMPILED_SELECTIVE_LOG_SOFTMAX:
+        try:
+            return _selective_log_softmax_compiled(logits, index)
+        except Exception as exc:
+            logger.warning(
+                "torch.compile failed for selective_log_softmax, falling back to eager: %s",
+                exc,
+            )
+            _USE_COMPILED_SELECTIVE_LOG_SOFTMAX = False
+    return _selective_log_softmax_impl(logits, index)
 
 @jaxtyped(typechecker=typechecker)
 def compute_logp_action(

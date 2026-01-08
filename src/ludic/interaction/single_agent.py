@@ -1,6 +1,5 @@
 from __future__ import annotations
 from typing import Any, Callable, Dict, Optional, List
-import inspect
 import logging
 import uuid
 
@@ -17,12 +16,6 @@ logger = logging.getLogger(__name__)
 # Type for external tool handlers: takes tool_calls, returns list of result dicts
 # Each result dict should have: tool_call_id, tool_name, content
 ExternalToolHandler = Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]
-
-
-def _has_async_env_methods(env: LudicEnv) -> tuple[bool, bool]:
-    reset = getattr(env, "env_reset", None)
-    step = getattr(env, "env_step", None)
-    return inspect.iscoroutinefunction(reset), inspect.iscoroutinefunction(step)
 
 
 class SingleAgentProtocol(InteractionProtocol):
@@ -54,8 +47,6 @@ class SingleAgentProtocol(InteractionProtocol):
       back to env.suggested_sysprompt. There is no protocol-level prompt
       override.
 
-    Async environment support:
-      If env.env_reset / env.env_step are async, this protocol awaits them.
     """
 
     def __init__(
@@ -107,17 +98,9 @@ class SingleAgentProtocol(InteractionProtocol):
             )
         agent_id = agent_ids[0]
 
-        # Check for async env methods (e.g., CodeExecEnv)
-        has_async_reset, has_async_step = _has_async_env_methods(env)
-
         # 2. --- Reset Env ---
-        # For async envs, call env_reset directly and await it.
-        # For sync envs, use the standard reset() wrapper.
-        if has_async_reset:
-            obs, info = await env.env_reset(seed=env_seed)  # type: ignore[union-attr]
-        else:
-            obs_info_dict = env.reset(seed=env_seed)
-            obs, info = obs_info_dict[agent_id]
+        obs_info_dict = env.reset(seed=env_seed)
+        obs, info = obs_info_dict[agent_id]
 
         # 3. --- Reset Agent & Feed First Obs ---
         # Choose system prompt: prefer the context's default if set, else env suggestion.
@@ -313,11 +296,8 @@ class SingleAgentProtocol(InteractionProtocol):
                 parse_error=False,
             )
             actions_dict = {agent_id: parsed_action}
-            if has_async_step:
-                env_outcome = await env.env_step(parsed_action)  # type: ignore[union-attr]
-            else:
-                outcomes_dict = env.step(actions_dict)
-                env_outcome = outcomes_dict[agent_id]
+            outcomes_dict = env.step(actions_dict)
+            env_outcome = outcomes_dict[agent_id]
 
             step_info = merge_step_info(
                 client_info=final_step.info,
@@ -403,5 +383,3 @@ class SingleAgentProtocol(InteractionProtocol):
         )
         return [rollout]
 
-
-SingleAgentSyncProtocol = SingleAgentProtocol

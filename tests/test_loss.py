@@ -27,7 +27,13 @@ class MockLoss(Loss):
     loss_val: float
     stats: Dict[str, Any]
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    def compute(
+        self,
+        logits: Tensor,
+        batch: Batch,
+        *,
+        shared: Any = None,
+    ) -> Tuple[Tensor, Dict[str, Any]]:
         return torch.tensor(self.loss_val, dtype=torch.float32), self.stats
 
 
