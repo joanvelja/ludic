@@ -14,13 +14,15 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from transformers import AutoTokenizer
+
 from ludic.agent import Agent
 from ludic.context import FullDialog
-from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams
-from ludic.interaction import SingleAgentProtocol
+from ludic.inference import VLLMChatClient, InferenceSpec, SamplingParams, HFChatTemplate
+from ludic.interaction import SingleAgentSyncProtocol
 from ludic.parsers import xml_tag_parser
 from ludic.training import RolloutEngine, EnvSpec, ProtocolSpec, RolloutRequest
-from ludic.types import Rollout
+from ludic.types import Rollout, EnvironmentStep
 
 from environments.tic_tac_toe import TicTacToeEnv
 
@@ -42,31 +44,46 @@ Do not include any other text, commentary, or tags.
 
 def rollout_to_dict(r: Rollout) -> dict[str, Any]:
     """Convert a Rollout to a JSON-serializable dict."""
+    def _serialize_step(step: EnvironmentStep) -> dict[str, Any]:
+        return {
+            "id": step.id,
+            "index": step.index,
+            "kind": step.kind,
+            "prev_obs": step.prev_obs,
+            "action": step.action,
+            "parsed_action": step.parsed_action,
+            "next_obs": step.next_obs,
+            "source_agent_step_id": step.source_agent_step_id,
+            "agent_step_ids": step.agent_step_ids,
+            "reward": step.reward,
+            "reward_components": step.reward_components,
+            "truncated": step.truncated,
+            "terminated": step.terminated,
+            "info": step.info,
+            "ts_ns": step.ts_ns,
+            "turn_id": step.turn_id,
+            "parent_id": step.parent_id,
+            "trace": step.trace.to_dict(),
+        }
+
+    env_steps = [s for s in r.steps if isinstance(s, EnvironmentStep)]
     return {
         "id": r.id,
         "meta": r.meta,
-        "steps": [
-            {
-                "index": s.index,
-                "prev_obs": s.prev_obs,
-                "action": s.action,
-                "next_obs": s.next_obs,
-                "reward": s.reward,
-                "truncated": s.truncated,
-                "terminated": s.terminated,
-                "info": s.info,
-                "ts_ns": s.ts_ns,
-            }
-            for s in r.steps
-        ],
+        "steps": [_serialize_step(s) for s in env_steps],
         "total_reward": r.total_reward,
-        "length": r.length,
+        "length": len(env_steps),
         "duration_ns": r.duration_ns,
     }
 
 
 async def generate_filtered_data(args: argparse.Namespace) -> None:
     print(f"Connecting to vLLM at http://{args.host}:{args.port}...")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    chat_template = HFChatTemplate(tokenizer)
 
     client = VLLMChatClient(
         host=args.host,
@@ -84,6 +101,7 @@ async def generate_filtered_data(args: argparse.Namespace) -> None:
                 model=args.model,
                 ctx=FullDialog(system_prompt=prompt_text),
                 parser=xml_tag_parser("move"),
+                chat_template=chat_template,
             ),
             stop_on_parse_error=True,
         )

@@ -8,7 +8,7 @@ Example:
         --host 127.0.0.1 --port 8000 \
         --limit 200
 
-Requires: uv pip install datasets math-verify
+Requires: uv sync --extra examples
 """
 
 from __future__ import annotations
@@ -17,7 +17,10 @@ import argparse
 import re
 from typing import Dict, List
 
+from transformers import AutoTokenizer
+
 from ludic.inference import VLLMChatClient
+from ludic.inference import HFChatTemplate
 from ludic.parsers import ParseResult, think_prefix_parser
 from ludic.eval.core import run_eval_sync
 from ludic.training import (
@@ -43,7 +46,7 @@ def load_gsm8k(split: str, limit: int | None) -> List[dict]:
     except ImportError as e:
         raise SystemExit(
             "This example requires the 'datasets' package. "
-            "Install with: uv pip install datasets"
+            "Install with: uv sync --extra examples"
         ) from e
 
     ds = load_dataset("gsm8k", "main", split=split)
@@ -146,6 +149,10 @@ def main() -> None:
 
     with maybe_start_vllm(args):
         client = VLLMChatClient(host=args.host, port=args.port, enable_weight_updates=False)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+        chat_template = HFChatTemplate(tokenizer)
         engine = build_single_agent_engine(
             client=client,
             model=args.model,
@@ -153,6 +160,7 @@ def main() -> None:
             env_registry={
                 "gsm8k": lambda sample, system_prompt=None: GSM8KEnv(sample=sample, system_prompt=system_prompt)
             },
+            chat_template=chat_template,
             system_prompt=args.system_prompt,
         )
         requests = make_requests(samples, args)

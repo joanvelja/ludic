@@ -1,14 +1,18 @@
 from __future__ import annotations
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Mapping, TYPE_CHECKING
 
 import torch
 
 from ludic.types import Observation, Info, Message, ChatResponse, TokenTrace
 from ludic.inference.client import ChatClient
-from ludic.inference.request import ChatCompletionRequest, InferenceSpec, ToolRequest
+from ludic.inference.request import TokenCompletionRequest, InferenceSpec, ToolRequest
 from ludic.context.base import ContextStrategy
 from ludic.parsers import Parser, ParseResult
+
+if TYPE_CHECKING:
+    from ludic.inference.chat_template import ChatTemplate
 
 _DEFAULT_INCOMPLETE_FEEDBACK = (
     "Your response was cut off because it exceeded the token limit. "
@@ -50,6 +54,28 @@ def _strip_token_trace_info(info: Dict[str, Any]) -> Dict[str, Any]:
     return stripped
 
 
+@dataclass
+class AgentActStep:
+    prompt_messages: List[Message]
+    action: str
+    parse_result: Optional[ParseResult]  # None for external tool calls (not final actions)
+    info: Dict[str, Any]
+    trace: TokenTrace
+    action_target: str  # "internal" | "external" | "env"
+    loop_index: int
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_results: Optional[List[Dict[str, Any]]] = None
+
+
+@dataclass
+class AgentActResult:
+    steps: List[AgentActStep]
+
+    @property
+    def final_step(self) -> AgentActStep:
+        return self.steps[-1]
+
+
 class Agent:
     """
     A stateful, logical actor that bundles inference, context, and parsing.
@@ -70,6 +96,7 @@ class Agent:
         reject_incomplete_completions: bool = True,
         incomplete_completion_penalty: float = -0.1,
         incomplete_completion_feedback: str = _DEFAULT_INCOMPLETE_FEEDBACK,
+        chat_template: Optional["ChatTemplate"] = None,
     ) -> None:
         """
         Initializes the Agent.
@@ -84,6 +111,8 @@ class Agent:
             incomplete_completion_penalty: Reward penalty for incomplete completions.
             incomplete_completion_feedback: Feedback message shown to agent when
                 its completion is cut off.
+            chat_template: ChatTemplate for token-in mode. If None, the agent
+                will try to build an HFChatTemplate from client.tokenizer.
         """
         self._client = client
         self._model = model
@@ -92,6 +121,17 @@ class Agent:
         self._reject_incomplete = reject_incomplete_completions
         self._incomplete_penalty = incomplete_completion_penalty
         self._incomplete_feedback = incomplete_completion_feedback
+        if chat_template is None:
+            tokenizer = getattr(client, "tokenizer", None)
+            if tokenizer is None or not callable(getattr(tokenizer, "apply_chat_template", None)):
+                raise ValueError(
+                    "Agent requires a chat_template for token-in inference or a client "
+                    "with a HuggingFace-compatible tokenizer."
+                )
+            from ludic.inference.chat_template import HFChatTemplate
+
+            chat_template = HFChatTemplate(tokenizer)
+        self._chat_template = chat_template
         self.last_info: Dict[str, Any] = {}
 
     async def _infer_once(
@@ -102,24 +142,34 @@ class Agent:
         sampling_seed: Optional[int] = None,
         tools: Optional[ToolRequest] = None,
         timeout_s: Optional[float] = None,
-    ) -> Tuple[ChatResponse, Dict[str, Any], Dict[str, Any], Optional[TokenTrace]]:
+    ) -> Tuple[ChatResponse, Dict[str, Any], Dict[str, Any], TokenTrace]:
         """
         Shared single inference helper.
 
-        Builds a ChatCompletionRequest, runs the client call (optionally with timeout),
-        strips token traces from the JSON info, and returns a TokenTrace separately.
+        Uses token-in mode (applies template ourselves, calls completions endpoint).
         """
         inf = inference or InferenceSpec()
-        req = ChatCompletionRequest(
+
+        # Token-in mode: apply chat template ourselves
+        tool_schemas = tools.tools if tools else None
+        template_result = self._chat_template.apply(
+            messages,
+            tools=tool_schemas,
+            add_generation_prompt=True,
+        )
+
+        req = TokenCompletionRequest(
             model=self._model,
-            messages=messages,
+            prompt_token_ids=template_result.prompt_token_ids,
+            prompt_text=template_result.prompt_text,
             sampling=inf.sampling,
             return_=inf.return_,
             seed=sampling_seed,
-            tools=tools,
             extensions=inf.extensions,
         )
-        coro = self._client.complete(req)
+
+        coro = self._client.complete_tokens(req)
+
         if timeout_s is None:
             resp, client_info = await coro
         else:
@@ -133,7 +183,13 @@ class Agent:
         resp.merge_into_info(last_info)
 
         self.last_info = last_info
-        return resp, public_info, last_info, resp.to_trace()
+        trace = resp.to_trace()
+        if trace is None:
+            raise ValueError(
+                "Missing token IDs from inference response. "
+                "Ensure ReturnSpec.return_token_ids=True for all calls."
+            )
+        return resp, public_info, last_info, trace
 
     def reset(self, system_prompt: Optional[str] = None) -> None:
         """Resets the agent's internal context."""
@@ -152,7 +208,7 @@ class Agent:
         inference: Optional[InferenceSpec] = None,
         sampling_seed: Optional[int] = None,
         timeout_s: Optional[float] = None,
-    ) -> Tuple[ParseResult, str, Dict[str, Any], Optional[TokenTrace]]:
+    ) -> AgentActResult:
         """
         Runs the think -> act -> parse cycle based on current context.
 
@@ -165,7 +221,7 @@ class Agent:
             timeout_s: Optional timeout for the inference call.
 
         Returns:
-            A tuple of (ParseResult, raw_action_text, client_info_dict, token_trace).
+            AgentActResult containing one or more AgentActStep entries.
         """
         # 1. Think (prepare prompt messages from context)
         messages: List[Message] = self._ctx.on_before_act()
@@ -192,12 +248,20 @@ class Agent:
             )
             # Mark this in info for downstream tracking
             last_info["incomplete_completion"] = True
-            return parse_result, raw_action, last_info, token_trace
+        else:
+            # 5. Parse (format the raw text action)
+            parse_result = self._parser(raw_action)
 
-        # 5. Parse (format the raw text action)
-        parse_result = self._parser(raw_action)
-
-        return parse_result, raw_action, last_info, token_trace
+        step = AgentActStep(
+            prompt_messages=messages,
+            action=raw_action,
+            parse_result=parse_result,
+            info=last_info,
+            trace=token_trace,
+            action_target="env",
+            loop_index=0,
+        )
+        return AgentActResult(steps=[step])
 
     def push_policy_update(
         self,

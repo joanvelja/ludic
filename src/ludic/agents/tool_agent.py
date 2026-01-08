@@ -3,12 +3,14 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Set
 
 from ludic.agents.base_agent import Agent
-from ludic.inference.request import InferenceSpec, ReturnSpec, ToolRequest
+from ludic.inference.request import InferenceSpec, ToolRequest
 
 logger = logging.getLogger(__name__)
+
+ToolScope = Literal["internal", "external"]
 
 
 class ToolAgent(Agent):
@@ -19,64 +21,112 @@ class ToolAgent(Agent):
       - Tool schema generation from python callables.
       - SamplingArgs augmentation to advertise tools to the model.
       - Execution + recording of tool calls into the ContextStrategy.
-      - Extraction of content/tool_calls from OpenAI raw_response info.
+
+    Tool Scopes:
+      - tools: Tools executed by the agent (calculator, code interpreter).
+        Results are added to context and the agent continues reasoning.
+      - external_tools: Tools the agent can call but doesn't execute.
+        These are returned to the protocol, which decides how to handle them
+        (e.g., delegation, environment interaction, etc.).
 
     Tool errors:
       - Missing tools, invalid JSON arguments, and tool exceptions are
         caught and recorded as tool messages in the ContextStrategy.
     """
 
-    def __init__(self, tools: Sequence[Callable], **kwargs):
+    def __init__(
+        self,
+        *,
+        tools: Optional[Sequence[Callable]] = None,
+        external_tools: Optional[Sequence[Callable]] = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
-        self.tool_map: Dict[str, Callable] = {t.__name__: t for t in tools}
-        self.tool_schemas: List[Dict[str, Any]] = [self._func_to_schema(t) for t in tools]
+
+        # Normalize tool inputs
+        internal = list(tools or [])
+        external = list(external_tools or [])
+
+        # Build tool maps and track scopes
+        self._internal_tools: Dict[str, Callable] = {t.__name__: t for t in internal}
+        self._external_tools: Dict[str, Callable] = {t.__name__: t for t in external}
+        self._external_tool_names: Set[str] = set(self._external_tools.keys())
+
+        # Combined map for schema generation (all tools are advertised)
+        self.tool_map: Dict[str, Callable] = {**self._internal_tools, **self._external_tools}
+
+        # Check for name collisions
+        overlap = set(self._internal_tools.keys()) & set(self._external_tools.keys())
+        if overlap:
+            raise ValueError(f"Tool names must be unique across internal and external tools: {overlap}")
+
+        # Generate schemas for all tools
+        all_tools = internal + external
+        self.tool_schemas: List[Dict[str, Any]] = [self._func_to_schema(t) for t in all_tools]
+
+        if self.tool_schemas and not self._chat_template.supports_tools():
+            raise ValueError(
+                "ToolAgent requires a chat_template with tool parsing support "
+                "(configure a ToolParser, e.g., HermesToolParser)."
+            )
+
+    def get_tool_scope(self, tool_name: str) -> Optional[ToolScope]:
+        """Return the scope of a tool by name, or None if not found."""
+        if tool_name in self._internal_tools:
+            return "internal"
+        if tool_name in self._external_tools:
+            return "external"
+        return None
+
+    def is_external_tool(self, tool_name: str) -> bool:
+        """Check if a tool is an external tool (not executed by agent)."""
+        return tool_name in self._external_tool_names
+
+    def has_external_tool_call(self, tool_calls: List[Dict[str, Any]]) -> bool:
+        """Check if any of the tool calls target an external tool."""
+        return any(self.is_external_tool(tc["function"]["name"]) for tc in tool_calls)
 
     def _tool_request(self) -> ToolRequest:
-        return ToolRequest(tools=list(self.tool_schemas), tool_choice="auto")
+        return ToolRequest(tools=list(self.tool_schemas))
 
     def _with_tools(self, inference: Optional[InferenceSpec]) -> InferenceSpec:
-        """
-        Return an InferenceSpec suitable for tool calling.
+        """Return an InferenceSpec suitable for tool calling."""
+        return inference or InferenceSpec()
 
-        Enforces `return_token_ids=True` so training can stay drift-free.
+    def _run_tool_calls(
+        self,
+        tool_calls: List[Dict[str, Any]],
+        *,
+        internal_only: bool = True,
+    ) -> List[Dict[str, Any]]:
         """
-        inf = inference or InferenceSpec()
-        if inf.return_.return_token_ids:
-            return inf
-        return InferenceSpec(
-            sampling=inf.sampling,
-            return_=ReturnSpec(
-                return_token_ids=True,
-                return_chosen_logprobs=inf.return_.return_chosen_logprobs,
-                top_logprobs_k=inf.return_.top_logprobs_k,
-            ),
-            extensions=inf.extensions,
-        )
+        Execute tool calls and record results in context.
 
-    def _extract_openai_message(
-        self, info: Dict[str, Any]
-    ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
-        """
-        Extract (content, tool_calls) from OpenAI/vLLM raw_response structure.
-        """
-        raw_choice = info["raw_response"]["choices"][0]
-        message_data = raw_choice["message"]
-        content = message_data.get("content")
-        tool_calls = message_data.get("tool_calls")
-        return content, tool_calls
+        Args:
+            tool_calls: List of tool call dicts from the model.
+            internal_only: If True (default), only execute internal tools.
+                          External tools are skipped (handled by protocol).
 
-    def _run_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
-        """Execute tool calls and record results in context."""
+        Returns:
+            List of result dicts for executed tools.
+        """
+        results: List[Dict[str, Any]] = []
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
             args_json = tc["function"]["arguments"]
             call_id = tc["id"]
 
+            # Skip external tools if internal_only
+            if internal_only and self.is_external_tool(fn_name):
+                continue
+
             result_str = ""
-            if fn_name in self.tool_map:
+            tool_fn = self._internal_tools.get(fn_name) if internal_only else self.tool_map.get(fn_name)
+
+            if tool_fn is not None:
                 try:
                     fn_args = json.loads(args_json)
-                    obs = self.tool_map[fn_name](**fn_args)
+                    obs = tool_fn(**fn_args)
                     result_str = str(obs)
                 except Exception as e:
                     result_str = f"Error executing tool {fn_name}: {e}"
@@ -85,6 +135,15 @@ class ToolAgent(Agent):
                 result_str = f"Error: Tool {fn_name} not found."
 
             self._ctx.add_tool_result(call_id, fn_name, result_str)
+            results.append(
+                {
+                    "tool_call_id": call_id,
+                    "tool_name": fn_name,
+                    "arguments_json": args_json,
+                    "content": result_str,
+                }
+            )
+        return results
 
     def _func_to_schema(self, f: Callable) -> Dict[str, Any]:
         """
@@ -97,11 +156,13 @@ class ToolAgent(Agent):
 
         for name, param in sig.parameters.items():
             p_type = "string"
-            if param.annotation == int:
+            # Handle both actual types and PEP 563 string annotations
+            ann = param.annotation
+            if ann in (int, "int"):
                 p_type = "integer"
-            elif param.annotation == float:
+            elif ann in (float, "float"):
                 p_type = "number"
-            elif param.annotation == bool:
+            elif ann in (bool, "bool"):
                 p_type = "boolean"
 
             params[name] = {"type": p_type}

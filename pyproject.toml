@@ -1,17 +1,35 @@
 [project]
 name = "ludic"
+authors = [
+    {name = "hallerite", email = "me@hallerite.com"},
+]
+description = "Ludic - The LLM-RL library for the age of experience"
 version = "0.1.0"
-description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "~=3.12.0"
 dependencies = [
     "aiohttp>=3.13.2",
+    "beartype>=0.22.9",
+    "jaxtyping>=0.3.4",
     "openai>=2.7.1",
     "peft>=0.18.0",
     "rich>=14.2.0",
     "setuptools>=79.0.1",
     "torch>=2.8.0",
-    "vllm>=0.11.0",
+    "vllm>=0.13.0",
+]
+
+[project.optional-dependencies]
+pipelinerl = [
+    "redis>=7.1.0",
+]
+examples = [
+    "datasets==4.4.1", # pinned to the versions in uv.lock that are known to work
+    "math-verify==0.8.0", # pinned to the versions in uv.lock that are known to work
+]
+tinker = [
+    "tinker==0.7.0", # pinned to the versions in uv.lock that are known to work
+    "tinker-cookbook @ git+ssh://git@github.com/thinking-machines-lab/tinker-cookbook.git@d2adfe562edb9cc97b43ceab537a3beeff892442",
 ]
 
 [project.optional-dependencies]
@@ -24,24 +42,27 @@ requires = ["uv_build>=0.9.5,<0.10.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = [
-    "mypy>=1.18.2",
+test = [
     "pytest>=8.4.2",
     "pytest-asyncio>=1.2.0",
+]
+lint = [
     "ruff>=0.14.5",
 ]
-pipelinerl = [
-    "redis>=7.1.0",
+typing = [
+    "ty>=0.0.5",
 ]
-examples = [
-    "datasets",
-    "math-verify",
+dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
+    { include-group = "typing" },
 ]
 
 [tool.pytest.ini_options]
+addopts = ["-m", "not diagnostic"]
 markers = [
     "integration: marks tests as integration tests",
     "gpu: marks tests as needing a GPU",
-    "report: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
+    "diagnostic: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
 ]
 testpaths = ["tests"]

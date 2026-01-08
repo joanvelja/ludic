@@ -11,13 +11,14 @@ from ludic.interaction.base import InteractionProtocol
 from ludic.interaction.single_agent import SingleAgentProtocol
 from ludic.context.full_dialog import FullDialog
 from ludic.envs.env import LudicEnv
-from ludic.inference.request import ChatCompletionRequest, InferenceSpec, ReturnSpec
+from ludic.inference.request import TokenCompletionRequest, InferenceSpec, ReturnSpec
 from ludic.inference.sampling import SamplingParams
 
 from ludic.training.batching import (
     RolloutEngine,
     RolloutBatchSource,
 )
+from ludic.training.batching.rollout_engine import ProtocolRegistry
 from ludic.training.types import (
     EnvSpec,
     ProtocolSpec,
@@ -25,9 +26,9 @@ from ludic.training.types import (
 )
 from ludic.training.credit_assignment import MonteCarloReturn
 from ludic.training.filters import drop_truncated
-from ludic.types import Rollout, Step
+from ludic.types import Rollout, EnvironmentStep, AgentStep, TokenTrace
 
-from tests._mocks import MockClient, _mock_parser, MockAgent
+from tests._mocks import MockClient, _mock_parser, MockAgent, MockChatTemplate
 
 pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 
@@ -35,15 +36,18 @@ pytestmark = [pytest.mark.integration, pytest.mark.gpu]
 # Helper / local mocks
 # ---------------------------------------------------------------------
 
+def _env_steps(rollout: Rollout) -> List[EnvironmentStep]:
+    return [s for s in rollout.steps if isinstance(s, EnvironmentStep)]
+
 class TokenClient(MockClient):
     """
     Mock client that returns both prompt and completion token IDs so that
     RolloutEngine.generate_batch can consume them without retokenization.
     """
 
-    async def complete(
+    async def complete_tokens(
         self,
-        request: ChatCompletionRequest,
+        request: TokenCompletionRequest,
         **kwargs,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
         # Prompt is "some prompt", completion is "1".
@@ -53,7 +57,7 @@ class TokenClient(MockClient):
             prompt_token_ids=[10, 11],
             completion_token_ids=[12, 13, 14],
         )
-        return resp, {"used_request": request.to_dict()}
+        return resp, {"mode": "token_in"}
 
 
 class ConstantCreditAssigner:
@@ -70,6 +74,15 @@ class ConstantCreditAssigner:
         for r in rollouts:
             for s in r.steps:
                 out[(r.id, s.index)] = self.value
+        return out
+
+
+class StepIndexCreditAssigner:
+    def compute(self, rollouts: List[Rollout]) -> Dict[Tuple[str, int], float]:
+        out: Dict[Tuple[str, int], float] = {}
+        for r in rollouts:
+            for s in r.steps:
+                out[(r.id, s.index)] = float(s.index)
         return out
 
 
@@ -95,9 +108,43 @@ class MultiTraceMockProtocol(InteractionProtocol):
         timeout_s: Optional[float] = None,
     ) -> List[Rollout]:
         # Simulate Agent A
-        r1 = Rollout(steps=[Step(0, "obsA", "actA", "nextA", 1.0, False, True)])
+        r1 = Rollout(
+            steps=[
+                EnvironmentStep(
+                    index=0,
+                    prev_obs="obsA",
+                    action="actA",
+                    parsed_action="actA",
+                    next_obs="nextA",
+                    source_agent_step_id="agentA_0",
+                    agent_step_ids=["agentA_0"],
+                    reward=1.0,
+                    truncated=False,
+                    terminated=True,
+                    info={},
+                    trace=TokenTrace(prompt_token_ids=[1], completion_token_ids=[2]),
+                )
+            ]
+        )
         # Simulate Agent B
-        r2 = Rollout(steps=[Step(0, "obsB", "actB", "nextB", -0.5, False, True)])
+        r2 = Rollout(
+            steps=[
+                EnvironmentStep(
+                    index=0,
+                    prev_obs="obsB",
+                    action="actB",
+                    parsed_action="actB",
+                    next_obs="nextB",
+                    source_agent_step_id="agentB_0",
+                    agent_step_ids=["agentB_0"],
+                    reward=-0.5,
+                    truncated=False,
+                    terminated=True,
+                    info={},
+                    trace=TokenTrace(prompt_token_ids=[1], completion_token_ids=[2]),
+                )
+            ]
+        )
         return [r1, r2]
 
 # ---------------------------------------------------------------------
@@ -140,7 +187,8 @@ async def test_generate_rollouts_basic_metadata_and_termination(
 
     for r in rollouts:
         # should terminate successfully on correct action "1"
-        assert r.steps[-1].terminated is True
+        env_steps = _env_steps(r)
+        assert env_steps[-1].terminated is True
         assert r.total_reward == pytest.approx(1.0)
 
         # engine metadata
@@ -302,10 +350,11 @@ async def test_generate_rollouts_heterogeneous_protocols(
 
     # Check that the correct agent was used for each
     for r in rollouts:
+        env_steps = _env_steps(r)
         if r.meta["engine"]["protocol_kind"] == "protocol_A":
-            assert r.steps[0].action == "Agent A says hi"
+            assert env_steps[0].action == "Agent A says hi"
         elif r.meta["engine"]["protocol_kind"] == "protocol_B":
-            assert r.steps[0].action == "Agent B says hi"
+            assert env_steps[0].action == "Agent B says hi"
 
 
 @pytest.mark.asyncio
@@ -369,7 +418,8 @@ async def test_generate_batch_uses_model_token_ids_when_available(
         client=TokenClient(),
         model="mock",
         ctx=FullDialog(),
-        parser=_mock_parser
+        parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )
     
     protocol_registry = {
@@ -398,7 +448,7 @@ async def test_generate_batch_uses_model_token_ids_when_available(
     )
 
     # Single rollout, single step
-    assert batch.meta["num_rollouts"] == 1
+    assert batch.meta["target_rollouts"] == 1
     assert batch.meta["num_samples"] == 1
     # Env gives +1 reward when guess is correct
     assert batch.meta["avg_total_reward"] == pytest.approx(1.0)
@@ -418,41 +468,275 @@ async def test_generate_batch_uses_model_token_ids_when_available(
     assert item.meta["total_reward"] == pytest.approx(1.0)
 
 
-# ---------------------------------------------------------------------
-# generate_batch: missing token IDs
-# ---------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_generate_batch_concatenates_turn_steps_and_stitches_logprobs(
+    env_registry,
+) -> None:
+    class TurnConcatProtocol(InteractionProtocol):
+        async def run(
+            self,
+            *,
+            env: LudicEnv,
+            max_steps: int,
+            env_seed: Optional[int] = None,
+            sampling_seed: Optional[int] = None,
+            inference: Optional[InferenceSpec] = None,
+            timeout_s: Optional[float] = None,
+        ) -> List[Rollout]:
+            turn_id = "turn-0"
+            trace1 = TokenTrace(
+                prompt_token_ids=[1, 2],
+                completion_token_ids=[3],
+                completion_logprobs=[-0.1],
+            )
+            trace2 = TokenTrace(
+                prompt_token_ids=[1, 2, 3, 4],
+                completion_token_ids=[5, 6],
+                completion_logprobs=[-0.2, -0.3],
+            )
+
+            agent1 = AgentStep(
+                index=0,
+                prompt_messages=[],
+                action="tool",
+                action_target="internal",
+                loop_index=0,
+                reward=0.0,
+                truncated=False,
+                terminated=False,
+                info={},
+                trace=trace1,
+                turn_id=turn_id,
+            )
+            agent2 = AgentStep(
+                index=1,
+                prompt_messages=[],
+                action="final",
+                action_target="env",
+                loop_index=1,
+                reward=0.0,
+                truncated=False,
+                terminated=False,
+                info={},
+                trace=trace2,
+                turn_id=turn_id,
+            )
+            env_step = EnvironmentStep(
+                index=2,
+                prev_obs="obs",
+                action="final",
+                parsed_action="final",
+                next_obs=None,
+                source_agent_step_id=agent2.id,
+                agent_step_ids=[agent1.id, agent2.id],
+                reward=1.0,
+                truncated=False,
+                terminated=True,
+                info={},
+                trace=trace2,
+                turn_id=turn_id,
+            )
+            return [Rollout(steps=[agent1, agent2, env_step])]
+
+    protocol_registry = {"turn_concat": lambda: TurnConcatProtocol()}
+    engine = RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry)
+
+    request = RolloutRequest(
+        env=EnvSpec(kind="mock", kwargs={}),
+        protocol=ProtocolSpec(kind="turn_concat"),
+        num_episodes=1,
+        inference=InferenceSpec(
+            sampling=SamplingParams(temperature=0.0, max_tokens=8),
+            return_=ReturnSpec.for_rl(),
+        ),
+    )
+
+    batch = await engine.generate_batch(
+        requests=[request],
+        max_steps=1,
+        credit_assigner=ConstantCreditAssigner(value=1.0),
+    )
+
+    assert len(batch.items) == 1
+    item = batch.items[0]
+
+    assert item.input_ids == [1, 2, 3, 4, 5, 6]
+    assert item.action_mask == [0, 0, 1, 0, 1, 1]
+    assert item.meta["prompt_length"] == 3
+    assert item.meta["completion_length"] == 3
+    assert item.meta["turn_step_count"] == 2
+    assert item.meta["turn_has_env_step"] is True
+    assert item.meta["step_kind"] == "env"
+    assert item.meta["reward"] == pytest.approx(1.0)
+
+    assert item.actor_logps is not None
+    assert item.actor_logps.token_logps == [-0.1, -0.2, -0.3]
+    assert sum(item.action_mask) == len(item.actor_logps.token_logps)
 
 
 @pytest.mark.asyncio
-async def test_generate_batch_raises_if_no_token_ids_and_no_retokenize(
+async def test_generate_batch_keeps_parse_error_turn_and_uses_last_agent_step(
     env_registry,
-    mock_agent,
 ) -> None:
-    protocol_registry = {
-        "mock_protocol": lambda: SingleAgentProtocol(agent=mock_agent)
-    }
-    
-    engine = RolloutEngine(
-        env_registry=env_registry,
-        protocol_registry=protocol_registry,
-    )
+    class ParseErrorProtocol(InteractionProtocol):
+        async def run(
+            self,
+            *,
+            env: LudicEnv,
+            max_steps: int,
+            env_seed: Optional[int] = None,
+            sampling_seed: Optional[int] = None,
+            inference: Optional[InferenceSpec] = None,
+            timeout_s: Optional[float] = None,
+        ) -> List[Rollout]:
+            turn_id = "turn-parse-error"
+            trace1 = TokenTrace(
+                prompt_token_ids=[1],
+                completion_token_ids=[2],
+                completion_logprobs=[-0.1],
+            )
+            trace2 = TokenTrace(
+                prompt_token_ids=[1, 2, 3],
+                completion_token_ids=[4],
+                completion_logprobs=[-0.2],
+            )
 
-    credit_assigner = ConstantCreditAssigner(value=1.0)
+            agent1 = AgentStep(
+                index=0,
+                prompt_messages=[],
+                action="attempt",
+                action_target="internal",
+                loop_index=0,
+                reward=0.0,
+                truncated=False,
+                terminated=False,
+                info={"parse_error": False},
+                trace=trace1,
+                turn_id=turn_id,
+            )
+            agent2 = AgentStep(
+                index=1,
+                prompt_messages=[],
+                action="bad",
+                action_target="env",
+                loop_index=1,
+                reward=-0.5,
+                truncated=False,
+                terminated=False,
+                info={"parse_error": True},
+                trace=trace2,
+                turn_id=turn_id,
+            )
+            return [Rollout(steps=[agent1, agent2])]
+
+    protocol_registry = {"parse_error": lambda: ParseErrorProtocol()}
+    engine = RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry)
 
     request = RolloutRequest(
-        env=EnvSpec(kind="mock", kwargs={"max_steps": 1, "target": "1"}),
-        protocol=ProtocolSpec(kind="mock_protocol"),
+        env=EnvSpec(kind="mock", kwargs={}),
+        protocol=ProtocolSpec(kind="parse_error"),
         num_episodes=1,
+        inference=InferenceSpec(
+            sampling=SamplingParams(temperature=0.0, max_tokens=8),
+            return_=ReturnSpec.for_rl(),
+        ),
     )
 
-    with pytest.raises(ValueError, match="Missing rollout-time token trace"):
+    batch = await engine.generate_batch(
+        requests=[request],
+        max_steps=1,
+        credit_assigner=StepIndexCreditAssigner(),
+    )
+
+    assert len(batch.items) == 1
+    item = batch.items[0]
+
+    assert item.meta["step_kind"] == "agent"
+    assert item.meta["step_index"] == 1
+    assert item.meta["reward"] == pytest.approx(-0.5)
+    assert item.weight == pytest.approx(1.0)
+    assert item.meta["turn_has_env_step"] is False
+
+
+@pytest.mark.asyncio
+async def test_generate_batch_raises_on_non_append_only_turn(
+    env_registry,
+) -> None:
+    class NonAppendProtocol(InteractionProtocol):
+        async def run(
+            self,
+            *,
+            env: LudicEnv,
+            max_steps: int,
+            env_seed: Optional[int] = None,
+            sampling_seed: Optional[int] = None,
+            inference: Optional[InferenceSpec] = None,
+            timeout_s: Optional[float] = None,
+        ) -> List[Rollout]:
+            turn_id = "turn-non-append"
+            trace1 = TokenTrace(
+                prompt_token_ids=[1, 2],
+                completion_token_ids=[3],
+                completion_logprobs=[-0.1],
+            )
+            trace2 = TokenTrace(
+                prompt_token_ids=[9, 9, 9],
+                completion_token_ids=[4],
+                completion_logprobs=[-0.2],
+            )
+
+            agent1 = AgentStep(
+                index=0,
+                prompt_messages=[],
+                action="first",
+                action_target="internal",
+                loop_index=0,
+                reward=0.0,
+                truncated=False,
+                terminated=False,
+                info={},
+                trace=trace1,
+                turn_id=turn_id,
+            )
+            agent2 = AgentStep(
+                index=1,
+                prompt_messages=[],
+                action="second",
+                action_target="env",
+                loop_index=1,
+                reward=0.0,
+                truncated=False,
+                terminated=False,
+                info={},
+                trace=trace2,
+                turn_id=turn_id,
+            )
+            return [Rollout(steps=[agent1, agent2])]
+
+    protocol_registry = {"non_append": lambda: NonAppendProtocol()}
+    engine = RolloutEngine(env_registry=env_registry, protocol_registry=protocol_registry)
+
+    request = RolloutRequest(
+        env=EnvSpec(kind="mock", kwargs={}),
+        protocol=ProtocolSpec(kind="non_append"),
+        num_episodes=1,
+        inference=InferenceSpec(
+            sampling=SamplingParams(temperature=0.0, max_tokens=8),
+            return_=ReturnSpec.for_rl(),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="prompt token IDs do not extend"):
         await engine.generate_batch(
             requests=[request],
-            max_steps=2,
-            credit_assigner=credit_assigner,
-            timeout_s=None,
-            concurrency=1,
+            max_steps=1,
+            credit_assigner=ConstantCreditAssigner(value=1.0),
         )
+
+
+# ---------------------------------------------------------------------
+# generate_batch: missing token IDs
+# ---------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------
@@ -469,6 +753,7 @@ async def test_rollout_batch_source_next_batch_integration(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentProtocol(agent=agent)
@@ -505,7 +790,7 @@ async def test_rollout_batch_source_next_batch_integration(
     saw_batch = await batch_source.next_batch()
 
     # We asked for num_episodes=2 => 2 rollouts; each should have at least 1 step
-    assert saw_batch.meta["num_rollouts"] == 2
+    assert saw_batch.meta["target_rollouts"] == 2
     assert saw_batch.meta["num_samples"] >= 2
 
     # All items should carry rollout metadata including request_meta
@@ -525,6 +810,7 @@ async def test_rollout_batch_source_passes_sample_filter(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentProtocol(agent=agent)
@@ -577,6 +863,7 @@ async def test_saw_item_contains_truncation_flags(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )  # Never terminates the env since it never outputs target="win"
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentProtocol(agent=agent),
@@ -632,6 +919,7 @@ async def test_generate_batch_applies_sample_filter_and_updates_counts(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )  # Never terminates the env since it never outputs target="win"
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentProtocol(agent=agent),
@@ -677,9 +965,9 @@ async def test_avg_completion_length_respects_filtered_items(
             self._texts = list(texts)
             self._i = 0
 
-        async def complete(  # type: ignore[override]
+        async def complete_tokens(  # type: ignore[override]
             self,
-            request: ChatCompletionRequest,
+            request: TokenCompletionRequest,
             **kwargs,
         ) -> Tuple[ChatResponse, Dict[str, Any]]:
             text = self._texts[min(self._i, len(self._texts) - 1)]
@@ -691,7 +979,7 @@ async def test_avg_completion_length_respects_filtered_items(
                     prompt_token_ids=[1, 2],
                     completion_token_ids=completion_ids,
                 ),
-                {"used_request": request.to_dict()},
+                {"mode": "token_in"},
             )
 
     agent = Agent(
@@ -699,6 +987,7 @@ async def test_avg_completion_length_respects_filtered_items(
         model="mock",
         ctx=FullDialog(),
         parser=_mock_parser,
+        chat_template=MockChatTemplate(),
     )
     protocol_registry = {
         "mock_protocol": lambda: SingleAgentProtocol(agent=agent),
@@ -719,12 +1008,12 @@ async def test_avg_completion_length_respects_filtered_items(
         )
     ]
 
-    # Keep only the first step so avg_completion_length should match len("a") == 1.
+    # Keep only the first env step so avg_completion_length should match len("a") == 1.
     batch = await engine.generate_batch(
         requests=requests,
         max_steps=3,
         credit_assigner=credit_assigner,
-        sample_filter=lambda item: item.meta.get("step_index") == 0,
+        sample_filter=lambda item: item.meta.get("step_index") == 1,
     )
 
     assert batch.meta["num_samples"] == 1

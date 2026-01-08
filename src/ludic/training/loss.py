@@ -20,10 +20,8 @@ Weights = Float[Tensor, "B"]
 
 logger = logging.getLogger(__name__)
 
-
 def _no_op(fn):
     return fn
-
 
 _TYPECHECK_ENABLED = os.getenv("LUDIC_TYPECHECK", "0") == "1"
 typechecker = beartype if _TYPECHECK_ENABLED else _no_op
@@ -31,141 +29,6 @@ logger.info(
     "Jaxtyping runtime checks: %s",
     "enabled (beartype)" if _TYPECHECK_ENABLED else "disabled",
 )
-
-
-# ---------------------------------------------------------------------------
-# Shared context for memory-efficient loss composition
-# ---------------------------------------------------------------------------
-
-
-class SharedContext:
-    """
-    Lazy-computed shared tensors for memory-efficient loss composition.
-
-    When multiple losses are combined via CompositeLoss, each typically needs
-    the same expensive intermediate tensors (e.g., token_logp from log_softmax).
-    Without sharing, each loss computes these independently, creating separate
-    autograd graphs that store duplicate [B, T, V] activations for backward.
-
-    SharedContext solves this by computing expensive tensors ONCE on first access
-    and caching them for subsequent uses. All losses receive the same tensor
-    objects, sharing a single autograd graph.
-
-    Memory savings example (7B model, V=32K, B=8, T=4096):
-        - Without sharing (2 losses): 2× [B, T, V] ≈ 4GB activations
-        - With sharing (2 losses):    1× [B, T, V] ≈ 2GB activations
-
-    Usage:
-        # Created by CompositeLoss, passed to each child loss
-        shared = SharedContext(logits, batch)
-
-        # In CISPOLoss.compute():
-        token_logp = shared.token_logp  # Computes and caches on first access
-
-        # In TokenKLLoss.compute():
-        token_logp = shared.token_logp  # Returns cached tensor (same object!)
-
-    Note: Properties that depend on batch["actor_logps"] will raise KeyError
-    if that key is missing. This is intentional - not all loss combinations
-    need actor logprobs.
-    """
-
-    __slots__ = ("logits", "batch", "_cache")
-
-    def __init__(self, logits: Logits, batch: Batch) -> None:
-        self.logits = logits
-        self.batch = batch
-        self._cache: Dict[str, Tensor] = {}
-
-    @property
-    def input_ids(self) -> TokenIds:
-        """Token IDs from batch (not cached, just a convenience accessor)."""
-        return self.batch["input_ids"]
-
-    @property
-    def action_mask(self) -> Mask:
-        """Action mask from batch (not cached, just a convenience accessor)."""
-        return self.batch["action_mask"]
-
-    @property
-    def token_logp(self) -> Float[Tensor, "B T-1"]:
-        """
-        Per-token log probabilities: log π(a_t|s_t) for each position.
-
-        THIS IS THE EXPENSIVE OPERATION - calls selective_log_softmax which
-        requires storing [B, T, V] activations for backward. Caching this
-        is the primary memory optimization.
-        """
-        if "token_logp" not in self._cache:
-            # Import here to avoid circular dependency (compute_token_logp defined later)
-            self._cache["token_logp"] = compute_token_logp(self.logits, self.input_ids)
-        return self._cache["token_logp"]
-
-    @property
-    def token_mask(self) -> Float[Tensor, "B T-1"]:
-        """Action mask aligned with token_logp (shifted by 1 for next-token prediction)."""
-        if "token_mask" not in self._cache:
-            self._cache["token_mask"] = self.action_mask[:, 1:].to(
-                self.token_logp.dtype
-            )
-        return self._cache["token_mask"]
-
-    @property
-    def token_counts(self) -> Float[Tensor, "B"]:
-        """Number of action tokens per sample (for length normalization)."""
-        if "token_counts" not in self._cache:
-            self._cache["token_counts"] = self.token_mask.sum(dim=-1).clamp(min=1.0)
-        return self._cache["token_counts"]
-
-    @property
-    def actor_logps_shifted(self) -> Float[Tensor, "B T-1"]:
-        """
-        Behavior policy log probs aligned with token_logp.
-
-        Raises:
-            KeyError: If batch["actor_logps"] is not present.
-        """
-        if "actor_logps_shifted" not in self._cache:
-            if "actor_logps" not in self.batch:
-                raise KeyError(
-                    "SharedContext.actor_logps_shifted requires batch['actor_logps']. "
-                    "Ensure your rollouts include actor_logps for ratio-based objectives."
-                )
-            self._cache["actor_logps_shifted"] = self.batch["actor_logps"][:, 1:]
-        return self._cache["actor_logps_shifted"]
-
-    @property
-    def log_ratio(self) -> Float[Tensor, "B T-1"]:
-        """Log importance ratio: log(π_new/π_old) per token."""
-        if "log_ratio" not in self._cache:
-            self._cache["log_ratio"] = self.token_logp - self.actor_logps_shifted
-        return self._cache["log_ratio"]
-
-    @property
-    def ratio(self) -> Float[Tensor, "B T-1"]:
-        """Importance ratio: π_new/π_old per token."""
-        if "ratio" not in self._cache:
-            self._cache["ratio"] = torch.exp(self.log_ratio)
-        return self._cache["ratio"]
-
-    def logp_action(self, *, length_normalize: bool = False) -> Float[Tensor, "B"]:
-        """
-        Sequence-level log probability (sum over action tokens).
-
-        Unlike token_logp, this is a cheap derivation that doesn't require
-        additional [B, T, V] storage. The length_normalize flag controls
-        whether to divide by number of action tokens.
-
-        Args:
-            length_normalize: If True, return mean log prob instead of sum.
-
-        Returns:
-            [B] tensor of per-sample log probabilities.
-        """
-        masked_logp = (self.token_logp * self.token_mask).sum(dim=-1)
-        if length_normalize:
-            return masked_logp / self.token_counts
-        return masked_logp
 
 
 class Loss(Protocol):
@@ -177,10 +40,8 @@ class Loss(Protocol):
     batched D2H transfer during aggregation. Use `tensor.detach()` not `float(...)`.
     """
 
-    def compute(
-        self, logits: Logits, batch: Batch
-    ) -> Tuple[Tensor, Dict[str, Tensor]]: ...
-
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Tensor]]:
+        ...
 
 # We define this as a standalone helper so torch.compile can cache it cleanly.
 # dynamic=True is critical for varying sequence lengths (preventing recompilation).
@@ -197,7 +58,6 @@ def selective_log_softmax(logits: Logits, index: TokenIds) -> Float[Tensor, "B T
     # This looks naive, but the compiler fuses it into a single read/write op.
     logprobs = logits.log_softmax(dim=-1)
     return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
-
 
 @jaxtyped(typechecker=typechecker)
 def compute_logp_action(
@@ -261,14 +121,12 @@ def compute_token_logp(
     if logits.ndim != 3:
         raise ValueError(f"Expected logits [B, T, V], got {tuple(logits.shape)}")
     if input_ids.shape != logits.shape[:2]:
-        raise ValueError(
-            f"Shape mismatch: input_ids {input_ids.shape} vs logits {logits.shape}"
-        )
+        raise ValueError(f"Shape mismatch: input_ids {input_ids.shape} vs logits {logits.shape}")
     if logits.size(1) < 2:
         raise ValueError("Sequence too short to compute next-token logprobs.")
 
-    logits_shifted = logits[:, :-1, :]  # [B, T-1, V]
-    target_ids = input_ids[:, 1:]  # [B, T-1]
+    logits_shifted = logits[:, :-1, :]          # [B, T-1, V]
+    target_ids = input_ids[:, 1:]               # [B, T-1]
     return selective_log_softmax(logits_shifted, target_ids)
 
 
@@ -299,34 +157,21 @@ class ReinforceLoss:
     old_logp_key: str = "old_logp_action"
 
     @jaxtyped(typechecker=typechecker)
-    def compute(
-        self,
-        logits: Logits,
-        batch: Batch,
-        *,
-        shared: Optional[SharedContext] = None,
-    ) -> Tuple[Tensor, Dict[str, Any]]:
-        advantages = batch["weight"]  # [B]
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]            # [B, T]
+        action_mask = batch["action_mask"]        # [B, T]
+        advantages = batch["weight"]              # [B]
 
         if self.old_logp_key not in batch:
             raise KeyError(f"ReinforceLoss requires '{self.old_logp_key}' in batch.")
 
-        # Use shared context if available (memory-efficient composition)
-        if shared is not None:
-            logp_action = shared.logp_action(length_normalize=self.length_normalize)
-            token_counts = shared.token_counts
-        else:
-            # Backward-compatible: compute locally
-            input_ids = batch["input_ids"]  # [B, T]
-            action_mask = batch["action_mask"]  # [B, T]
-            logp_action = compute_logp_action(
-                logits, input_ids, action_mask, length_normalize=self.length_normalize
-            )  # [B]
-            token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
+        logp_action = compute_logp_action(
+            logits, input_ids, action_mask, length_normalize=self.length_normalize
+        )  # [B]
 
         old_logp = batch[self.old_logp_key]  # [B]
         if self.length_normalize:
-            lengths = token_counts.to(old_logp.dtype)
+            lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
             old_logp = old_logp / lengths
 
         log_ratio = logp_action - old_logp
@@ -335,7 +180,7 @@ class ReinforceLoss:
         mismatch_kl = ratio - log_ratio - 1.0
 
         # Stop-gradient on IS weight: gradient flows only through log π
-        loss = -(ratio.detach() * advantages * logp_action).mean()
+        loss = - (ratio.detach() * advantages * logp_action).mean()
 
         stats: Dict[str, Any] = {
             "loss": loss.detach(),
@@ -440,36 +285,21 @@ class ReinforceBaselineLoss:
     old_logp_key: str = "old_logp_action"
 
     @jaxtyped(typechecker=typechecker)
-    def compute(
-        self,
-        logits: Logits,
-        batch: Batch,
-        *,
-        shared: Optional[SharedContext] = None,
-    ) -> Tuple[Tensor, Dict[str, Any]]:
-        adv_raw = batch["weight"]  # [B]
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        adv_raw = batch["weight"]                # [B]
 
         if self.old_logp_key not in batch:
-            raise KeyError(
-                f"ReinforceBaselineLoss requires '{self.old_logp_key}' in batch."
-            )
+            raise KeyError(f"ReinforceBaselineLoss requires '{self.old_logp_key}' in batch.")
 
-        # Use shared context if available (memory-efficient composition)
-        if shared is not None:
-            logp_action = shared.logp_action(length_normalize=self.length_normalize)
-            token_counts = shared.token_counts
-        else:
-            # Backward-compatible: compute locally
-            input_ids = batch["input_ids"]
-            action_mask = batch["action_mask"]
-            logp_action = compute_logp_action(
-                logits, input_ids, action_mask, length_normalize=self.length_normalize
-            )  # [B]
-            token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
+        logp_action = compute_logp_action(
+            logits, input_ids, action_mask, length_normalize=self.length_normalize
+        )  # [B]
 
         old_logp = batch[self.old_logp_key]  # [B]
         if self.length_normalize:
-            lengths = token_counts.to(old_logp.dtype)
+            lengths = action_mask[:, 1:].to(old_logp.dtype).sum(dim=-1).clamp(min=1.0)
             old_logp = old_logp / lengths
 
         log_ratio = logp_action - old_logp
@@ -484,7 +314,7 @@ class ReinforceBaselineLoss:
             advantages = advantages / (std + 1e-8)
 
         # Stop-gradient on IS weight
-        loss = -(ratio.detach() * advantages * logp_action).mean()
+        loss = - (ratio.detach() * advantages * logp_action).mean()
 
         stats: Dict[str, Any] = {
             "loss": loss.detach(),
@@ -536,14 +366,10 @@ class ClippedSurrogateLoss:
             raise ValueError(f"ratio_clip must be positive, got {self.ratio_clip}")
 
     @jaxtyped(typechecker=typechecker)
-    def compute(
-        self,
-        logits: Logits,
-        batch: Batch,
-        *,
-        shared: Optional[SharedContext] = None,
-    ) -> Tuple[Tensor, Dict[str, Any]]:
-        advantages = batch["weight"]  # [B]
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        advantages = batch["weight"]              # [B]
         if self.old_logp_key not in batch:
             raise KeyError(
                 f"ClippedSurrogateLoss requires '{self.old_logp_key}' in batch."
@@ -578,19 +404,28 @@ class ClippedSurrogateLoss:
             ratio = torch.clamp(ratio, max=self.ratio_clip)
 
         unclipped = ratio * advantages
-        clipped = (
-            torch.clamp(ratio, 1.0 - self.clip_eps_low, 1.0 + self.clip_eps_high)
-            * advantages
-        )
+        clipped = torch.clamp(
+            ratio, 1.0 - self.clip_eps_low, 1.0 + self.clip_eps_high
+        ) * advantages
 
         obj = torch.min(unclipped, clipped)
         loss = -obj.mean()
 
-        ppo_clip_frac = (
-            ((ratio > 1.0 + self.clip_eps_high) | (ratio < 1.0 - self.clip_eps_low))
-            .float()
-            .mean()
+        # Token-weighted clip fraction: counts tokens in sequences where the
+        # clipped branch is active (sequence-level GSPO-style metric).
+        token_mask = action_mask[:, 1:].to(dtype=ratio.dtype)
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)
+        adv_pos = advantages >= 0
+        seq_clipped = torch.where(
+            adv_pos,
+            ratio > 1.0 + self.clip_eps_high,
+            ratio < 1.0 - self.clip_eps_low,
         )
+        total_tokens = token_counts.sum()
+        if total_tokens > 0:
+            ppo_clip_frac = (seq_clipped.to(token_counts.dtype) * token_counts).sum() / total_tokens
+        else:
+            ppo_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
         if self.ratio_clip is not None:
             ratio_clip_frac = (ratio >= self.ratio_clip).float().mean()
         else:
@@ -643,51 +478,33 @@ class CISPOLoss:
 
     def __post_init__(self) -> None:
         if self.clip_eps_high < 0:
-            raise ValueError(
-                f"clip_eps_high must be non-negative, got {self.clip_eps_high}"
-            )
+            raise ValueError(f"clip_eps_high must be non-negative, got {self.clip_eps_high}")
 
     @jaxtyped(typechecker=typechecker)
-    def compute(
-        self,
-        logits: Logits,
-        batch: Batch,
-        *,
-        shared: Optional[SharedContext] = None,
-    ) -> Tuple[Tensor, Dict[str, Any]]:
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
         advantages = batch["weight"]  # [B]
 
-        # Use shared context if available (memory-efficient composition)
-        if shared is not None:
-            token_logp = shared.token_logp
-            token_mask = shared.token_mask
-            token_counts = shared.token_counts
-            actor_logps_shifted = shared.actor_logps_shifted
-            log_ratio = shared.log_ratio
-            ratio = shared.ratio
-        else:
-            # Backward-compatible: compute locally
-            input_ids = batch["input_ids"]
-            action_mask = batch["action_mask"]
+        if "actor_logps" not in batch:
+            raise KeyError("CISPOLoss requires batch['actor_logps'] for importance sampling.")
 
-            if "actor_logps" not in batch:
-                raise KeyError(
-                    "CISPOLoss requires batch['actor_logps'] for importance sampling."
-                )
+        actor_logps = batch["actor_logps"]  # [B, T]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
 
-            actor_logps = batch["actor_logps"]  # [B, T]
-            if actor_logps.shape != input_ids.shape:
-                raise ValueError(
-                    f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
-                    f"{tuple(input_ids.shape)}."
-                )
+        # Compute token log probs under current policy
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
 
-            token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
-            token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
-            token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
-            actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
-            log_ratio = token_logp - actor_logps_shifted
-            ratio = torch.exp(log_ratio)
+        # Compute importance sampling ratios
+        log_ratio = token_logp - actor_logps_shifted
+        ratio = torch.exp(log_ratio)
 
         # CISPO: Clip the IS weight, not the update
         clipped_ratio = torch.clamp(
@@ -719,13 +536,9 @@ class CISPOLoss:
             ratio_std = ratio_vals.std(unbiased=False)
             # Fraction of tokens where IS weight was clipped
             clip_frac = (
-                (
-                    (ratio_vals > 1.0 + self.clip_eps_high)
-                    | (ratio_vals < 1.0 - self.clip_eps_low)
-                )
-                .float()
-                .mean()
-            )
+                (ratio_vals > 1.0 + self.clip_eps_high) |
+                (ratio_vals < 1.0 - self.clip_eps_low)
+            ).float().mean()
             # KL approximation: r - log(r) - 1
             token_kl = ratio_vals - log_ratio.masked_select(mask) - 1.0
             mismatch_kl = token_kl.mean()
@@ -745,112 +558,6 @@ class CISPOLoss:
             "adv_mean": advantages.mean().detach(),
             "adv_std": advantages.std(unbiased=False).detach(),
             "logp_mean": logp_action.mean().detach(),
-            "avg_action_tokens": token_counts.mean().detach(),
-        }
-        return loss, stats
-
-
-@dataclass
-class TokenKLLoss:
-    """
-    Token-level KL penalty between π_new and the behavior policy (actor).
-
-    Uses token-level log probabilities from batch["actor_logps"] to compute:
-
-        KL(π_new || π_actor) ≈ mean_t[ log π_new(a_t|s_t) - log π_actor(a_t|s_t) ]
-
-    This is designed to be consistent with CISPO's token-level approach,
-    where we want to penalize the policy for deviating too far from the
-    behavior policy at each token position.
-
-    Loss is:
-        loss = coeff * mean(kl)
-
-    Args:
-        coeff: KL penalty coefficient. Positive values penalize divergence.
-        length_normalize: If True, normalize by number of action tokens per sample
-            before averaging across samples.
-
-    Expects:
-        - batch["actor_logps"]: [B, T] log probs under behavior policy
-        - batch["action_mask"]: [B, T] mask for action tokens
-        - batch["input_ids"]: [B, T] token ids
-
-    Reference: Useful for stabilizing CISPO training (MiniMax-M1, arXiv:2506.13585)
-    """
-
-    coeff: float = 0.01
-    length_normalize: bool = True
-
-    @jaxtyped(typechecker=typechecker)
-    def compute(
-        self,
-        logits: Logits,
-        batch: Batch,
-        *,
-        shared: Optional[SharedContext] = None,
-    ) -> Tuple[Tensor, Dict[str, Any]]:
-        # Use shared context if available (memory-efficient composition)
-        if shared is not None:
-            token_logp = shared.token_logp
-            token_mask = shared.token_mask
-            token_counts = shared.token_counts
-            actor_logps_shifted = shared.actor_logps_shifted
-            token_kl = shared.log_ratio  # log π_new - log π_actor
-        else:
-            # Backward-compatible: compute locally
-            input_ids = batch["input_ids"]
-            action_mask = batch["action_mask"]
-
-            if "actor_logps" not in batch:
-                raise KeyError(
-                    "TokenKLLoss requires batch['actor_logps'] for KL computation."
-                )
-
-            actor_logps = batch["actor_logps"]  # [B, T]
-            if actor_logps.shape != input_ids.shape:
-                raise ValueError(
-                    f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
-                    f"{tuple(input_ids.shape)}."
-                )
-
-            token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
-            token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
-            token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
-            actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
-            token_kl = token_logp - actor_logps_shifted  # [B, T-1]
-
-        # Masked sum per sample
-        per_sample_kl = (token_kl * token_mask).sum(dim=-1)  # [B]
-        if self.length_normalize:
-            per_sample_kl = per_sample_kl / token_counts
-
-        mean_kl = per_sample_kl.mean()
-        loss = self.coeff * mean_kl
-
-        # Stats
-        mask = token_mask > 0
-        if mask.any():
-            kl_vals = token_kl.masked_select(mask)
-            kl_mean = kl_vals.mean()
-            kl_std = kl_vals.std(unbiased=False)
-            # Also compute ratio stats for monitoring
-            ratio = torch.exp(token_kl)
-            ratio_vals = ratio.masked_select(mask)
-            ratio_mean = ratio_vals.mean()
-            ratio_std = ratio_vals.std(unbiased=False)
-        else:
-            kl_mean = torch.zeros((), device=token_kl.device, dtype=token_kl.dtype)
-            kl_std = torch.zeros((), device=token_kl.device, dtype=token_kl.dtype)
-            ratio_mean = torch.zeros((), device=token_kl.device, dtype=token_kl.dtype)
-            ratio_std = torch.zeros((), device=token_kl.device, dtype=token_kl.dtype)
-
-        stats: Dict[str, Any] = {
-            "loss": loss.detach(),
-            "kl_mean": kl_mean.detach(),
-            "kl_std": kl_std.detach(),
-            "ratio_mean": ratio_mean.detach(),
-            "ratio_std": ratio_std.detach(),
             "avg_action_tokens": token_counts.mean().detach(),
         }
         return loss, stats
@@ -886,45 +593,27 @@ class TokenClippedSurrogateLoss:
             raise ValueError(f"ratio_clip must be positive, got {self.ratio_clip}")
 
     @jaxtyped(typechecker=typechecker)
-    def compute(
-        self,
-        logits: Logits,
-        batch: Batch,
-        *,
-        shared: Optional[SharedContext] = None,
-    ) -> Tuple[Tensor, Dict[str, Any]]:
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
         advantages = batch["weight"]
+        if "actor_logps" not in batch:
+            raise KeyError("TokenClippedSurrogateLoss requires batch['actor_logps'] for token IS.")
 
-        # Use shared context if available (memory-efficient composition)
-        if shared is not None:
-            token_logp = shared.token_logp
-            token_mask = shared.token_mask
-            token_counts = shared.token_counts
-            log_ratio = shared.log_ratio
-            ratio_raw = shared.ratio
-        else:
-            # Backward-compatible: compute locally
-            input_ids = batch["input_ids"]
-            action_mask = batch["action_mask"]
-            if "actor_logps" not in batch:
-                raise KeyError(
-                    "TokenClippedSurrogateLoss requires batch['actor_logps'] for token IS."
-                )
+        actor_logps = batch["actor_logps"]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
 
-            actor_logps = batch["actor_logps"]
-            if actor_logps.shape != input_ids.shape:
-                raise ValueError(
-                    f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
-                    f"{tuple(input_ids.shape)}."
-                )
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)
+        actor_logps_shifted = actor_logps[:, 1:]
 
-            token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
-            token_mask = action_mask[:, 1:].to(token_logp.dtype)
-            token_counts = token_mask.sum(dim=-1).clamp(min=1.0)
-            actor_logps_shifted = actor_logps[:, 1:]
-            log_ratio = token_logp - actor_logps_shifted
-            ratio_raw = torch.exp(log_ratio)
-
+        log_ratio = token_logp - actor_logps_shifted
+        ratio_raw = torch.exp(log_ratio)
         token_mismatch_kl = ratio_raw - log_ratio - 1.0
         ratio = ratio_raw
         if self.ratio_clip is not None:
@@ -947,22 +636,15 @@ class TokenClippedSurrogateLoss:
         if mask.any():
             ratio_vals = ratio.masked_select(mask)
             ppo_clip_frac = (
-                (
-                    (ratio_vals > 1.0 + self.clip_eps_high)
-                    | (ratio_vals < 1.0 - self.clip_eps_low)
-                )
-                .float()
-                .mean()
-            )
+                (ratio_vals > 1.0 + self.clip_eps_high) | (ratio_vals < 1.0 - self.clip_eps_low)
+            ).float().mean()
             ratio_mean = ratio_vals.mean()
             ratio_std = ratio_vals.std(unbiased=False)
             mismatch_kl = token_mismatch_kl.masked_select(mask).mean()
             if self.ratio_clip is not None:
                 ratio_clip_frac = (ratio_vals >= self.ratio_clip).float().mean()
             else:
-                ratio_clip_frac = torch.zeros(
-                    (), device=ratio.device, dtype=ratio.dtype
-                )
+                ratio_clip_frac = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
         else:
             ratio_mean = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
             ratio_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
@@ -975,6 +657,339 @@ class TokenClippedSurrogateLoss:
             "loss": loss.detach(),
             "ratio_mean": ratio_mean.detach(),
             "ratio_std": ratio_std.detach(),
+            "clip_frac": ppo_clip_frac.detach(),
+            "ratio_clip_frac": ratio_clip_frac.detach(),
+            "kl_actor_policy": mismatch_kl.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
+        }
+        return loss, stats
+
+
+@dataclass
+class SAPOLoss:
+    """
+    SAPO (Soft Adaptive Policy Optimization) loss.
+
+    SAPO replaces hard clipping with a smooth, temperature-controlled sigmoid gate
+    that adaptively attenuates off-policy updates while preserving useful learning
+    signals. Unlike hard clipping (GRPO) or sequence-level gates (GSPO), SAPO
+    applies a soft trust region at the token level that naturally yields sequence-level
+    coherence under mild conditions.
+
+    Core idea:
+        Instead of hard clipping: min(r * A, clip(r, 1-ε, 1+ε) * A)
+        SAPO uses soft gate:   f(r) * A, where f(r) = (4/τ) * σ(τ(r - 1))
+
+    The sigmoid gate σ(τ(r - 1)) peaks at r=1 and decays smoothly as r deviates,
+    implementing a continuous trust region. The temperature τ controls decay rate:
+    larger τ → faster decay → more conservative updates.
+
+    Asymmetric temperatures:
+        - τ_pos for positive advantages (token logit should increase)
+        - τ_neg for negative advantages (token logit should decrease)
+
+    Setting τ_neg > τ_pos makes negative gradients decay faster, improving stability.
+    Rationale: Negative updates diffuse to many unsampled tokens in a large vocabulary,
+    introducing more noise than positive updates which focus on the sampled token.
+
+    Objective:
+        J_SAPO = E[ (1/|o|) Σ_t f(ρ_t) * A ]
+        where f(r) = (4/τ) * σ(τ(r - 1))
+        and τ = τ_pos if A > 0 else τ_neg
+
+    Gradient weight (from differentiating f):
+        w(r) = 4 * p(r) * (1 - p(r)), where p(r) = σ(τ(r - 1))
+        This peaks at r=1 with value 1 and decays smoothly.
+
+    Connection to other methods:
+        - Under mild conditions (small steps, low token variance), SAPO reduces to
+          sequence-level optimization like GSPO but with smooth gating
+        - Compared to GRPO's hard token clipping, SAPO provides smooth scaling
+        - Compared to GSPO's sequence-level hard clipping, SAPO is token-adaptive
+
+    Expects:
+        - batch["weight"]:       A (advantages)       [B]
+        - batch["actor_logps"]:  token logps under behavior policy [B, T]
+        - input_ids / attention_mask / action_mask for π_new
+
+    Reference: "Soft Adaptive Policy Optimization" (arXiv:2511.20347v2)
+    https://arxiv.org/abs/2511.20347
+    """
+
+    tau_pos: float = 1.0    # Temperature for positive advantages
+    tau_neg: float = 1.05   # Temperature for negative advantages (higher for stability)
+    length_normalize: bool = False  # Normalize by sequence length
+
+    def __post_init__(self) -> None:
+        if self.tau_pos <= 0 or self.tau_neg <= 0:
+            raise ValueError(
+                f"tau_pos/tau_neg must be positive, got {self.tau_pos}, {self.tau_neg}"
+            )
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        advantages = batch["weight"]  # [B]
+
+        if "actor_logps" not in batch:
+            raise KeyError("SAPOLoss requires batch['actor_logps'] for token IS.")
+
+        actor_logps = batch["actor_logps"]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
+
+        # Compute token-level log probabilities
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
+
+        # Compute importance ratios
+        log_ratio = token_logp - actor_logps_shifted  # [B, T-1]
+        ratio = torch.exp(log_ratio)  # [B, T-1]
+
+        # Select temperature based on advantage sign
+        # Use where to select between tau_pos and tau_neg without creating new tensors
+        adv_positive = advantages > 0  # [B]
+        tau_pos_val = self.tau_pos
+        tau_neg_val = self.tau_neg
+
+        # Compute soft gate for positive and negative advantages separately
+        # This allows kernel fusion since we're not creating tensors in the graph
+        ratio_minus_1 = ratio - 1.0  # [B, T-1]
+
+        # For positive advantages: f(r) = (4/τ_pos) * σ(τ_pos * (r - 1))
+        # For negative advantages: f(r) = (4/τ_neg) * σ(τ_neg * (r - 1))
+        sigmoid_arg_pos = tau_pos_val * ratio_minus_1  # [B, T-1]
+        sigmoid_arg_neg = tau_neg_val * ratio_minus_1  # [B, T-1]
+
+        gate_pos = torch.sigmoid(sigmoid_arg_pos)  # [B, T-1]
+        gate_neg = torch.sigmoid(sigmoid_arg_neg)  # [B, T-1]
+
+        soft_gate_pos = (4.0 / tau_pos_val) * gate_pos  # [B, T-1]
+        soft_gate_neg = (4.0 / tau_neg_val) * gate_neg  # [B, T-1]
+
+        # Select based on advantage sign (broadcast over tokens)
+        adv_positive_expanded = adv_positive.unsqueeze(-1)  # [B, 1]
+        soft_gate = torch.where(adv_positive_expanded, soft_gate_pos, soft_gate_neg)  # [B, T-1]
+
+        # Apply gate to advantages (broadcast advantages over tokens)
+        adv_expanded = advantages.unsqueeze(-1)  # [B, 1]
+        gated_obj = soft_gate * adv_expanded * token_mask  # [B, T-1]
+
+        # Aggregate over tokens
+        per_sample_obj = gated_obj.sum(dim=-1)  # [B]
+        if self.length_normalize:
+            per_sample_obj = per_sample_obj / token_counts
+
+        loss = -per_sample_obj.mean()
+
+        # --- Stats computation ---
+        # Gradient weight: w(r) = 4 * p(r) * (1 - p(r))
+        # Select the correct gate based on advantage sign
+        gate_selected = torch.where(adv_positive_expanded, gate_pos, gate_neg)  # [B, T-1]
+        grad_weight = 4.0 * gate_selected * (1.0 - gate_selected)  # [B, T-1]
+
+        # Compute KL for monitoring
+        token_mismatch_kl = ratio - log_ratio - 1.0  # [B, T-1]
+
+        mask = token_mask > 0
+        if mask.any():
+            ratio_vals = ratio.masked_select(mask)
+            ratio_mean = ratio_vals.mean()
+            ratio_std = ratio_vals.std(unbiased=False)
+            mismatch_kl = token_mismatch_kl.masked_select(mask).mean()
+
+            # Average gradient weight (for monitoring soft gating)
+            grad_weight_vals = grad_weight.masked_select(mask)
+            grad_weight_mean = grad_weight_vals.mean()
+            grad_weight_std = grad_weight_vals.std(unbiased=False)
+        else:
+            ratio_mean = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            ratio_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            mismatch_kl = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            grad_weight_mean = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            grad_weight_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+
+        logp_action = (token_logp * token_mask).sum(dim=-1)
+        stats: Dict[str, Any] = {
+            "loss": loss.detach(),
+            "ratio_mean": ratio_mean.detach(),
+            "ratio_std": ratio_std.detach(),
+            "grad_weight_mean": grad_weight_mean.detach(),
+            "grad_weight_std": grad_weight_std.detach(),
+            "kl_actor_policy": mismatch_kl.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
+        }
+        return loss, stats
+
+
+@dataclass
+class GMPOLoss:
+    """
+    GMPO (Geometric-Mean Policy Optimization) loss.
+
+    GMPO stabilizes GRPO by using the geometric mean of token-level importance ratios
+    instead of the arithmetic mean. This makes the objective less sensitive to outliers
+    and results in more stable policy updates.
+
+    Objective:
+        J_GMPO = E[ (∏_t min(ρ_t * A, clip(ρ_t, 1-ε_low, 1+ε_high) * A))^(1/|o|) * sgn(A) ]
+
+    where:
+        - ρ_t = π_new(a_t|s_t) / π_old(a_t|s_t) is the token-level importance ratio
+        - A is the advantage (from batch["weight"])
+        - |o| is the sequence length (normalization factor)
+        - sgn(A) ensures correct optimization direction
+
+    Key differences from GRPO (TokenClippedSurrogateLoss):
+        1. Uses geometric mean instead of arithmetic mean (more robust to outliers)
+        2. Applies token-level clipping (not sequence-level)
+        3. Supports wider clipping ranges (e.g., (e^-0.4, e^0.4) instead of (0.8, 1.2))
+        4. Results in more stable importance sampling ratios during training
+
+    Implementation details:
+        - All operations performed in log-space for numerical stability
+        - Clipping applied at token level before geometric mean computation
+        - Normalization by sequence length (1/|o|) is critical for stability
+
+    Expects:
+        - batch["weight"]:       A (advantages)       [B]
+        - batch["actor_logps"]:  token logps under behavior policy [B, T]
+        - input_ids / attention_mask / action_mask for π_new.
+
+    Reference: "GMPO: Geometric-Mean Policy Optimization" (arXiv:2507.20673v3)
+    Defaults follow the GMPO paper settings with wider clipping (e^-0.4, e^0.4).
+    """
+
+    clip_eps_low: float = 0.4      # In log-space: clip to e^-0.4 ≈ 0.67
+    clip_eps_high: float = 0.4     # In log-space: clip to e^0.4 ≈ 1.49
+    length_normalize: bool = True  # 1/|o| normalization (critical for GMPO)
+    ratio_clip: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.clip_eps_low < 0 or self.clip_eps_high < 0:
+            raise ValueError(
+                f"clip_eps_low/high must be non-negative, got {self.clip_eps_low}, {self.clip_eps_high}"
+            )
+        if self.ratio_clip is not None and self.ratio_clip <= 0:
+            raise ValueError(f"ratio_clip must be positive, got {self.ratio_clip}")
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        advantages = batch["weight"]  # [B]
+
+        if "actor_logps" not in batch:
+            raise KeyError("GMPOLoss requires batch['actor_logps'] for token IS.")
+
+        actor_logps = batch["actor_logps"]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
+
+        # Compute token-level log probabilities
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
+
+        # Compute log importance ratios (in log-space for numerical stability)
+        log_ratio = token_logp - actor_logps_shifted  # [B, T-1]
+
+        # Sign of advantage (for correct optimization direction)
+        sgn_adv = torch.sign(advantages).unsqueeze(-1)  # [B, 1]
+
+        # Apply advantage sign to log ratios: sgn(A) * log(ρ_t)
+        sgn_log_ratio = sgn_adv * log_ratio  # [B, T-1]
+
+        # Token-level clipping in log-space
+        # clip(sgn(A) * log(ρ_t), -ε_low, ε_high)
+        sgn_log_ratio_clipped = torch.clamp(
+            sgn_log_ratio,
+            -self.clip_eps_low,
+            self.clip_eps_high
+        )  # [B, T-1]
+
+        # Take min of unclipped and clipped (still in log-space, signed)
+        sgn_log_ratio_min = torch.min(sgn_log_ratio, sgn_log_ratio_clipped)  # [B, T-1]
+
+        # Remove sign to get actual log ratios for geometric mean
+        log_ratio_min = sgn_adv * sgn_log_ratio_min  # [B, T-1]
+
+        # Geometric mean: exp(sum(log(ρ_t)) / |o|) = exp(mean(log(ρ_t)))
+        # Only sum over valid tokens (token_mask == 1)
+        sum_log_ratio = (log_ratio_min * token_mask).sum(dim=-1)  # [B]
+
+        if self.length_normalize:
+            # Normalize by sequence length: 1/|o| * sum(log(ρ_t))
+            geom_mean_log_ratio = sum_log_ratio / token_counts  # [B]
+        else:
+            geom_mean_log_ratio = sum_log_ratio  # [B]
+
+        # Convert back from log-space: ∏_t ρ_t^(1/|o|)
+        geom_mean_ratio = torch.exp(geom_mean_log_ratio)  # [B]
+
+        # Optional ratio clipping (after geometric mean)
+        if self.ratio_clip is not None:
+            geom_mean_ratio = torch.clamp(geom_mean_ratio, max=self.ratio_clip)
+
+        # Objective: geom_mean_ratio * A (advantage sign already handled in clipping)
+        obj = geom_mean_ratio * advantages  # [B]
+        loss = -obj.mean()
+
+        # --- Stats computation ---
+        # Compute raw ratios for monitoring (not used in loss)
+        ratio_raw = torch.exp(log_ratio)  # [B, T-1]
+        token_mismatch_kl = ratio_raw - log_ratio - 1.0  # [B, T-1]
+
+        mask = token_mask > 0
+        if mask.any():
+            ratio_vals = ratio_raw.masked_select(mask)
+
+            # Clip fraction in original ratio space (for comparison with GRPO)
+            # Note: GMPO clips in log-space, so we convert bounds
+            lower_bound = torch.exp(torch.tensor(-self.clip_eps_low, device=ratio_vals.device))
+            upper_bound = torch.exp(torch.tensor(self.clip_eps_high, device=ratio_vals.device))
+            ppo_clip_frac = (
+                (ratio_vals > upper_bound) | (ratio_vals < lower_bound)
+            ).float().mean()
+
+            ratio_mean = ratio_vals.mean()
+            ratio_std = ratio_vals.std(unbiased=False)
+            mismatch_kl = token_mismatch_kl.masked_select(mask).mean()
+
+            if self.ratio_clip is not None:
+                ratio_clip_frac = (geom_mean_ratio >= self.ratio_clip).float().mean()
+            else:
+                ratio_clip_frac = torch.zeros((), device=ratio_vals.device, dtype=ratio_vals.dtype)
+        else:
+            ratio_mean = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+            ratio_std = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+            ppo_clip_frac = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+            ratio_clip_frac = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+            mismatch_kl = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+
+        logp_action = (token_logp * token_mask).sum(dim=-1)
+        stats: Dict[str, Any] = {
+            "loss": loss.detach(),
+            "ratio_mean": ratio_mean.detach(),
+            "ratio_std": ratio_std.detach(),
+            "geom_mean_ratio_mean": geom_mean_ratio.mean().detach(),
+            "geom_mean_ratio_std": geom_mean_ratio.std(unbiased=False).detach(),
             "clip_frac": ppo_clip_frac.detach(),
             "ratio_clip_frac": ratio_clip_frac.detach(),
             "kl_actor_policy": mismatch_kl.detach(),
@@ -1013,30 +1028,10 @@ class KLLoss:
     length_normalize: bool = False
 
     @jaxtyped(typechecker=typechecker)
-    def compute(
-        self,
-        logits: Logits,
-        batch: Batch,
-        *,
-        shared: Optional[SharedContext] = None,
-    ) -> Tuple[Tensor, Dict[str, Any]]:
-        old_logp = batch[self.old_logp_key]  # [B]
-
-        # Use shared context if available (memory-efficient composition)
-        if shared is not None:
-            logp_new = shared.logp_action(length_normalize=self.length_normalize)
-            token_counts = shared.token_counts
-        else:
-            # Backward-compatible: compute locally
-            input_ids = batch["input_ids"]
-            action_mask = batch["action_mask"]
-            logp_new = compute_logp_action(
-                logits,
-                input_ids,
-                action_mask,
-                length_normalize=self.length_normalize,
-            )  # [B]
-            token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        old_logp = batch[self.old_logp_key]       # [B]
 
         if self.length_normalize:
             lengths = token_counts.to(old_logp.dtype)

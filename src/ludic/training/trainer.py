@@ -70,8 +70,8 @@ class Trainer:
         model: nn.Module,
         algo: RLAlgorithm,
         batch_source: BatchSource,
+        cfg: TrainerConfig,
         publisher: Optional[PolicyPublisher] = None,
-        cfg: TrainerConfig = TrainerConfig(),
         param_filter: Optional[Callable[[str, Tensor], bool]] = None,
         enable_gradient_checkpointing: bool = False,
         checkpointer: Optional[CheckpointManager] = None,
@@ -96,13 +96,13 @@ class Trainer:
                 The SAWBatch is treated as a macro-batch and split into
                 micro-batches for gradient accumulation.
 
-            publisher:
-                Abstract interface to push weights to inference workers. If None, weight
-                syncing is disabled.
-
             cfg:
                 TrainerConfig for device, optimizer hyperparams, pad_token_id,
                 micro_token_budget, max_seq_len, and sync_every_steps.
+
+            publisher:
+                Abstract interface to push weights to inference workers. If None, weight
+                syncing is disabled.
 
             param_filter:
                 Optional predicate (name, Tensor) -> bool deciding which
@@ -575,11 +575,17 @@ class Trainer:
             # ---- 2c) Loss + backward (scaled) --------------------------
             pre_forward_alloc = self._reset_peak_memory(device) if profile_memory else None
             try:
-                loss, stats = self.algo.compute_loss(
-                    self.model,
-                    batch_tensors,
-                    cast_logits_to_fp32=self.cfg.cast_logits_to_fp32,
-                )
+                loss, stats = self.algo.compute_loss(self.model, batch_tensors)
+
+                # Scale loss by micro-batch size to preserve macro-batch mean.
+                scaled_loss = loss * (item_count / total_items)
+                if profile_memory:
+                    # Forward memory stats before backward frees activations
+                    forward_mem_stats, alloc_after_forward, forward_peak = (
+                        self._capture_forward_memory_stats(device, pre_forward_alloc)
+                    )
+                else:
+                    forward_mem_stats, alloc_after_forward, forward_peak = {}, None, None
 
                 # Scale loss by micro-batch size to preserve macro-batch mean.
                 scaled_loss = loss * (item_count / total_items)
@@ -701,8 +707,6 @@ class Trainer:
             raise ValueError(
                 "Trainer evaluation requested (eval_at_start or eval_every_n_steps) but no evaluator was provided."
             )
-        if self.cfg.pad_token_id is None:
-            raise ValueError("TrainerConfig.pad_token_id must be set for collation.")
         if self.cfg.max_seq_len < 1:
             raise ValueError("TrainerConfig.max_seq_len must be >= 1.")
         if self.cfg.micro_token_budget <= 0:

@@ -24,7 +24,7 @@ class PipelineBatchSource(BatchSource):
     Pulls completed, pre-processed SAWItems from a Redis queue.
     
     This decouples the Trainer from the generation latency. The Trainer
-    simply blocks on the queue until data arrives.
+    simply blocks on the queue until a macro-batch is assembled.
     """
     def __init__(
         self, 
@@ -36,7 +36,9 @@ class PipelineBatchSource(BatchSource):
         try:
             import redis  # type: ignore
         except ImportError as exc:
-            raise ImportError("PipelineBatchSource requires the 'redis' package. Install with: uv pip install redis") from exc
+            raise ImportError(
+                "PipelineBatchSource requires the 'redis' package. Install with: uv sync --extra pipelinerl"
+            ) from exc
 
         self.r = redis.from_url(redis_url)
         self.queue_key = queue_key
@@ -76,7 +78,7 @@ class PipelineBatchSource(BatchSource):
             avg_reward = total_r / len(items)
 
         meta = {
-            "num_rollouts": len(items),
+            "target_rollouts": len(items),
             "num_samples": len(items),
             "avg_total_reward": avg_reward,
             "source": "pipeline_redis"
@@ -104,13 +106,15 @@ async def run_pipeline_actor(
     1. Fetch intent via requests_fn.
     2. Poll the runtime (via client) for the current policy version.
     3. Tag requests with that version.
-    4. Delegate generation AND collation to the shared Engine.
+    4. Delegate generation AND collation to the shared Engine (one SAWItem per turn).
     5. Push the resulting SAWItems to Redis.
     """
     try:
         import redis  # type: ignore
     except ImportError as exc:
-        raise ImportError("run_pipeline_actor requires the 'redis' package. Install with: uv pip install redis") from exc
+        raise ImportError(
+            "run_pipeline_actor requires the 'redis' package. Install with: uv sync --extra pipelinerl"
+        ) from exc
 
     r_conn = redis.from_url(redis_url)
     logger.info(f"Pipeline Actor connected to Redis at {redis_url}")
