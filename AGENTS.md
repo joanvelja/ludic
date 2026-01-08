@@ -108,9 +108,9 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
 
 - **Algorithm injection (credit + loss)**: `src/ludic/training/algorithm.py`
   - `RLAlgorithm = (CreditAssigner, Loss)`
-  - Presets: `make_reinforce()`, `make_reinforce_baseline()`, `make_grpo()`, `make_sft()`
+  - Presets: `make_reinforce()`, `make_reinforce_baseline()`, `make_grpo()`, `make_dr_grpo()`, `make_gspo()`, `make_cispo()`, `make_gmpo()`, `make_sft()`
   - Credit assigners: `src/ludic/training/credit_assignment.py` – `MonteCarloReturn`, `GroupNormalizedReturn`, `EpisodicReturn`, `PerStepReward`, `ConstantCredit`
-  - Losses: `src/ludic/training/loss.py`
+  - Losses: `src/ludic/training/loss.py` – `ReinforceLoss`, `TokenClippedSurrogateLoss`, `ClippedSurrogateLoss`, `CISPOLoss`, `GMPOLoss`, `MaskedCausalLMCrossEntropyLoss`
 
 - **Trainer (optimization loop only)**: `src/ludic/training/trainer.py`
   - Collates `SAWItem` → tensors and runs `RLAlgorithm.loss`.
@@ -146,6 +146,23 @@ GRPO mental model in this codebase:
 - It's still **policy-gradient** training on sampled tokens.
 - It avoids a learned **value function** by using a **Monte Carlo / group-relative baseline** (group mean reward for the same prompt) to form advantages.
 - If you come from PPO-RLHF: think "PPO-shaped dataflow" without a critic/value model, where the "advantage" is estimated by group comparison rather than by GAE/value bootstrapping.
+
+## GMPO (Geometric-Mean Policy Optimization)
+
+**GMPO** (arXiv:2507.20673) is a variant of GRPO that uses the **geometric mean** of token-level importance ratios instead of the arithmetic mean.
+
+**Core idea**:
+- GRPO optimizes: (1/|o|) Σ_t ρ_t * A (arithmetic mean)
+- GMPO optimizes: (∏_t ρ_t)^(1/|o|) * A (geometric mean)
+
+The geometric mean is less sensitive to outlier importance ratios, which can help prevent extreme policy updates when individual tokens have unusually high or low ratios.
+
+**Implementation** (`src/ludic/training/loss.py`, `src/ludic/training/algorithm.py`):
+- **Loss**: `GMPOLoss` computes the geometric mean in log-space for numerical stability
+- **Objective**: J_GMPO = E[ (∏_t min(ρ_t * A, clip(ρ_t, e^-ε_low, e^ε_high) * A))^(1/|o|) * sgn(A) ]
+- **Clipping**: Token-level clipping in log-space, wider default range (e^-0.4, e^0.4) vs GRPO's (0.8, 1.2)
+- **Normalization**: 1/|o| sequence length normalization
+- **Preset**: `make_gmpo(group_size=4)` uses same credit assignment as GRPO (`GroupNormalizedReturn`)
 
 ## SFT / Offline RL
 

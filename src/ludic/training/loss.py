@@ -652,6 +652,173 @@ class TokenClippedSurrogateLoss:
         return loss, stats
 
 
+@dataclass
+class GMPOLoss:
+    """
+    GMPO (Geometric-Mean Policy Optimization) loss.
+
+    GMPO stabilizes GRPO by using the geometric mean of token-level importance ratios
+    instead of the arithmetic mean. This makes the objective less sensitive to outliers
+    and results in more stable policy updates.
+
+    Objective:
+        J_GMPO = E[ (∏_t min(ρ_t * A, clip(ρ_t, 1-ε_low, 1+ε_high) * A))^(1/|o|) * sgn(A) ]
+
+    where:
+        - ρ_t = π_new(a_t|s_t) / π_old(a_t|s_t) is the token-level importance ratio
+        - A is the advantage (from batch["weight"])
+        - |o| is the sequence length (normalization factor)
+        - sgn(A) ensures correct optimization direction
+
+    Key differences from GRPO (TokenClippedSurrogateLoss):
+        1. Uses geometric mean instead of arithmetic mean (more robust to outliers)
+        2. Applies token-level clipping (not sequence-level)
+        3. Supports wider clipping ranges (e.g., (e^-0.4, e^0.4) instead of (0.8, 1.2))
+        4. Results in more stable importance sampling ratios during training
+
+    Implementation details:
+        - All operations performed in log-space for numerical stability
+        - Clipping applied at token level before geometric mean computation
+        - Normalization by sequence length (1/|o|) is critical for stability
+
+    Expects:
+        - batch["weight"]:       A (advantages)       [B]
+        - batch["actor_logps"]:  token logps under behavior policy [B, T]
+        - input_ids / attention_mask / action_mask for π_new.
+
+    Reference: "GMPO: Geometric-Mean Policy Optimization" (arXiv:2507.20673v3)
+    Defaults follow the GMPO paper settings with wider clipping (e^-0.4, e^0.4).
+    """
+
+    clip_eps_low: float = 0.4      # In log-space: clip to e^-0.4 ≈ 0.67
+    clip_eps_high: float = 0.4     # In log-space: clip to e^0.4 ≈ 1.49
+    length_normalize: bool = True  # 1/|o| normalization (critical for GMPO)
+    ratio_clip: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.clip_eps_low < 0 or self.clip_eps_high < 0:
+            raise ValueError(
+                f"clip_eps_low/high must be non-negative, got {self.clip_eps_low}, {self.clip_eps_high}"
+            )
+        if self.ratio_clip is not None and self.ratio_clip <= 0:
+            raise ValueError(f"ratio_clip must be positive, got {self.ratio_clip}")
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        advantages = batch["weight"]  # [B]
+
+        if "actor_logps" not in batch:
+            raise KeyError("GMPOLoss requires batch['actor_logps'] for token IS.")
+
+        actor_logps = batch["actor_logps"]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
+
+        # Compute token-level log probabilities
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
+
+        # Compute log importance ratios (in log-space for numerical stability)
+        log_ratio = token_logp - actor_logps_shifted  # [B, T-1]
+
+        # Sign of advantage (for correct optimization direction)
+        sgn_adv = torch.sign(advantages).unsqueeze(-1)  # [B, 1]
+
+        # Apply advantage sign to log ratios: sgn(A) * log(ρ_t)
+        sgn_log_ratio = sgn_adv * log_ratio  # [B, T-1]
+
+        # Token-level clipping in log-space
+        # clip(sgn(A) * log(ρ_t), -ε_low, ε_high)
+        sgn_log_ratio_clipped = torch.clamp(
+            sgn_log_ratio,
+            -self.clip_eps_low,
+            self.clip_eps_high
+        )  # [B, T-1]
+
+        # Take min of unclipped and clipped (still in log-space, signed)
+        sgn_log_ratio_min = torch.min(sgn_log_ratio, sgn_log_ratio_clipped)  # [B, T-1]
+
+        # Remove sign to get actual log ratios for geometric mean
+        log_ratio_min = sgn_adv * sgn_log_ratio_min  # [B, T-1]
+
+        # Geometric mean: exp(sum(log(ρ_t)) / |o|) = exp(mean(log(ρ_t)))
+        # Only sum over valid tokens (token_mask == 1)
+        sum_log_ratio = (log_ratio_min * token_mask).sum(dim=-1)  # [B]
+
+        if self.length_normalize:
+            # Normalize by sequence length: 1/|o| * sum(log(ρ_t))
+            geom_mean_log_ratio = sum_log_ratio / token_counts  # [B]
+        else:
+            geom_mean_log_ratio = sum_log_ratio  # [B]
+
+        # Convert back from log-space: ∏_t ρ_t^(1/|o|)
+        geom_mean_ratio = torch.exp(geom_mean_log_ratio)  # [B]
+
+        # Optional ratio clipping (after geometric mean)
+        if self.ratio_clip is not None:
+            geom_mean_ratio = torch.clamp(geom_mean_ratio, max=self.ratio_clip)
+
+        # Objective: geom_mean_ratio * A (advantage sign already handled in clipping)
+        obj = geom_mean_ratio * advantages  # [B]
+        loss = -obj.mean()
+
+        # --- Stats computation ---
+        # Compute raw ratios for monitoring (not used in loss)
+        ratio_raw = torch.exp(log_ratio)  # [B, T-1]
+        token_mismatch_kl = ratio_raw - log_ratio - 1.0  # [B, T-1]
+
+        mask = token_mask > 0
+        if mask.any():
+            ratio_vals = ratio_raw.masked_select(mask)
+
+            # Clip fraction in original ratio space (for comparison with GRPO)
+            # Note: GMPO clips in log-space, so we convert bounds
+            lower_bound = torch.exp(torch.tensor(-self.clip_eps_low, device=ratio_vals.device))
+            upper_bound = torch.exp(torch.tensor(self.clip_eps_high, device=ratio_vals.device))
+            ppo_clip_frac = (
+                (ratio_vals > upper_bound) | (ratio_vals < lower_bound)
+            ).float().mean()
+
+            ratio_mean = ratio_vals.mean()
+            ratio_std = ratio_vals.std(unbiased=False)
+            mismatch_kl = token_mismatch_kl.masked_select(mask).mean()
+
+            if self.ratio_clip is not None:
+                ratio_clip_frac = (geom_mean_ratio >= self.ratio_clip).float().mean()
+            else:
+                ratio_clip_frac = torch.zeros((), device=ratio_vals.device, dtype=ratio_vals.dtype)
+        else:
+            ratio_mean = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+            ratio_std = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+            ppo_clip_frac = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+            ratio_clip_frac = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+            mismatch_kl = torch.zeros((), device=log_ratio.device, dtype=log_ratio.dtype)
+
+        logp_action = (token_logp * token_mask).sum(dim=-1)
+        stats: Dict[str, Any] = {
+            "loss": loss.detach(),
+            "ratio_mean": ratio_mean.detach(),
+            "ratio_std": ratio_std.detach(),
+            "geom_mean_ratio_mean": geom_mean_ratio.mean().detach(),
+            "geom_mean_ratio_std": geom_mean_ratio.std(unbiased=False).detach(),
+            "clip_frac": ppo_clip_frac.detach(),
+            "ratio_clip_frac": ratio_clip_frac.detach(),
+            "kl_actor_policy": mismatch_kl.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
+        }
+        return loss, stats
+
+
 # ---------------------------------------------------------------------------
 # KL penalty and entropy bonus
 # ---------------------------------------------------------------------------

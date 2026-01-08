@@ -14,6 +14,7 @@ from ludic.training.loss import (
     ClippedSurrogateLoss,
     TokenClippedSurrogateLoss,
     CISPOLoss,
+    GMPOLoss,
     MaskedCausalLMCrossEntropyLoss,
 )
 from ludic.training.credit_assignment import MonteCarloReturn, GroupNormalizedReturn, ConstantCredit
@@ -442,6 +443,108 @@ def make_cispo(
         clip_eps_low=clip_eps_low,
         clip_eps_high=clip_eps_high,
         length_normalize=length_normalize,
+    )
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
+def make_gmpo(
+    *,
+    group_size: int,
+    group_normalize_adv: bool = True,
+    positive_only: bool = False,
+    clip_eps_low: float = 0.4,
+    clip_eps_high: float = 0.4,
+    length_normalize: bool = True,
+    ratio_clip: Optional[float] = None,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "gmpo",
+) -> RLAlgorithm:
+    """
+    GMPO (Geometric-Mean Policy Optimization) preset.
+
+    GMPO stabilizes GRPO by using the geometric mean of token-level importance
+    ratios instead of the arithmetic mean. This makes the objective less sensitive
+    to outliers and results in more stable policy updates with fewer extreme
+    importance sampling ratios.
+
+    Key advantages over GRPO:
+        1. More robust to outlier tokens (geometric mean vs arithmetic mean)
+        2. More stable importance sampling ratios during training
+        3. Supports wider clipping ranges (e.g., (e^-0.4, e^0.4) vs (0.8, 1.2))
+        4. Better exploration due to higher entropy maintenance
+        5. More stable gradients and lower KL divergence from reference policy
+
+    Objective:
+        J_GMPO = E[ (∏_t min(ρ_t * A, clip(ρ_t, e^-ε_low, e^ε_high) * A))^(1/|o|) * sgn(A) ]
+
+    where:
+        - ρ_t = π_new(a_t|s_t) / π_old(a_t|s_t) is the token-level importance ratio
+        - A is the advantage (group-normalized)
+        - |o| is the sequence length
+        - Clipping is performed at the token level in log-space
+
+    Implementation differences from GRPO:
+        - Uses geometric mean: (∏_t ρ_t)^(1/|o|) instead of (1/|o|) Σ_t ρ_t
+        - All operations performed in log-space for numerical stability
+        - Token-level clipping (not sequence-level as in DeepSeek-R1)
+        - Wider default clipping range: (e^-0.4, e^0.4) ≈ (0.67, 1.49)
+
+    Args:
+        group_size: Number of rollouts per group for advantage normalization.
+        group_normalize_adv: Whether to normalize advantages within each group.
+            Recommended: True (follows GRPO and paper experiments).
+        positive_only: If True, clip negative advantages to zero.
+        clip_eps_low: Lower clipping epsilon in log-space. Default 0.4 means
+            clipping to e^-0.4 ≈ 0.67. Paper uses (e^-0.4, e^0.4).
+        clip_eps_high: Upper clipping epsilon in log-space. Default 0.4 means
+            clipping to e^0.4 ≈ 1.49.
+        length_normalize: Whether to normalize by sequence length (1/|o|).
+            This is critical for GMPO stability. Default: True.
+        ratio_clip: Optional upper bound for geometric mean ratio truncation.
+        drop_zero_weight: Whether to drop zero-advantage samples before training.
+        drop_zero_weight_eps: Epsilon for zero-weight detection.
+        name: Algorithm name for logging/metrics.
+
+    Note: Rollouts must carry `group_id` in their metadata and each group
+    must have exactly `group_size` members. Use GRPORequestStrategy for
+    request expansion.
+
+    Reference: "GMPO: Geometric-Mean Policy Optimization" (arXiv:2507.20673v3)
+    https://arxiv.org/abs/2507.20673
+
+    Usage example:
+        ```python
+        from ludic.training import make_gmpo, GRPORequestStrategy
+
+        # Create GMPO algorithm
+        algo = make_gmpo(group_size=4)
+
+        # Use with GRPO request expansion
+        request_strategy = GRPORequestStrategy(group_size=4)
+        ```
+    """
+    credit_assigner: CreditAssigner = GroupNormalizedReturn(
+        group_size=group_size,
+        normalize_adv=group_normalize_adv,
+        positive_only=positive_only,
+    )
+    loss: Loss = GMPOLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+        ratio_clip=ratio_clip,
     )
     preprocess_fns = []
     if drop_zero_weight:

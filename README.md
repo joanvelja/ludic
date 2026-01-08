@@ -63,18 +63,41 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 
 ### Examples at a glance
 
-- Tic-Tac-Toe (`examples/tic_tac_toe/`): a small env that’s useful for iterating on the full stack without paying a huge sampling bill.
+- Tic-Tac-Toe (`examples/tic_tac_toe/`): a small env that's useful for iterating on the full stack without paying a huge sampling bill.
 	- Online RL: `examples/tic_tac_toe/train_tic_tac_toe.py` does LoRA fine-tuning with GRPO-style group-relative credit assignment.
-	- SFT: `examples/tic_tac_toe/sft_tic_tac_toe.py` is the “offline” counterpart; it’s useful if you want to bootstrap a policy (format-following, basic competence) before turning on online RL.
+	- SFT: `examples/tic_tac_toe/sft_tic_tac_toe.py` is the "offline" counterpart; it's useful if you want to bootstrap a policy (format-following, basic competence) before turning on online RL.
 	- Data + eval: `examples/tic_tac_toe/generate_synth_data.py` and `examples/tic_tac_toe/eval_tic_tac_toe_vllm.py`.
 
-- GSM8K (`examples/gsm8k/`): a more “standard” QA-shaped workload with training + evaluation scripts (`examples/gsm8k/train_gsm8k.py`, `examples/gsm8k/eval_gsm8k_vllm.py`).
+- GSM8K (`examples/gsm8k/`): a more "standard" QA-shaped workload with training + evaluation scripts (`examples/gsm8k/train_gsm8k.py`, `examples/gsm8k/eval_gsm8k_vllm.py`).
 
 - FSDP2 Math (`examples/fsdp2_training/`): a multi-GPU template showing FSDP2 wrapping, NCCL weight pushes to vLLM, and GRPO-style credit assignment (`examples/fsdp2_training/train_math_fsdp2.py`).
 
 - Pipeline RL (`examples/pipeline_rl/`): an actor/learner split over Redis for async sampling (`examples/pipeline_rl/run_actor.py`, `examples/pipeline_rl/run_trainer.py`). This is still experimental.
 
 - Rejection sampling (`examples/rejection_sampling.py`): generate rollouts, filter them, and write training-ready JSONL for offline training.
+
+### Algorithm Presets
+
+Ludic provides several algorithm presets that combine credit assignment with loss functions:
+
+- **GRPO** (`make_grpo`): Group Relative Policy Optimization with token-level clipped surrogate loss. Default clipping: (0.8, 1.2).
+- **GMPO** (`make_gmpo`): Uses geometric mean of token-level importance ratios instead of arithmetic mean. The geometric mean is less sensitive to outlier tokens, which can help with training stability. Wider default clipping: (e^-0.4, e^0.4) ≈ (0.67, 1.49).
+- **Dr. GRPO** (`make_dr_grpo`): Unbiased GRPO variant without std normalization.
+- **GSPO** (`make_gspo`): Sequence-level importance ratios with geometric mean.
+- **CISPO** (`make_cispo`): Clipped IS-weight optimization that preserves gradients from reflective reasoning tokens.
+- **REINFORCE** (`make_reinforce`): Classic policy gradient with importance sampling correction.
+- **SFT** (`make_sft`): Supervised fine-tuning (behavioral cloning) for cold-start training.
+
+Example usage:
+```python
+from ludic.training import make_gmpo, GRPORequestStrategy
+
+# Create GMPO algorithm with group size 4
+algo = make_gmpo(group_size=4)
+
+# Use with GRPO request expansion
+request_strategy = GRPORequestStrategy(group_size=4)
+```
 
 ## Token-in Inference (Drift-Free)
 
