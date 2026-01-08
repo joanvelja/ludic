@@ -80,6 +80,10 @@ class RLAlgorithm:
         )
         logits: Logits = outputs.logits
 
+        # ScaleRL: FP32 logits prevent IS ratio precision issues in exp(logp_new - logp_old)
+        if cast_logits_to_fp32:
+            logits = logits.float()
+
         # Pass the resulting logits to the loss function
         return self.loss.compute(logits, batch)
 
