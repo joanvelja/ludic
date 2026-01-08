@@ -81,6 +81,7 @@ If you care about truncation semantics (env time limits vs protocol cutoffs vs m
 Ludic provides several algorithm presets that combine credit assignment with loss functions:
 
 - **GRPO** (`make_grpo`): Group Relative Policy Optimization with token-level clipped surrogate loss. Default clipping: (0.8, 1.2).
+- **SAPO** (`make_sapo`): Uses a soft sigmoid gate instead of hard clipping. The gate smoothly attenuates off-policy updates while preserving learning signals. Asymmetric temperatures (τ_neg > τ_pos) for stability.
 - **GMPO** (`make_gmpo`): Uses geometric mean of token-level importance ratios instead of arithmetic mean. The geometric mean is less sensitive to outlier tokens, which can help with training stability. Wider default clipping: (e^-0.4, e^0.4) ≈ (0.67, 1.49).
 - **Dr. GRPO** (`make_dr_grpo`): Unbiased GRPO variant without std normalization.
 - **GSPO** (`make_gspo`): Sequence-level importance ratios with geometric mean.

@@ -14,6 +14,7 @@ from ludic.training.loss import (
     ClippedSurrogateLoss,
     TokenClippedSurrogateLoss,
     CISPOLoss,
+    SAPOLoss,
     GMPOLoss,
     MaskedCausalLMCrossEntropyLoss,
 )
@@ -442,6 +443,102 @@ def make_cispo(
     loss: Loss = CISPOLoss(
         clip_eps_low=clip_eps_low,
         clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+    )
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps))
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
+def make_sapo(
+    *,
+    group_size: int,
+    group_normalize_adv: bool = True,
+    positive_only: bool = False,
+    tau_pos: float = 1.0,
+    tau_neg: float = 1.05,
+    length_normalize: bool = False,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "sapo",
+) -> RLAlgorithm:
+    """
+    SAPO (Soft Adaptive Policy Optimization) preset.
+
+    SAPO replaces hard clipping with a smooth, temperature-controlled sigmoid gate
+    that adaptively attenuates off-policy updates while preserving learning signals.
+    The soft gate implements a continuous trust region that is both sequence-coherent
+    and token-adaptive.
+
+    Core mechanism:
+        Instead of hard clipping: min(r * A, clip(r, 1-ε, 1+ε) * A)
+        SAPO uses soft gate:      f(r) * A, where f(r) = (4/τ) * σ(τ(r - 1))
+
+    The sigmoid gate σ(τ(r - 1)) peaks at r=1 (on-policy) and decays smoothly as
+    r deviates, providing gradual attenuation rather than abrupt cutoff.
+
+    Asymmetric temperatures:
+        - τ_pos: temperature for positive advantages (increase token logit)
+        - τ_neg: temperature for negative advantages (decrease token logit)
+
+    Setting τ_neg > τ_pos makes negative gradients decay faster, improving stability.
+    This is motivated by the observation that negative updates diffuse to many
+    unsampled tokens in the vocabulary, introducing more noise than positive updates.
+
+    Advantages over hard clipping methods:
+        - vs GRPO: smooth token-level scaling instead of hard cutoff
+        - vs GSPO: token-adaptive (preserves signal from near-on-policy tokens even
+          when sequence has outliers)
+        - Maintains sequence-level coherence under mild conditions (small steps,
+          low token variance)
+
+    Args:
+        group_size: Number of rollouts per group for advantage normalization.
+        group_normalize_adv: Whether to normalize advantages within each group.
+        positive_only: If True, clip negative advantages to zero.
+        tau_pos: Temperature for positive advantages. Default: 1.0 (paper setting).
+        tau_neg: Temperature for negative advantages. Default: 1.05 (paper setting).
+            Higher values → faster decay → more conservative.
+        length_normalize: Whether to normalize by sequence length.
+        drop_zero_weight: Whether to drop zero-advantage samples.
+        drop_zero_weight_eps: Epsilon for zero-weight detection.
+        name: Algorithm name for logging.
+
+    Note: Rollouts must carry `group_id` in their metadata and each group
+    must have exactly `group_size` members. Use GRPORequestStrategy for
+    request expansion.
+
+    Reference: "Soft Adaptive Policy Optimization" (arXiv:2511.20347v2)
+    https://arxiv.org/abs/2511.20347
+
+    Usage example:
+        ```python
+        from ludic.training import make_sapo, GRPORequestStrategy
+
+        # Create SAPO algorithm
+        algo = make_sapo(group_size=4)
+
+        # Use with GRPO request expansion
+        request_strategy = GRPORequestStrategy(group_size=4)
+        ```
+    """
+    credit_assigner: CreditAssigner = GroupNormalizedReturn(
+        group_size=group_size,
+        normalize_adv=group_normalize_adv,
+        positive_only=positive_only,
+    )
+    loss: Loss = SAPOLoss(
+        tau_pos=tau_pos,
+        tau_neg=tau_neg,
         length_normalize=length_normalize,
     )
     preprocess_fns = []

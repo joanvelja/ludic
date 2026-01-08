@@ -653,6 +653,172 @@ class TokenClippedSurrogateLoss:
 
 
 @dataclass
+class SAPOLoss:
+    """
+    SAPO (Soft Adaptive Policy Optimization) loss.
+
+    SAPO replaces hard clipping with a smooth, temperature-controlled sigmoid gate
+    that adaptively attenuates off-policy updates while preserving useful learning
+    signals. Unlike hard clipping (GRPO) or sequence-level gates (GSPO), SAPO
+    applies a soft trust region at the token level that naturally yields sequence-level
+    coherence under mild conditions.
+
+    Core idea:
+        Instead of hard clipping: min(r * A, clip(r, 1-ε, 1+ε) * A)
+        SAPO uses soft gate:   f(r) * A, where f(r) = (4/τ) * σ(τ(r - 1))
+
+    The sigmoid gate σ(τ(r - 1)) peaks at r=1 and decays smoothly as r deviates,
+    implementing a continuous trust region. The temperature τ controls decay rate:
+    larger τ → faster decay → more conservative updates.
+
+    Asymmetric temperatures:
+        - τ_pos for positive advantages (token logit should increase)
+        - τ_neg for negative advantages (token logit should decrease)
+
+    Setting τ_neg > τ_pos makes negative gradients decay faster, improving stability.
+    Rationale: Negative updates diffuse to many unsampled tokens in a large vocabulary,
+    introducing more noise than positive updates which focus on the sampled token.
+
+    Objective:
+        J_SAPO = E[ (1/|o|) Σ_t f(ρ_t) * A ]
+        where f(r) = (4/τ) * σ(τ(r - 1))
+        and τ = τ_pos if A > 0 else τ_neg
+
+    Gradient weight (from differentiating f):
+        w(r) = 4 * p(r) * (1 - p(r)), where p(r) = σ(τ(r - 1))
+        This peaks at r=1 with value 1 and decays smoothly.
+
+    Connection to other methods:
+        - Under mild conditions (small steps, low token variance), SAPO reduces to
+          sequence-level optimization like GSPO but with smooth gating
+        - Compared to GRPO's hard token clipping, SAPO provides smooth scaling
+        - Compared to GSPO's sequence-level hard clipping, SAPO is token-adaptive
+
+    Expects:
+        - batch["weight"]:       A (advantages)       [B]
+        - batch["actor_logps"]:  token logps under behavior policy [B, T]
+        - input_ids / attention_mask / action_mask for π_new
+
+    Reference: "Soft Adaptive Policy Optimization" (arXiv:2511.20347v2)
+    https://arxiv.org/abs/2511.20347
+    """
+
+    tau_pos: float = 1.0    # Temperature for positive advantages
+    tau_neg: float = 1.05   # Temperature for negative advantages (higher for stability)
+    length_normalize: bool = False  # Normalize by sequence length
+
+    def __post_init__(self) -> None:
+        if self.tau_pos <= 0 or self.tau_neg <= 0:
+            raise ValueError(
+                f"tau_pos/tau_neg must be positive, got {self.tau_pos}, {self.tau_neg}"
+            )
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]
+        action_mask = batch["action_mask"]
+        advantages = batch["weight"]  # [B]
+
+        if "actor_logps" not in batch:
+            raise KeyError("SAPOLoss requires batch['actor_logps'] for token IS.")
+
+        actor_logps = batch["actor_logps"]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
+
+        # Compute token-level log probabilities
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
+
+        # Compute importance ratios
+        log_ratio = token_logp - actor_logps_shifted  # [B, T-1]
+        ratio = torch.exp(log_ratio)  # [B, T-1]
+
+        # Select temperature based on advantage sign
+        # Use where to select between tau_pos and tau_neg without creating new tensors
+        adv_positive = advantages > 0  # [B]
+        tau_pos_val = self.tau_pos
+        tau_neg_val = self.tau_neg
+
+        # Compute soft gate for positive and negative advantages separately
+        # This allows kernel fusion since we're not creating tensors in the graph
+        ratio_minus_1 = ratio - 1.0  # [B, T-1]
+
+        # For positive advantages: f(r) = (4/τ_pos) * σ(τ_pos * (r - 1))
+        # For negative advantages: f(r) = (4/τ_neg) * σ(τ_neg * (r - 1))
+        sigmoid_arg_pos = tau_pos_val * ratio_minus_1  # [B, T-1]
+        sigmoid_arg_neg = tau_neg_val * ratio_minus_1  # [B, T-1]
+
+        gate_pos = torch.sigmoid(sigmoid_arg_pos)  # [B, T-1]
+        gate_neg = torch.sigmoid(sigmoid_arg_neg)  # [B, T-1]
+
+        soft_gate_pos = (4.0 / tau_pos_val) * gate_pos  # [B, T-1]
+        soft_gate_neg = (4.0 / tau_neg_val) * gate_neg  # [B, T-1]
+
+        # Select based on advantage sign (broadcast over tokens)
+        adv_positive_expanded = adv_positive.unsqueeze(-1)  # [B, 1]
+        soft_gate = torch.where(adv_positive_expanded, soft_gate_pos, soft_gate_neg)  # [B, T-1]
+
+        # Apply gate to advantages (broadcast advantages over tokens)
+        adv_expanded = advantages.unsqueeze(-1)  # [B, 1]
+        gated_obj = soft_gate * adv_expanded * token_mask  # [B, T-1]
+
+        # Aggregate over tokens
+        per_sample_obj = gated_obj.sum(dim=-1)  # [B]
+        if self.length_normalize:
+            per_sample_obj = per_sample_obj / token_counts
+
+        loss = -per_sample_obj.mean()
+
+        # --- Stats computation ---
+        # Gradient weight: w(r) = 4 * p(r) * (1 - p(r))
+        # Select the correct gate based on advantage sign
+        gate_selected = torch.where(adv_positive_expanded, gate_pos, gate_neg)  # [B, T-1]
+        grad_weight = 4.0 * gate_selected * (1.0 - gate_selected)  # [B, T-1]
+
+        # Compute KL for monitoring
+        token_mismatch_kl = ratio - log_ratio - 1.0  # [B, T-1]
+
+        mask = token_mask > 0
+        if mask.any():
+            ratio_vals = ratio.masked_select(mask)
+            ratio_mean = ratio_vals.mean()
+            ratio_std = ratio_vals.std(unbiased=False)
+            mismatch_kl = token_mismatch_kl.masked_select(mask).mean()
+
+            # Average gradient weight (for monitoring soft gating)
+            grad_weight_vals = grad_weight.masked_select(mask)
+            grad_weight_mean = grad_weight_vals.mean()
+            grad_weight_std = grad_weight_vals.std(unbiased=False)
+        else:
+            ratio_mean = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            ratio_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            mismatch_kl = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            grad_weight_mean = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+            grad_weight_std = torch.zeros((), device=ratio.device, dtype=ratio.dtype)
+
+        logp_action = (token_logp * token_mask).sum(dim=-1)
+        stats: Dict[str, Any] = {
+            "loss": loss.detach(),
+            "ratio_mean": ratio_mean.detach(),
+            "ratio_std": ratio_std.detach(),
+            "grad_weight_mean": grad_weight_mean.detach(),
+            "grad_weight_std": grad_weight_std.detach(),
+            "kl_actor_policy": mismatch_kl.detach(),
+            "adv_mean": advantages.mean().detach(),
+            "adv_std": advantages.std(unbiased=False).detach(),
+            "logp_mean": logp_action.mean().detach(),
+            "avg_action_tokens": token_counts.mean().detach(),
+        }
+        return loss, stats
+
+
+@dataclass
 class GMPOLoss:
     """
     GMPO (Geometric-Mean Policy Optimization) loss.

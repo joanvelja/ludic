@@ -26,6 +26,7 @@ from .algorithm import (
     make_dr_grpo,
     make_gspo,
     make_cispo,
+    make_sapo,
     make_gmpo,
     make_sft,
 )
@@ -43,6 +44,7 @@ from .loss import (
     ClippedSurrogateLoss,
     TokenClippedSurrogateLoss,
     CISPOLoss,
+    SAPOLoss,
     GMPOLoss,
     KLLoss,
     EntropyBonus,
@@ -87,6 +89,7 @@ __all__ = [
     "make_dr_grpo",
     "make_gspo",
     "make_cispo",
+    "make_sapo",
     "make_gmpo",
     "make_sft",
     # Credit assignment
@@ -102,6 +105,7 @@ __all__ = [
     "ClippedSurrogateLoss",
     "TokenClippedSurrogateLoss",
     "CISPOLoss",
+    "SAPOLoss",
     "GMPOLoss",
     "KLLoss",
     "EntropyBonus",
