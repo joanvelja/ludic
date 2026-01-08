@@ -23,6 +23,7 @@ from ludic.training.loss import (
     CompositeLoss,
     LossTerm,
     MaskedCausalLMCrossEntropyLoss,
+    BradleyTerryLoss,
 )
 from ludic.training.credit_assignment import (
     MonteCarloReturn,
@@ -716,4 +717,288 @@ def make_scalerl(
         credit_assigner=credit_assigner,
         loss=loss,
         preprocess=preprocess,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GRPO / ScaleRL with Reward Model
+# ---------------------------------------------------------------------------
+
+
+def make_grpo_with_rm(
+    *,
+    group_size: int,
+    rm_mode: str = "bonus",
+    rm_coeff: float = 1.0,
+    clip_eps_low: float = 0.2,
+    clip_eps_high: float = 0.27,
+    length_normalize: bool = False,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "grpo_rm",
+) -> RLAlgorithm:
+    """GRPO with reward model bonus.
+
+    Combines group-normalized returns with RM scores. The reward model score
+    is read from rollout.meta["rm_score"] (must be pre-computed by
+    RewardModelScorer) and combined with environment rewards according to
+    the specified mode.
+
+    Args:
+        group_size: Number of rollouts per group.
+        rm_mode: How to combine RM with env rewards:
+            - "bonus": env + rm_coeff * rm (default, additive bonus)
+            - "replace": Use RM score instead of env reward
+            - "add": Add RM score to env reward (rm_coeff=1)
+            - "multiply": Multiply env reward by RM score
+            - "weighted": alpha * env + (1-alpha) * rm
+        rm_coeff: Coefficient for RM score in "bonus" mode.
+        clip_eps_low: Lower PPO clipping epsilon.
+        clip_eps_high: Upper PPO clipping epsilon.
+        length_normalize: Whether to normalize log-probs by action length.
+        drop_zero_weight: Whether to drop zero-weight samples.
+        drop_zero_weight_eps: Epsilon for zero-weight detection.
+        name: Algorithm name for logging.
+
+    Returns:
+        RLAlgorithm configured for GRPO with reward model integration.
+
+    Example:
+        ```python
+        from ludic.training import make_grpo_with_rm
+        from ludic.training.reward_scorer import RewardModelScorer
+
+        # Set up RM scoring in your rollout pipeline
+        rm_scorer = RewardModelScorer(client=rm_client)
+
+        # Create algorithm
+        algorithm = make_grpo_with_rm(
+            group_size=8,
+            rm_mode="bonus",
+            rm_coeff=0.5,
+        )
+        ```
+    """
+    from ludic.training.reward_credit import RewardModelCreditAssigner
+
+    inner = GroupNormalizedReturn(group_size=group_size)
+    credit_assigner = RewardModelCreditAssigner(
+        mode=rm_mode,
+        rm_coeff=rm_coeff,
+        inner_assigner=inner,
+    )
+    loss = TokenClippedSurrogateLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+    )
+
+    preprocess_fns = []
+    if drop_zero_weight:
+        preprocess_fns.append(
+            lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+        )
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
+def make_scalerl_with_rm(
+    *,
+    group_size: int,
+    rm_mode: str = "bonus",
+    rm_coeff: float = 0.1,
+    kl_coeff: float = 0.0,
+    clip_eps_low: float = 0.20,
+    clip_eps_high: float = 0.28,
+    length_normalize: bool = True,
+    filter_zvp: bool = True,
+    zvp_filter_eps: float = 1e-6,
+    drop_zero_weight: bool = False,
+    drop_zero_weight_eps: float = 1e-4,
+    name: str = "scalerl_rm",
+) -> RLAlgorithm:
+    """ScaleRL with reward model bonus.
+
+    Combines ScaleRL's hybrid normalization with RM scores. This extends
+    the standard ScaleRL recipe (CISPO + hybrid normalization + ZVP filtering)
+    by incorporating learned reward model scores.
+
+    The reward model score is read from rollout.meta["rm_score"] (must be
+    pre-computed by RewardModelScorer) and combined with environment rewards
+    according to the specified mode.
+
+    Args:
+        group_size: Number of rollouts per group.
+        rm_mode: How to combine RM with env rewards:
+            - "bonus": env + rm_coeff * rm (default, additive bonus)
+            - "replace": Use RM score instead of env reward
+            - "add": Add RM score to env reward (rm_coeff=1)
+            - "multiply": Multiply env reward by RM score
+            - "weighted": alpha * env + (1-alpha) * rm
+        rm_coeff: Coefficient for RM score in "bonus" mode.
+        kl_coeff: Coefficient for optional token-level KL penalty.
+            Set > 0 for additional stability. Typical: 0.01-0.1. Default 0.0.
+        clip_eps_low: Lower CISPO clipping bound.
+        clip_eps_high: Upper CISPO clipping bound.
+        length_normalize: Whether to normalize by number of action tokens.
+        filter_zvp: If True, filter zero-variance groups before training.
+        zvp_filter_eps: Epsilon for ZVP detection.
+        drop_zero_weight: If True, drop individual samples with ~zero weight.
+        drop_zero_weight_eps: Epsilon for zero-weight sample detection.
+        name: Algorithm name for logging/metrics.
+
+    Returns:
+        RLAlgorithm configured for ScaleRL with reward model integration.
+
+    Example:
+        ```python
+        from ludic.training import make_scalerl_with_rm
+        from ludic.training.reward_scorer import RewardModelScorer
+
+        # Set up RM scoring in your rollout pipeline
+        rm_scorer = RewardModelScorer(client=rm_client)
+
+        # Create algorithm with RM bonus
+        algorithm = make_scalerl_with_rm(
+            group_size=8,
+            rm_mode="bonus",
+            rm_coeff=0.1,
+            kl_coeff=0.01,
+        )
+        ```
+
+    References:
+        - ScaleRL: arXiv:2510.13786
+        - DAPO (ZVP filtering): arXiv:2503.14476
+        - MiniMax-M1 (CISPO): arXiv:2506.13585
+    """
+    from ludic.training.reward_credit import RewardModelCreditAssigner
+
+    inner = HybridNormalizedReturn(group_size=group_size)
+    credit_assigner = RewardModelCreditAssigner(
+        mode=rm_mode,
+        rm_coeff=rm_coeff,
+        inner_assigner=inner,
+    )
+
+    cispo_loss = CISPOLoss(
+        clip_eps_low=clip_eps_low,
+        clip_eps_high=clip_eps_high,
+        length_normalize=length_normalize,
+    )
+
+    if kl_coeff > 0:
+        kl_loss = TokenKLLoss(coeff=kl_coeff, length_normalize=length_normalize)
+        loss: Loss = CompositeLoss(
+            terms=[
+                LossTerm(name="cispo", loss=cispo_loss, weight=1.0),
+                LossTerm(name="kl", loss=kl_loss, weight=1.0),
+            ]
+        )
+    else:
+        loss = cispo_loss
+
+    preprocess_fns = []
+    if filter_zvp:
+        preprocess_fns.append(
+            lambda batch: filter_zero_variance_groups(batch, eps=zvp_filter_eps)
+        )
+    if drop_zero_weight:
+        preprocess_fns.append(
+            lambda batch: drop_zero_weight_samples(batch, eps=drop_zero_weight_eps)
+        )
+    preprocess_fns.append(validate_actor_logps)
+    preprocess = compose_preprocess(*preprocess_fns)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
+        preprocess=preprocess,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bradley-Terry (Preference Learning / Reward Model Training)
+# ---------------------------------------------------------------------------
+
+
+def make_bradley_terry(
+    *,
+    beta: float = 1.0,
+    score_type: str = "reward",
+    name: str = "bradley_terry",
+) -> RLAlgorithm:
+    """Create Bradley-Terry preference learning algorithm.
+
+    Bradley-Terry models preference as:
+        P(chosen > rejected) = sigma(beta * (s_chosen - s_rejected))
+
+    This is the standard loss for training reward models from pairwise
+    preferences, and can also be used for DPO-style direct policy optimization.
+
+    For reward model training (score_type="reward"):
+        Model outputs scalar reward per sequence.
+        Use with AutoModelForSequenceClassification or custom reward head.
+        Logits shape should be [B, 1] or [B].
+
+    For DPO-style policy training (score_type="logprob"):
+        Uses log probability sums as implicit rewards.
+        Model is a standard causal LM with logits shape [B, T, V].
+
+    The batch must contain paired SAWItems with metadata:
+    - meta["pair_id"]: Unique pair identifier linking chosen/rejected
+    - meta["role"]: "chosen" or "rejected"
+    - meta["label"]: Preference strength (1.0 = chosen preferred)
+
+    Credit assignment is trivial (ConstantCredit(1.0)) because the preference
+    signal lives in the metadata labels, not in the sample weights.
+
+    Args:
+        beta: Temperature scaling for score differences. Higher values make
+              predictions more confident. Default 1.0.
+        score_type: How to compute sequence scores:
+            - "reward": Use model's scalar output (for reward models)
+            - "logprob": Sum of log probs over action tokens (for DPO-style)
+        name: Algorithm name for logging/metrics.
+
+    Returns:
+        RLAlgorithm configured for Bradley-Terry preference learning.
+
+    Example:
+        ```python
+        # Train reward model
+        algorithm = make_bradley_terry(score_type="reward")
+        batch_source = OfflineBatchSource(
+            jsonl_paths=[Path("data/preferences.jsonl")],
+            tokenize=tokenizer.encode,
+            credit_assigner=algorithm.credit_assigner,
+            batch_size=32,
+        )
+        trainer = Trainer(model=rm_model, algorithm=algorithm, ...)
+
+        # DPO-style policy training
+        algorithm = make_bradley_terry(score_type="logprob", beta=0.1)
+        trainer = Trainer(model=policy_model, algorithm=algorithm, ...)
+        ```
+
+    References:
+        - Bradley-Terry model: https://en.wikipedia.org/wiki/Bradley%E2%80%93Terry_model
+        - RLHF reward modeling: https://arxiv.org/abs/2203.02155
+        - DPO: https://arxiv.org/abs/2305.18290
+    """
+    credit_assigner: CreditAssigner = ConstantCredit(value=1.0)
+    loss: Loss = BradleyTerryLoss(beta=beta, score_type=score_type)
+
+    return RLAlgorithm(
+        name=name,
+        credit_assigner=credit_assigner,
+        loss=loss,
     )

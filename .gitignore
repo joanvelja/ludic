@@ -30,3 +30,11 @@ data/
 .env
 .env.*
 .DS_Store
+
+# Hiding
+RM_PLAN.md
+.bottleneck-analysis-rm-overall/
+tests/
+docs/RM_TEST_PLAN.md
+.codex-bottleneck-analysis/
+.claude/

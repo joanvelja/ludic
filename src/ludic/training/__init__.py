@@ -26,6 +26,9 @@ from .algorithm import (
     make_gspo,
     make_cispo,
     make_sft,
+    make_bradley_terry,
+    make_grpo_with_rm,
+    make_scalerl_with_rm,
 )
 from .credit_assignment import (
     GroupNormalizedReturn,
@@ -34,6 +37,7 @@ from .credit_assignment import (
     EpisodicReturn,
     ConstantCredit,
 )
+from .reward_credit import RewardModelCreditAssigner, CombineMode
 from .loss import (
     Loss,
     ReinforceLoss,
@@ -46,8 +50,15 @@ from .loss import (
     LossTerm,
     CompositeLoss,
     selective_log_softmax,
+    BradleyTerryLoss,
 )
 from .filters import drop_truncated, drop_parse_errors, drop_incomplete_completions
+from .preference_utils import (
+    create_preference_saw_items,
+    preference_dataset_to_saw_items,
+    shuffle_preference_pairs,
+)
+from .reward_scorer import RewardModelScorer
 from .config import TrainerConfig
 from .checkpoint import CheckpointConfig
 from .batching import (
@@ -84,12 +95,17 @@ __all__ = [
     "make_gspo",
     "make_cispo",
     "make_sft",
+    "make_bradley_terry",
+    "make_grpo_with_rm",
+    "make_scalerl_with_rm",
     # Credit assignment
     "GroupNormalizedReturn",
     "MonteCarloReturn",
     "PerStepReward",
     "EpisodicReturn",
     "ConstantCredit",
+    "RewardModelCreditAssigner",
+    "CombineMode",
     # Losses
     "Loss",
     "ReinforceLoss",
@@ -102,10 +118,17 @@ __all__ = [
     "LossTerm",
     "CompositeLoss",
     "selective_log_softmax",
+    "BradleyTerryLoss",
+    # Reward model integration
+    "RewardModelScorer",
     # Sample filters
     "drop_truncated",
     "drop_parse_errors",
     "drop_incomplete_completions",
+    # Preference utilities
+    "create_preference_saw_items",
+    "preference_dataset_to_saw_items",
+    "shuffle_preference_pairs",
     # Core data types
     "EnvSpec",
     "ProtocolSpec",

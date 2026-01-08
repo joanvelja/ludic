@@ -1,3 +1,14 @@
+"""Unified vLLM client for policy generation AND reward model scoring.
+
+This module provides a single VLLMClient class that supports:
+- Chat completions via OpenAI-compatible API (policy generation)
+- Reward model scoring via /score endpoint
+- NCCL-based weight synchronization for both policy and RM servers
+
+For single-server setups, use the default `port` parameter.
+For dual-server setups (separate policy + RM), use `policy_port` and `scoring_port`.
+"""
+
 import atexit
 import logging
 import time
@@ -5,57 +16,104 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import requests
 import aiohttp
-import torch  # type: ignore
+import torch
 from openai import AsyncOpenAI
-from requests import ConnectionError
 from requests.adapters import HTTPAdapter
-from requests.exceptions import RequestException, Timeout
-from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-from vllm.distributed.utils import StatelessProcessGroup
+from requests.exceptions import Timeout
 
 from ludic.types import ChatResponse
 from ludic.inference.client import ChatClient
 from ludic.inference.request import ChatCompletionRequest, ToolRequest
 from ludic.inference.extensions import BackendExtensions, VLLMExtensions
+from ludic.inference.reward_types import (
+    PoolingType,
+    RewardModelTrainingMode,
+    ScoringRequest,
+    ScoringResponse,
+)
+
+# Shared infrastructure
+from ludic.inference.vllm.client_base import (
+    NCCLCommunicator,
+    check_server_health,
+    sync_weights_batch,
+    get_server_background_tasks,
+)
 
 log = logging.getLogger(__name__)
 
 
-class VLLMChatClient(ChatClient):
-    """
-    vLLM ChatClient backed by:
-      - the OpenAI-compatible inference server
-      - an optional NCCL-based weight update path.
+class VLLMClient(ChatClient):
+    """Unified vLLM client for policy generation AND reward model scoring.
+
+    Supports two modes of operation:
+
+    **Single-server mode** (default):
+        One vLLM server handles both policy/chat and scoring.
+        Use `port` parameter for this mode.
+
+    **Dual-server mode**:
+        Separate servers for policy (chat completions) and scoring (reward model).
+        Use `policy_port` and `scoring_port` parameters.
+
+    Features:
+      - Chat completions via OpenAI-compatible API (complete() method)
+      - Reward model scoring via /score endpoint (score(), score_batch() methods)
+      - NCCL-based weight updates for both policy and RM servers
 
     Modes:
       * inference-only (enable_weight_updates=False):
-            - Only uses HTTP OpenAI API.
+            - Only uses HTTP APIs.
             - No NCCL, no GPU expected on client side.
             - Weight updates are disabled.
       * training/update mode (enable_weight_updates=True):
             - Client becomes an additional NCCL rank.
-            - Enables sync_weights() to broadcast updated parameters
-              directly into the vLLM worker processes.
+            - Enables sync_weights() for policy and sync_reward_weights() for RM.
 
     Args:
         host:
-            Hostname of the vLLM OpenAI-compatible server. Defaults to "0.0.0.0".
+            Hostname of the vLLM server(s). Defaults to "0.0.0.0".
         port:
-            HTTP port for the vLLM server. Defaults to 8000.
+            HTTP port for single-server mode (used for both policy and scoring).
+            Defaults to 8000. Ignored if policy_port or scoring_port is set.
+        policy_port:
+            HTTP port for the policy server. If None, uses `port`.
+        scoring_port:
+            HTTP port for the scoring/reward model server. If None, uses `port`.
         group_port:
-            TCP port used to form the StatelessProcessGroup for NCCL-based
-            weight updates. Only used when enable_weight_updates=True.
+            TCP port for NCCL communicator (policy server weight sync).
+            Only used when enable_weight_updates=True. Defaults to 51216.
+        scoring_group_port:
+            TCP port for NCCL communicator (scoring server weight sync).
+            Only used when enable_weight_updates=True and dual-server mode.
+            Defaults to 51217.
         connection_timeout_s:
-            Maximum number of seconds to wait for the server /health endpoint
-            to become reachable during initialization. Defaults to 60 seconds.
-            If the timeout is exceeded, the constructor raises ConnectionError.
+            Maximum seconds to wait for server /health endpoint.
+            Defaults to 60. Raises ConnectionError if exceeded.
         enable_weight_updates:
-            If True, initialize the NCCL communicator and enable
-            sync_weights(); otherwise run in inference-only mode.
+            If True, initialize NCCL communicators for weight sync.
         device:
-            The device (e.g. "cuda:0", 0, or torch.device) to bind the NCCL
-            communicator to. Defaults to 0. Important when running client on
-            multi-GPU setups (e.g. via accelerate).
+            Device for NCCL communicator (e.g. "cuda:0", 0).
+            Defaults to 0.
+        model_name:
+            Model name for scoring requests. Defaults to "default".
+
+    Example (single-server):
+        client = VLLMClient(host="0.0.0.0", port=8000)
+        response, _ = await client.complete(request)
+        scores = await client.score_batch(["text1", "text2"])
+
+    Example (dual-server):
+        client = VLLMClient(
+            host="0.0.0.0",
+            policy_port=8000,
+            scoring_port=8001,
+            enable_weight_updates=True,
+        )
+        response, _ = await client.complete(request)
+        scores = await client.score_batch([response.text])
+        client.sync_weights(policy_state_dict, version=1)
+        client.sync_reward_weights(rm_state_dict, training_mode=RewardModelTrainingMode.FULL)
     """
 
     def __init__(
@@ -63,69 +121,138 @@ class VLLMChatClient(ChatClient):
         *,
         host: str = "0.0.0.0",
         port: int = 8000,
+        policy_port: Optional[int] = None,
+        scoring_port: Optional[int] = None,
         group_port: int = 51216,
+        scoring_group_port: int = 51217,
         connection_timeout_s: float = 60,
         enable_weight_updates: bool = False,
         device: Union[str, torch.device, int] = 0,
+        model_name: str = "default",
     ) -> None:
 
         # Store configuration parameters
         self.host = host
         self.port = port
+        self.policy_port = policy_port if policy_port is not None else port
+        self.scoring_port = scoring_port if scoring_port is not None else port
         self.group_port = group_port
+        self.scoring_group_port = scoring_group_port
         self.connection_timeout_s = connection_timeout_s
         self.enable_weight_updates = enable_weight_updates
         self.device = device
+        self.model_name = model_name
 
-        # AsyncOpenAI handles the OpenAI-compatible HTTP endpoints.
+        # Determine if we're in dual-server mode
+        self._dual_server_mode = self.policy_port != self.scoring_port
+
+        # AsyncOpenAI handles the OpenAI-compatible HTTP endpoints (policy server).
         self._async_client = AsyncOpenAI(
-            base_url=f"http://{self.host}:{self.port}/v1",
+            base_url=f"http://{self.host}:{self.policy_port}/v1",
             api_key="local",
         )
 
-        # Sync HTTP client for health checks and weight-update metadata RPC
+        # Sync HTTP client for health checks, scoring, and weight-update metadata RPC
         self._session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
 
-        self.server_url = f"http://{self.host}:{self.port}"
-        self._pynccl_comm: Optional[PyNcclCommunicator] = None
-        self._rank: Optional[int] = None
+        # Server URLs
+        self.server_url = f"http://{self.host}:{self.policy_port}"  # Policy server
+        self._scoring_url = f"http://{self.host}:{self.scoring_port}"  # Scoring server
 
-        # Verify server is reachable before continuing.
-        self._check_server(self.connection_timeout_s)
+        # NCCL communicators (using shared infrastructure)
+        self._policy_comm: Optional[NCCLCommunicator] = None
+        self._scoring_comm: Optional[NCCLCommunicator] = None
 
-        # If weight updates are enabled, the client forms the extra NCCL rank.
+        # Cached aiohttp session for async HTTP calls (lazy-initialized)
+        self._async_session: Optional[aiohttp.ClientSession] = None
+
+        # Verify policy server is reachable
+        check_server_health(
+            self._session,
+            self.server_url,
+            total_timeout=self.connection_timeout_s,
+        )
+
+        # In dual-server mode, also check scoring server
+        if self._dual_server_mode:
+            check_server_health(
+                self._session,
+                self._scoring_url,
+                total_timeout=self.connection_timeout_s,
+            )
+
+        # If weight updates are enabled, initialize policy communicator
         if self.enable_weight_updates:
-            self._init_communicator()
+            self._init_policy_communicator()
             atexit.register(self.close_communicator)
 
-    async def get_policy_version(self) -> int:
-        """
-        Polls the /runtime_version endpoint of the vLLM server to check
-        the current monotonic version of the policy weights.
-        """
-        url = f"{self.server_url}/runtime_version"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=2.0) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return int(data.get("version", 0))
-        except Exception:
-            # On failure (timeout/network), simply return 0 or log warning
-            pass
-        return 0
+    # ─────────────────────────────────────────────────────────────────
+    # Communicator Management
+    # ─────────────────────────────────────────────────────────────────
 
-    # ---- ChatClient.complete ------------------------------------
+    def _init_policy_communicator(self) -> None:
+        """Initialize NCCL communicator for policy server."""
+        self._policy_comm = NCCLCommunicator(
+            host=self.host,
+            http_port=self.policy_port,
+            nccl_port=self.group_port,
+            device=self.device,
+            session=self._session,
+        )
+        self._policy_comm.initialize()
+
+    def _init_scoring_communicator(self) -> None:
+        """Initialize NCCL communicator for scoring server (lazy)."""
+        if self._scoring_comm is not None:
+            return  # Already initialized
+
+        self._scoring_comm = NCCLCommunicator(
+            host=self.host,
+            http_port=self.scoring_port,
+            nccl_port=self.scoring_group_port,
+            device=self.device,
+            session=self._session,
+        )
+        self._scoring_comm.initialize()
+
+    def close_communicator(self) -> None:
+        """Close all NCCL communicators and notify servers."""
+        if self._policy_comm is not None:
+            self._policy_comm.close()
+            self._policy_comm = None
+
+        if self._scoring_comm is not None:
+            self._scoring_comm.close()
+            self._scoring_comm = None
+
+    async def _get_async_session(self) -> aiohttp.ClientSession:
+        """Get or create a cached aiohttp ClientSession.
+
+        Lazily initializes the session on first call and reuses it for
+        subsequent calls. Creates a new session if the previous one was closed.
+        """
+        if self._async_session is None or self._async_session.closed:
+            self._async_session = aiohttp.ClientSession()
+        return self._async_session
+
+    async def close_async_session(self) -> None:
+        """Close the cached aiohttp session if it exists."""
+        if self._async_session is not None and not self._async_session.closed:
+            await self._async_session.close()
+            self._async_session = None
+
+    # ─────────────────────────────────────────────────────────────────
+    # ChatClient.complete
+    # ─────────────────────────────────────────────────────────────────
 
     async def complete(
         self,
         request: ChatCompletionRequest,
     ) -> Tuple[ChatResponse, Dict[str, Any]]:
-        """
-        High-level LLM invocation with vLLM extensions.
+        """High-level LLM invocation with vLLM extensions.
 
         Returns:
             (ChatResponse, info):
@@ -154,12 +281,7 @@ class VLLMChatClient(ChatClient):
             if tools.tool_choice is not None:
                 request_kwargs["tool_choice"] = tools.tool_choice
 
-        # ----------------------------------------------------------
-        # vLLM-specific extensions live under `extra_body`:
-        #
-        #   - max_think        -> extra_body["vllm_xargs"]["max_think"]
-        #   - return_token_ids -> extra_body["return_token_ids"] = True
-        # ----------------------------------------------------------
+        # vLLM-specific extensions live under `extra_body`
         extra_body: Dict[str, Any] = {}
 
         if request.extensions is not None:
@@ -170,9 +292,6 @@ class VLLMChatClient(ChatClient):
                         raise ValueError("VLLMExtensions.max_think must be a positive integer")
                 if ext.repetition_penalty <= 0:
                     raise ValueError("VLLMExtensions.repetition_penalty must be > 0")
-                # OpenAI's Python SDK rejects unknown kwargs (like repetition_penalty),
-                # so send vLLM/HF-only knobs via `extra_body` which is merged into the
-                # JSON request body.
                 extra_body["repetition_penalty"] = float(ext.repetition_penalty)
 
                 if ext.max_think is not None:
@@ -193,17 +312,14 @@ class VLLMChatClient(ChatClient):
         if request.return_.return_token_ids:
             extra_body["return_token_ids"] = True
 
-        # Request chosen-token logprobs if asked.
-        # vLLM uses OpenAI-compatible shape where `logprobs` is an int (top-k).
+        # Logprobs
         if request.return_.return_chosen_logprobs:
             request_kwargs["logprobs"] = int(max(1, request.return_.top_logprobs_k))
 
         if extra_body:
             request_kwargs["extra_body"] = extra_body
 
-        # ----------------------------------------------------------
         # Perform inference
-        # ----------------------------------------------------------
         resp = await self._async_client.chat.completions.create(**request_kwargs)
 
         choice = resp.choices[0]
@@ -214,9 +330,7 @@ class VLLMChatClient(ChatClient):
         prompt_token_ids = getattr(resp, "prompt_token_ids", None)
         completion_token_ids = getattr(choice, "token_ids", None)
 
-        # Extract per-token logprobs if the server returned them. vLLM follows the
-        # OpenAI-compatible shape where `choice.logprobs.token_logprobs` carries the
-        # per-token values.
+        # Extract per-token logprobs
         completion_logprobs = None
         logprobs_obj = getattr(choice, "logprobs", None)
         if logprobs_obj is not None:
@@ -227,7 +341,6 @@ class VLLMChatClient(ChatClient):
                     or logprobs_obj.get("logprobs")
                 )
             if token_logprobs is None and hasattr(logprobs_obj, "content"):
-                # OpenAI responses may nest token logprobs inside content entries.
                 parts = []
                 for part in getattr(logprobs_obj, "content", []):
                     lp = getattr(part, "logprob", None)
@@ -255,7 +368,22 @@ class VLLMChatClient(ChatClient):
 
         return chat_resp, info
 
-    # ---- ChatClient.sync_weights --------------------------
+    # ─────────────────────────────────────────────────────────────────
+    # Policy Weight Sync
+    # ─────────────────────────────────────────────────────────────────
+
+    async def get_policy_version(self) -> int:
+        """Polls the /runtime_version endpoint of the policy server."""
+        url = f"{self.server_url}/runtime_version"
+        try:
+            session = await self._get_async_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return int(data.get("version", 0))
+        except Exception:
+            pass
+        return 0
 
     def sync_weights(
         self,
@@ -264,20 +392,14 @@ class VLLMChatClient(ChatClient):
         timeout_s: float = 600.0,
         version: Optional[Union[str, int]] = None,
     ) -> str:
-        """
-        Push updated model parameters into the running vLLM server.
+        """Push updated policy model parameters into the running vLLM server.
 
-        Optimized batch implementation:
-            1. Sort keys to ensure deterministic ordering.
-            2. Send ONE metadata payload (POST /update_param_batch).
-            3. Stream tensors via NCCL broadcast loop.
-            4. Barrier & Finalize.
+        Uses shared infrastructure for efficient batched NCCL sync.
 
         Returns:
             version string (either supplied or autogenerated)
         """
-
-        if self._pynccl_comm is None or self._rank is None:
+        if self._policy_comm is None:
             if not self.enable_weight_updates:
                 raise RuntimeError(
                     "sync_weights() called on inference-only client "
@@ -285,155 +407,212 @@ class VLLMChatClient(ChatClient):
                 )
             raise RuntimeError("Communicator not initialized.")
 
-        start = time.time()
-
-        # 1. Prepare Metadata
-        # We must iterate in a stable order so the server and client
-        # broadcast/recv the same tensors in the same order.
-        sorted_keys = sorted(params.keys())
-        metadata: List[Dict[str, Any]] = []
-
-        for name in sorted_keys:
-            tensor = params[name]
-            metadata.append(
-                {
-                    "name": name,
-                    "dtype": str(tensor.dtype),
-                    "shape": tuple(tensor.shape),
-                }
-            )
-
-        # 2. Control Plane: Announce Batch
-        url = f"{self.server_url}/update_param_batch"
-        
-        # Prepare payload with optional version
-        payload = {"metadata": metadata}
-        if version is not None:
-            payload["version"] = version
-
-        try:
-            resp = self._session.post(
-                url,
-                json=payload,
-                timeout=timeout_s,
-            )
-        except Timeout:
-            raise TimeoutError("HTTP timeout during batch metadata send")
-        except Exception as exc:
-            raise RuntimeError(f"Error sending batch metadata: {exc}") from exc
-
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Server rejected update_param_batch: {resp.status_code} {resp.text}"
-            )
-        
-        time.sleep(1.0)
-        
-        # 3. Data Plane: Stream Tensors
-        for name in sorted_keys:
-            tensor = params[name]
-            # Ensure contiguous memory before broadcast
-            if not tensor.is_contiguous():
-                tensor = tensor.contiguous()
-
-            self._pynccl_comm.broadcast(tensor, src=self._rank)
-
-        # 4. Synchronization
-        self._pynccl_comm.group.barrier()
-
-        if (time.time() - start) > timeout_s:
-            raise TimeoutError(f"sync_weights exceeded {timeout_s}s")
-
-        # Wait for server background weight-update tasks to drain
-        while self.get_num_background_tasks() > 0:
-            time.sleep(0.2)
-
-        return str(version) if version is not None else f"vllm-{int(time.time())}"
-
-    # ---- Control-plane helpers ---------------------------------
-
-    def _check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
-        """
-        Poll /health until the server responds OK or timeout expires.
-        Ensures we don't start NCCL or inference before the server is alive.
-        """
-        url = f"{self.server_url}/health"
-        start_time = time.time()
-
-        while True:
-            try:
-                r = self._session.get(url, timeout=5.0)
-                if r.status_code == 200:
-                    log.info("vLLM server is up")
-                    return
-            except RequestException:
-                pass
-
-            if total_timeout and (time.time() - start_time) >= total_timeout:
-                raise ConnectionError(
-                    f"vLLM server not reachable at {self.host}:{self.port} "
-                    f"after {total_timeout} seconds"
-                )
-
-            log.info("vLLM server not ready, retrying...")
-            time.sleep(retry_interval)
-
-    def _init_communicator(self) -> None:
-        """
-        Establish the client's NCCL communicator:
-          * query world size from server
-          * tell server workers to initialize their communicator
-          * create client-side NCCL process group
-        """
-
-        # 1) query world size
-        r = self._session.get(f"{self.server_url}/get_world_size", timeout=10.0)
-        r.raise_for_status()
-        vllm_world_size = r.json()["world_size"]
-        world_size = vllm_world_size + 1  # client is the extra rank
-        self._rank = vllm_world_size
-
-        # 2) ask server workers to init their communicators
-        r = self._session.post(
-            f"{self.server_url}/init_communicator",
-            json={"host": self.host, "port": self.group_port, "world_size": world_size},
-            timeout=30.0,
+        return sync_weights_batch(
+            communicator=self._policy_comm,
+            params=params,
+            endpoint="/update_param_batch",
+            timeout_s=timeout_s,
+            version=version,
+            get_background_tasks=lambda: get_server_background_tasks(
+                self._session, self.server_url
+            ),
         )
-        r.raise_for_status()
 
-        time.sleep(0.1)  # let server initialize NCCL
-
-        # 3) create the matching client-side communicator
-        pg = StatelessProcessGroup.create(
-            host=self.host,
-            port=self.group_port,
-            rank=self._rank,
-            world_size=world_size,
-        )
-        self._pynccl_comm = PyNcclCommunicator(pg, device=self.device)
+    # ─────────────────────────────────────────────────────────────────
+    # Control-plane helpers
+    # ─────────────────────────────────────────────────────────────────
 
     def reset_prefix_cache(self) -> None:
+        """Reset KV/prefix caches on the policy server."""
         r = self._session.post(f"{self.server_url}/reset_prefix_cache", timeout=30.0)
         r.raise_for_status()
 
     def get_num_background_tasks(self) -> int:
-        r = self._session.post(
-            f"{self.server_url}/get_num_background_tasks", timeout=10.0
-        )
-        r.raise_for_status()
-        return r.json()["num_background_tasks"]
+        """Get number of pending background tasks on the policy server."""
+        return get_server_background_tasks(self._session, self.server_url)
 
-    def close_communicator(self) -> None:
-        try:
-            r = self._session.post(
-                f"{self.server_url}/close_communicator", timeout=10.0
-            )
-            if r.status_code != 200:
-                log.warning(
-                    "close_communicator responded with %s %s",
-                    r.status_code,
-                    r.text,
+    # ─────────────────────────────────────────────────────────────────
+    # Scoring API (Reward Model)
+    # ─────────────────────────────────────────────────────────────────
+
+    async def score(
+        self,
+        request: ScoringRequest,
+    ) -> Tuple[ScoringResponse, Dict[str, Any]]:
+        """Score inputs via /score endpoint on the scoring server."""
+        payload = {
+            "model": request.model,
+            "inputs": list(request.inputs),
+            "pooling_type": request.pooling_type.value,
+            "normalize": request.normalize,
+            "n_labels": request.n_labels,
+        }
+
+        url = f"{self._scoring_url}/score"
+
+        session = await self._get_async_session()
+        async with session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise RuntimeError(
+                    f"Score request failed: {resp.status} {error_text}"
                 )
-        except ConnectionError:
-            # server may already be down — nothing to do.
+            data = await resp.json()
+
+        response = ScoringResponse(
+            scores=data["scores"],
+            model=data.get("model", request.model),
+            usage=data.get("usage", {}),
+            metadata=data.get("metadata", {}),
+        )
+
+        info: Dict[str, Any] = {
+            "raw_response": data,
+            "used_args": payload,
+        }
+
+        return response, info
+
+    async def score_batch(
+        self,
+        inputs: List[str],
+        *,
+        normalize: bool = True,
+        pooling_type: PoolingType = PoolingType.LAST,
+        n_labels: int = 1,
+    ) -> List[float]:
+        """Convenience method for batch scoring."""
+        request = ScoringRequest.from_list(
+            model=self.model_name,
+            inputs=inputs,
+            pooling_type=pooling_type,
+            normalize=normalize,
+            n_labels=n_labels,
+        )
+        response, _ = await self.score(request)
+        return response.scores
+
+    def score_sync(
+        self,
+        request: ScoringRequest,
+    ) -> Tuple[ScoringResponse, Dict[str, Any]]:
+        """Synchronous version of score() for non-async contexts."""
+        payload = {
+            "model": request.model,
+            "inputs": list(request.inputs),
+            "pooling_type": request.pooling_type.value,
+            "normalize": request.normalize,
+            "n_labels": request.n_labels,
+        }
+
+        url = f"{self._scoring_url}/score"
+
+        try:
+            resp = self._session.post(url, json=payload, timeout=60.0)
+        except Timeout:
+            raise TimeoutError("HTTP timeout during score request")
+        except Exception as exc:
+            raise RuntimeError(f"Error during score request: {exc}") from exc
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Score request failed: {resp.status_code} {resp.text}")
+
+        data = resp.json()
+
+        response = ScoringResponse(
+            scores=data["scores"],
+            model=data.get("model", request.model),
+            usage=data.get("usage", {}),
+            metadata=data.get("metadata", {}),
+        )
+
+        info: Dict[str, Any] = {
+            "raw_response": data,
+            "used_args": payload,
+        }
+
+        return response, info
+
+    async def get_reward_model_version(self) -> int:
+        """Polls the /runtime_version endpoint on the scoring server."""
+        url = f"{self._scoring_url}/runtime_version"
+        try:
+            session = await self._get_async_session()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return int(data.get("version", 0))
+        except Exception:
             pass
+        return 0
+
+    def get_server_info(self, server: str = "scoring") -> Dict[str, Any]:
+        """Get server information."""
+        url = self._scoring_url if server == "scoring" else self.server_url
+        r = self._session.get(f"{url}/health", timeout=5.0)
+        r.raise_for_status()
+        try:
+            return r.json()
+        except Exception:
+            return {"status": "healthy"}
+
+    # ─────────────────────────────────────────────────────────────────
+    # Reward Model Weight Sync
+    # ─────────────────────────────────────────────────────────────────
+
+    def sync_reward_weights(
+        self,
+        params: Mapping[str, torch.Tensor],
+        *,
+        training_mode: RewardModelTrainingMode = RewardModelTrainingMode.FULL,
+        timeout_s: float = 600.0,
+        version: Optional[Union[str, int]] = None,
+    ) -> str:
+        """Push updated reward model parameters into the scoring vLLM server.
+
+        Uses shared infrastructure for efficient batched NCCL sync.
+
+        Args:
+            params: Mapping of parameter names to tensors.
+            training_mode: Which weights are being synced (HEAD_ONLY, LORA, FULL).
+            timeout_s: Maximum time in seconds for the operation.
+            version: Optional version identifier for the weights.
+
+        Returns:
+            Version string (supplied or auto-generated).
+        """
+        if not self.enable_weight_updates:
+            raise RuntimeError(
+                "sync_reward_weights() called on inference-only client "
+                "(enable_weight_updates=False)."
+            )
+
+        # Determine which communicator and server to use
+        if self._dual_server_mode:
+            # Initialize scoring communicator lazily
+            self._init_scoring_communicator()
+            comm = self._scoring_comm
+            server_url = self._scoring_url
+        else:
+            # Single-server mode: reuse policy communicator
+            comm = self._policy_comm
+            server_url = self._scoring_url
+
+        if comm is None:
+            raise RuntimeError("Communicator not initialized.")
+
+        return sync_weights_batch(
+            communicator=comm,
+            params=params,
+            endpoint="/update_param_batch",
+            timeout_s=timeout_s,
+            version=version,
+            extra_payload={"training_mode": training_mode.value},
+            get_background_tasks=lambda: get_server_background_tasks(
+                self._session, server_url
+            ),
+        )
+
+
+# Backward compatibility alias
+VLLMChatClient = VLLMClient

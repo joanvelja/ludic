@@ -55,9 +55,12 @@ class PolicyPublisher(Protocol):
     def publish(self, state_dict: Mapping[str, torch.Tensor], version: Optional[int] = None) -> None:
         """
         Publishes the state_dict to the remote inference engine.
-        
+
         Args:
             state_dict: The model parameters to push.
             version: Optional explicit version number (clock) for PipelineRL.
         """
         ...
+
+# Type alias - PolicyPublisher works for any model type
+WeightPublisher = PolicyPublisher

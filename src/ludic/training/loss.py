@@ -1189,3 +1189,195 @@ class CompositeLoss:
         stats["loss"] = total_loss.detach()
 
         return total_loss, stats
+
+
+# ---------------------------------------------------------------------------
+# Bradley-Terry preference loss
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BradleyTerryLoss:
+    """Bradley-Terry preference loss over paired SAWItems.
+
+    Groups SAWItems by pair_id, computes:
+        Loss = -E[label * log(sigma(s_c - s_r)) + (1-label) * log(sigma(s_r - s_c))]
+
+    Where s_c, s_r are scores for chosen/rejected sequences and sigma is the
+    sigmoid function.
+
+    Supports two scoring modes:
+    - "reward": Model outputs scalar reward per sequence (for reward models).
+                Expects logits shape [B, 1] or [B].
+    - "logprob": Sum of log probs over action tokens (for DPO-style policy training).
+                 Expects logits shape [B, T, V].
+
+    Expects batch to contain paired items with metadata:
+    - meta["pair_id"]: Unique pair identifier (str)
+    - meta["role"]: "chosen" or "rejected"
+    - meta["label"]: Preference strength (1.0 = chosen preferred, 0.0 = rejected preferred)
+
+    Items should be interleaved: [chosen_0, rejected_0, chosen_1, rejected_1, ...]
+    The loss groups by pair_id for robustness against out-of-order or filtered batches.
+
+    Args:
+        beta: Temperature scaling for score differences. Higher values make the
+              sigmoid sharper (more confident predictions). Default 1.0.
+        score_type: How to compute sequence scores:
+            - "reward": Use model's scalar output directly (for reward models)
+            - "logprob": Sum of log probs over action tokens (for DPO-style)
+    """
+
+    beta: float = 1.0
+    score_type: str = "reward"  # Literal["reward", "logprob"]
+
+    def __post_init__(self) -> None:
+        if self.score_type not in ("reward", "logprob"):
+            raise ValueError(
+                f"score_type must be 'reward' or 'logprob', got {self.score_type!r}"
+            )
+        if self.beta <= 0:
+            raise ValueError(f"beta must be positive, got {self.beta}")
+
+    @jaxtyped(typechecker=typechecker)
+    def compute(
+        self,
+        logits: Tensor,
+        batch: Batch,
+        *,
+        shared: Optional[SharedContext] = None,
+    ) -> Tuple[Tensor, Dict[str, Any]]:
+        """Compute Bradley-Terry loss.
+
+        Args:
+            logits: [B, T, V] for language model or [B, 1]/[B] for reward model
+            batch: Collated batch with input_ids, action_mask, and meta
+            shared: Optional SharedContext for caching (used in logprob mode)
+
+        Returns:
+            (loss, stats) where loss is scalar and stats are detached scalars
+        """
+        # 1. Compute scores for each item
+        if self.score_type == "reward":
+            # Reward model: scalar output per sequence
+            # Expect logits shape [B, 1] or [B]
+            if logits.ndim == 1:
+                scores = logits  # [B]
+            elif logits.ndim == 2 and logits.shape[1] == 1:
+                scores = logits.squeeze(-1)  # [B, 1] -> [B]
+            else:
+                raise ValueError(
+                    f"BradleyTerryLoss with score_type='reward' expects logits shape "
+                    f"[B] or [B, 1], got {tuple(logits.shape)}. "
+                    f"Use score_type='logprob' for language model logits [B, T, V]."
+                )
+        else:
+            # DPO-style: sum of log probs over action tokens
+            scores = self._compute_logprob_scores(logits, batch, shared)
+
+        # 2. Extract metadata
+        meta = batch["meta"]
+        pair_ids: List[str] = meta["pair_id"]
+        roles: List[str] = meta["role"]
+        labels_list: List[float] = meta["label"]
+
+        # 3. Group by pair_id and separate chosen/rejected
+        pair_map: Dict[str, Dict[str, int]] = {}
+        for i, (pid, role) in enumerate(zip(pair_ids, roles)):
+            if pid not in pair_map:
+                pair_map[pid] = {}
+            if role in pair_map[pid]:
+                logger.warning(
+                    f"BradleyTerryLoss: Duplicate role '{role}' for pair_id '{pid}'. "
+                    f"Index {pair_map[pid][role]} will be overwritten by index {i}."
+                )
+            pair_map[pid][role] = i
+
+        chosen_scores_list: List[Tensor] = []
+        rejected_scores_list: List[Tensor] = []
+        labels_tensor_list: List[float] = []
+
+        for pid, indices in pair_map.items():
+            if "chosen" in indices and "rejected" in indices:
+                chosen_scores_list.append(scores[indices["chosen"]])
+                rejected_scores_list.append(scores[indices["rejected"]])
+                labels_tensor_list.append(labels_list[indices["chosen"]])
+
+        if not chosen_scores_list:
+            # No complete pairs found - return zero loss with grad
+            zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
+            zero.requires_grad_(True)
+            return zero, {
+                "loss": zero.detach(),
+                "num_pairs": torch.zeros((), device=logits.device),
+                "accuracy": torch.zeros((), device=logits.device),
+                "chosen_score": torch.zeros((), device=logits.device),
+                "rejected_score": torch.zeros((), device=logits.device),
+                "margin": torch.zeros((), device=logits.device),
+            }
+
+        chosen_scores = torch.stack(chosen_scores_list)
+        rejected_scores = torch.stack(rejected_scores_list)
+        labels = torch.tensor(
+            labels_tensor_list, device=scores.device, dtype=scores.dtype
+        )
+
+        # 4. Bradley-Terry loss with soft labels
+        # Loss = -E[label * log(sigma(beta * (s_c - s_r))) + (1-label) * log(sigma(beta * (s_r - s_c)))]
+        logit_diff = self.beta * (chosen_scores - rejected_scores)
+        loss = -(
+            labels * F.logsigmoid(logit_diff)
+            + (1 - labels) * F.logsigmoid(-logit_diff)
+        ).mean()
+
+        # 5. Stats
+        with torch.no_grad():
+            # Accuracy: prediction matches label direction
+            # For hard labels (0 or 1), this is straightforward
+            # For soft labels, we compare to 0.5 threshold
+            predictions_correct = (logit_diff > 0) == (labels > 0.5)
+            accuracy = predictions_correct.float().mean()
+
+            stats: Dict[str, Any] = {
+                "loss": loss.detach(),
+                "accuracy": accuracy,
+                "chosen_score": chosen_scores.mean().detach(),
+                "rejected_score": rejected_scores.mean().detach(),
+                "margin": logit_diff.mean().detach(),
+                "num_pairs": torch.tensor(
+                    float(len(chosen_scores_list)), device=logits.device
+                ),
+            }
+
+        return loss, stats
+
+    def _compute_logprob_scores(
+        self,
+        logits: Tensor,
+        batch: Batch,
+        shared: Optional[SharedContext],
+    ) -> Tensor:
+        """Compute sum of log probs over action tokens for each sequence.
+
+        Args:
+            logits: [B, T, V] language model logits
+            batch: Collated batch with input_ids and action_mask
+            shared: Optional SharedContext for efficient caching
+
+        Returns:
+            [B] tensor of sequence-level log probability sums
+        """
+        # Use SharedContext if available for efficiency
+        if shared is not None:
+            token_logp = shared.token_logp  # [B, T-1]
+            token_mask = shared.token_mask  # [B, T-1]
+        else:
+            # Compute token log probs directly
+            input_ids = batch["input_ids"]
+            action_mask = batch["action_mask"]
+            token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+            token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+
+        # Sum over action tokens only
+        masked_logp = token_logp * token_mask
+        return masked_logp.sum(dim=-1)  # [B]

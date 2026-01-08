@@ -1,23 +1,36 @@
+"""vLLM-specific adapters for weight publishing.
+
+Provides factory functions to create PolicyPublisher instances
+that push weights into vLLM inference servers via NCCL.
+
+For policy models, use create_vllm_publisher().
+For reward models, use create_rm_publisher().
+"""
+
 import time
 import torch
 import logging
-from typing import List, Optional, Mapping, Dict, Any
+from typing import List, Optional, Mapping, Dict, Any, Union
 from ludic.distributed.interfaces import (
     ControlPlane,
     WeightMetadata,
     TensorCommunicator,
     PolicyPublisher,
 )
-from ludic.inference.vllm_client import VLLMChatClient
+from ludic.inference.vllm_client import VLLMClient
+from ludic.inference.reward_types import RewardModelTrainingMode
 from ludic.distributed.publisher import BroadcastPolicyPublisher
 from ludic.distributed.publisher import Rank0OnlyPublisher
 
 # Setup logger
 logger = logging.getLogger(__name__)
 
+# Type alias for backward compatibility
+VLLMChatClient = VLLMClient
+
 
 class VllmControlPlane(ControlPlane):
-    def __init__(self, client: VLLMChatClient):
+    def __init__(self, client: VLLMClient):
         self.client = client
         self.session = client._session
         self.url = client.server_url
@@ -53,11 +66,11 @@ class VllmControlPlane(ControlPlane):
 
 
 class VllmTensorCommunicator(TensorCommunicator):
-    def __init__(self, client: VLLMChatClient):
-        if not client._pynccl_comm:
+    def __init__(self, client: VLLMClient):
+        if not client._policy_comm:
             raise RuntimeError("vLLM Client has no active NCCL communicator")
-        self._comm = client._pynccl_comm
-        self._rank = client._rank
+        self._comm = client._policy_comm.comm
+        self._rank = client._policy_comm.rank
 
     @property
     def rank(self) -> int:
@@ -166,16 +179,22 @@ class VllmPublisherAdapter(PolicyPublisher):
 
 
 def create_vllm_publisher(
-    client: VLLMChatClient,
+    client: VLLMClient,
     *,
     debug: bool = False,
     rank0_only: bool = False,
 ) -> PolicyPublisher:
-    """
-    Create a PolicyPublisher that pushes weights into a vLLM runtime.
+    """Create a PolicyPublisher that pushes weights into a vLLM policy server.
 
-    If rank0_only=True, returns a Rank0OnlyPublisher wrapper that constructs the
-    underlying publisher lazily and only publishes on distributed rank 0.
+    Uses the client's NCCL communicator for efficient tensor broadcast.
+
+    Args:
+        client: VLLMClient with enable_weight_updates=True.
+        debug: If True, print key transformations for debugging.
+        rank0_only: If True, only publish from distributed rank 0.
+
+    Returns:
+        PolicyPublisher that can be used with Trainer.
     """
 
     def _make() -> PolicyPublisher:
@@ -183,6 +202,84 @@ def create_vllm_publisher(
         comm = VllmTensorCommunicator(client)
         broadcaster = BroadcastPolicyPublisher(control, comm, src_rank=comm.rank)
         return VllmPublisherAdapter(broadcaster, debug=debug)
+
+    if rank0_only:
+        return Rank0OnlyPublisher(_make)
+    return _make()
+
+
+class RMPublisherAdapter(PolicyPublisher):
+    """Adapter that uses VLLMClient.sync_reward_weights() directly.
+
+    Transforms weights and calls the client's sync_reward_weights method,
+    which handles the NCCL communication internally.
+    """
+
+    def __init__(
+        self,
+        client: VLLMClient,
+        *,
+        training_mode: RewardModelTrainingMode = RewardModelTrainingMode.FULL,
+        debug: bool = False,
+    ):
+        self.client = client
+        self.training_mode = training_mode
+        self._debug = debug
+
+    def publish(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        version: Optional[int] = None,
+    ) -> None:
+        # Transform (Clean/Normalize) the weights before sending.
+        vllm_params = _transform_hf_to_vllm(state_dict, debug=self._debug)
+        self.client.sync_reward_weights(
+            vllm_params,
+            training_mode=self.training_mode,
+            version=version,
+        )
+
+
+def create_rm_publisher(
+    client: VLLMClient,
+    *,
+    training_mode: RewardModelTrainingMode = RewardModelTrainingMode.FULL,
+    debug: bool = False,
+    rank0_only: bool = False,
+) -> PolicyPublisher:
+    """Create a PolicyPublisher that pushes weights into a vLLM reward model server.
+
+    Uses the client's sync_reward_weights() method, which handles NCCL
+    communication to the scoring server (either same as policy or separate).
+
+    Args:
+        client: VLLMClient with enable_weight_updates=True.
+        training_mode: Which weights are being synced (HEAD_ONLY, LORA, FULL).
+        debug: If True, print key transformations for debugging.
+        rank0_only: If True, only publish from distributed rank 0.
+
+    Returns:
+        PolicyPublisher that can be used to update reward model weights.
+
+    Example:
+        client = VLLMClient(
+            policy_port=8000,
+            scoring_port=8001,
+            enable_weight_updates=True,
+        )
+        rm_publisher = create_rm_publisher(
+            client,
+            training_mode=RewardModelTrainingMode.FULL,
+        )
+        rm_publisher.publish(rm_state_dict, version=1)
+    """
+
+    def _make() -> PolicyPublisher:
+        return RMPublisherAdapter(
+            client,
+            training_mode=training_mode,
+            debug=debug,
+        )
 
     if rank0_only:
         return Rank0OnlyPublisher(_make)

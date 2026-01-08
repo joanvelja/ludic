@@ -188,6 +188,73 @@ def vllm_client(vllm_host_port: Tuple[str, int]) -> VLLMChatClient:
     except RequestsConnectionError:
         pytest.skip(f"vLLM server not reachable at {host}:{port}")
 
+
+# ---------------------------------------------------------------------------
+# Reward server fixture: launch ludic.inference.vllm_reward_server end-to-end
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def vllm_reward_server(request) -> VLLMServerHandle:
+    rm_model = os.getenv("VLLM_RM_MODEL")
+    if not rm_model:
+        pytest.skip("VLLM_RM_MODEL not set; skipping reward server tests")
+
+    host = os.getenv("VLLM_RM_HOST", "127.0.0.1")
+    port = int(os.getenv("VLLM_RM_PORT", "8001"))
+    group_port = int(os.getenv("VLLM_RM_GROUP_PORT", "51217"))
+
+    config = getattr(request, "param", {})
+    dtype = config.get("dtype", os.getenv("VLLM_RM_DTYPE", os.getenv("VLLM_DTYPE", "bfloat16")))
+
+    env = os.environ.copy()
+    env.setdefault("VLLM_USE_V1", "1")
+    env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "ludic.inference.vllm_reward_server",
+        "--model",
+        rm_model,
+        "--dtype",
+        dtype,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--group-port",
+        str(group_port),
+        "--gpu_memory_utilization",
+        os.getenv("VLLM_RM_GPU_MEM_UTIL", "0.7"),
+        "--max-model-len",
+        os.getenv("VLLM_RM_MAX_MODEL_LEN", "4096"),
+        "--max-num-seqs",
+        os.getenv("VLLM_RM_MAX_NUM_SEQS", "4"),
+        "--max-num-batched-tokens",
+        os.getenv("VLLM_RM_MAX_BATCHED_TOKENS", "4096"),
+        "--enforce-eager",
+    ]
+
+    handle = VLLMServerHandle(host=host, port=port, cmd=cmd, env=env, dtype=dtype)
+    try:
+        handle.start()
+    except Exception as exc:  # noqa: BLE001
+        handle.stop()
+        pytest.skip(f"vLLM reward server failed to start: {exc}")
+    yield handle
+    handle.stop()
+
+
+@pytest.fixture(scope="session")
+def vllm_reward_host_port(vllm_reward_server: VLLMServerHandle) -> Tuple[str, int]:
+    return vllm_reward_server.host_port
+
+
+@pytest.fixture(scope="session")
+def vllm_reward_model_name() -> str:
+    return os.getenv("VLLM_RM_MODEL", "")
+
 @pytest.fixture
 def env_registry():
     """
