@@ -553,3 +553,58 @@ def test_composite_loss():
         "kl/kl_mean": 0.5,
     }
     assert stats == expected_stats
+
+
+def test_shared_context_caches_token_logp(monkeypatch):
+    """SharedContext should compute token_logp once and reuse the same tensor."""
+    import ludic.training.loss as loss_mod
+
+    calls = {"count": 0}
+
+    def fake_compute_token_logp(logits: Tensor, input_ids: Tensor) -> Tensor:
+        calls["count"] += 1
+        B, T, _ = logits.shape
+        return torch.zeros((B, T - 1), dtype=logits.dtype)
+
+    monkeypatch.setattr(loss_mod, "compute_token_logp", fake_compute_token_logp)
+
+    seen: Dict[str, Tensor] = {}
+
+    class UseLogp:
+        def compute(
+            self,
+            logits: Tensor,
+            batch: Batch,
+            *,
+            shared: Any = None,
+        ) -> Tuple[Tensor, Dict[str, Any]]:
+            assert shared is not None
+            seen["first"] = shared.token_logp
+            return shared.token_logp.sum(), {}
+
+    class UseLogpAgain:
+        def compute(
+            self,
+            logits: Tensor,
+            batch: Batch,
+            *,
+            shared: Any = None,
+        ) -> Tuple[Tensor, Dict[str, Any]]:
+            assert shared is not None
+            seen["second"] = shared.token_logp
+            return shared.token_logp.sum(), {}
+
+    composite_loss = CompositeLoss(
+        terms=[
+            LossTerm(name="a", loss=UseLogp(), weight=1.0),
+            LossTerm(name="b", loss=UseLogpAgain(), weight=1.0),
+        ]
+    )
+
+    logits = torch.zeros((1, 2, 3), dtype=torch.float32)
+    batch = {"input_ids": torch.tensor([[0, 1]], dtype=torch.long)}
+
+    composite_loss.compute(logits, batch)
+
+    assert calls["count"] == 1
+    assert seen["first"] is seen["second"]
