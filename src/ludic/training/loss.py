@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
 import logging
 import os
 from beartype.typing import Any, Dict, Mapping, Protocol, Tuple, List, Optional
@@ -36,6 +38,42 @@ logger.info(
 # ---------------------------------------------------------------------------
 
 
+_shared_context_var: ContextVar[Optional["SharedContext"]] = ContextVar(
+    "ludic_shared_context",
+    default=None,
+)
+
+
+def _get_shared_context(
+    logits: Logits,
+    *,
+    batch: Optional[Batch] = None,
+    input_ids: Optional[TokenIds] = None,
+    action_mask: Optional[Mask] = None,
+) -> Optional["SharedContext"]:
+    shared = _shared_context_var.get()
+    if shared is None:
+        return None
+    if shared.logits is not logits:
+        return None
+    if batch is not None and shared.batch is not batch:
+        return None
+    if input_ids is not None and shared.batch.get("input_ids") is not input_ids:
+        return None
+    if action_mask is not None and shared.batch.get("action_mask") is not action_mask:
+        return None
+    return shared
+
+
+@contextmanager
+def _use_shared_context(shared: "SharedContext"):
+    token = _shared_context_var.set(shared)
+    try:
+        yield
+    finally:
+        _shared_context_var.reset(token)
+
+
 class SharedContext:
     """
     Lazy-computed shared tensors for memory-efficient loss composition.
@@ -54,14 +92,9 @@ class SharedContext:
         - With sharing (2 losses):    1× [B, T, V] ≈ 2GB activations
 
     Usage:
-        # Created by CompositeLoss, passed to each child loss
-        shared = SharedContext(logits, batch)
-
-        # In CISPOLoss.compute():
-        token_logp = shared.token_logp  # Computes and caches on first access
-
-        # In TokenKLLoss.compute():
-        token_logp = shared.token_logp  # Returns cached tensor (same object!)
+        # CompositeLoss installs a SharedContext so helpers can reuse cached tensors.
+        with _use_shared_context(SharedContext(logits, batch)):
+            token_logp = compute_token_logp(logits, batch["input_ids"])
 
     Note: Properties that depend on batch["actor_logps"] will raise KeyError
     if that key is missing. This is intentional - not all loss combinations
@@ -95,8 +128,7 @@ class SharedContext:
         is the primary memory optimization.
         """
         if "token_logp" not in self._cache:
-            # Import here to avoid circular dependency (compute_token_logp defined later)
-            self._cache["token_logp"] = compute_token_logp(self.logits, self.input_ids)
+            self._cache["token_logp"] = _compute_token_logp_raw(self.logits, self.input_ids)
         return self._cache["token_logp"]
 
     @property
@@ -181,13 +213,7 @@ class Loss(Protocol):
     batched D2H transfer during aggregation. Use `tensor.detach()` not `float(...)`.
     """
 
-    def compute(
-        self,
-        logits: Logits,
-        batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
-    ) -> Tuple[Tensor, Dict[str, Tensor]]:
+    def compute(self, logits: Logits, batch: Batch) -> Tuple[Tensor, Dict[str, Tensor]]:
         ...
 
 # We define this as a standalone helper so torch.compile can cache it cleanly.
@@ -233,7 +259,7 @@ def selective_log_softmax(logits: Logits, index: TokenIds) -> Float[Tensor, "B T
     return _selective_log_softmax_impl(logits, index)
 
 @jaxtyped(typechecker=typechecker)
-def compute_logp_action(
+def _compute_logp_action_raw(
     logits: Logits,
     input_ids: TokenIds,
     action_mask: Mask,
@@ -281,7 +307,30 @@ def compute_logp_action(
 
 
 @jaxtyped(typechecker=typechecker)
-def compute_token_logp(
+def compute_logp_action(
+    logits: Logits,
+    input_ids: TokenIds,
+    action_mask: Mask,
+    *,
+    length_normalize: bool = False,
+) -> Weights:
+    shared = _get_shared_context(
+        logits,
+        input_ids=input_ids,
+        action_mask=action_mask,
+    )
+    if shared is not None:
+        return shared.logp_action(length_normalize=length_normalize)
+    return _compute_logp_action_raw(
+        logits,
+        input_ids,
+        action_mask,
+        length_normalize=length_normalize,
+    )
+
+
+@jaxtyped(typechecker=typechecker)
+def _compute_token_logp_raw(
     logits: Logits,
     input_ids: TokenIds,
 ) -> Float[Tensor, "B T-1"]:
@@ -301,6 +350,19 @@ def compute_token_logp(
     logits_shifted = logits[:, :-1, :]          # [B, T-1, V]
     target_ids = input_ids[:, 1:]               # [B, T-1]
     return selective_log_softmax(logits_shifted, target_ids)
+
+
+@jaxtyped(typechecker=typechecker)
+def compute_token_logp(
+    logits: Logits,
+    input_ids: TokenIds,
+) -> Float[Tensor, "B T-1"]:
+    shared = _get_shared_context(logits, input_ids=input_ids)
+    if shared is not None:
+        if "token_logp" not in shared._cache:
+            shared._cache["token_logp"] = _compute_token_logp_raw(logits, input_ids)
+        return shared._cache["token_logp"]
+    return _compute_token_logp_raw(logits, input_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -334,24 +396,18 @@ class ReinforceLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
+        input_ids = batch["input_ids"]            # [B, T]
         action_mask = batch["action_mask"]        # [B, T]
         advantages = batch["weight"]              # [B]
 
         if self.old_logp_key not in batch:
             raise KeyError(f"ReinforceLoss requires '{self.old_logp_key}' in batch.")
 
-        if shared is not None:
-            logp_action = shared.logp_action(length_normalize=self.length_normalize)
-            token_counts = shared.token_counts
-        else:
-            input_ids = batch["input_ids"]
-            logp_action = compute_logp_action(
-                logits, input_ids, action_mask, length_normalize=self.length_normalize
-            )  # [B]
-            token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
+        logp_action = compute_logp_action(
+            logits, input_ids, action_mask, length_normalize=self.length_normalize
+        )  # [B]
+        token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
 
         old_logp = batch[self.old_logp_key]  # [B]
         if self.length_normalize:
@@ -404,8 +460,6 @@ class MaskedCausalLMCrossEntropyLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         input_ids = batch["input_ids"]  # [B, T]
         action_mask = batch["action_mask"]  # [B, T]
@@ -479,8 +533,6 @@ class ReinforceBaselineLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
         adv_raw = batch["weight"]                # [B]
@@ -488,15 +540,11 @@ class ReinforceBaselineLoss:
         if self.old_logp_key not in batch:
             raise KeyError(f"ReinforceBaselineLoss requires '{self.old_logp_key}' in batch.")
 
-        if shared is not None:
-            logp_action = shared.logp_action(length_normalize=self.length_normalize)
-            token_counts = shared.token_counts
-        else:
-            input_ids = batch["input_ids"]
-            logp_action = compute_logp_action(
-                logits, input_ids, action_mask, length_normalize=self.length_normalize
-            )  # [B]
-            token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
+        input_ids = batch["input_ids"]
+        logp_action = compute_logp_action(
+            logits, input_ids, action_mask, length_normalize=self.length_normalize
+        )  # [B]
+        token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
 
         old_logp = batch[self.old_logp_key]  # [B]
         if self.length_normalize:
@@ -571,8 +619,6 @@ class ClippedSurrogateLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
         advantages = batch["weight"]              # [B]
@@ -581,21 +627,14 @@ class ClippedSurrogateLoss:
                 f"ClippedSurrogateLoss requires '{self.old_logp_key}' in batch."
             )
 
-        # Use shared context if available (memory-efficient composition)
-        if shared is not None:
-            logp_action = shared.logp_action(length_normalize=self.length_normalize)
-            token_counts = shared.token_counts
-        else:
-            # Backward-compatible: compute locally
-            input_ids = batch["input_ids"]
-            action_mask = batch["action_mask"]
-            logp_action = compute_logp_action(
-                logits,
-                input_ids,
-                action_mask,
-                length_normalize=self.length_normalize,
-            )  # [B]
-            token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
+        input_ids = batch["input_ids"]
+        logp_action = compute_logp_action(
+            logits,
+            input_ids,
+            action_mask,
+            length_normalize=self.length_normalize,
+        )  # [B]
+        token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
 
         old_logp = batch[self.old_logp_key]  # [B]
         if self.length_normalize:
@@ -691,8 +730,6 @@ class CISPOLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
         advantages = batch["weight"]  # [B]
@@ -700,25 +737,19 @@ class CISPOLoss:
         if "actor_logps" not in batch:
             raise KeyError("CISPOLoss requires batch['actor_logps'] for importance sampling.")
 
-        if shared is not None:
-            token_logp = shared.token_logp
-            token_mask = shared.token_mask
-            token_counts = shared.token_counts
-            actor_logps_shifted = shared.actor_logps_shifted
-        else:
-            input_ids = batch["input_ids"]
-            actor_logps = batch["actor_logps"]  # [B, T]
-            if actor_logps.shape != input_ids.shape:
-                raise ValueError(
-                    f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
-                    f"{tuple(input_ids.shape)}."
-                )
+        input_ids = batch["input_ids"]
+        actor_logps = batch["actor_logps"]  # [B, T]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
 
-            # Compute token log probs under current policy
-            token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
-            token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
-            token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
-            actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
+        # Compute token log probs under current policy
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
 
         # Compute importance sampling ratios
         log_ratio = token_logp - actor_logps_shifted
@@ -815,31 +846,23 @@ class TokenClippedSurrogateLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
         advantages = batch["weight"]
         if "actor_logps" not in batch:
             raise KeyError("TokenClippedSurrogateLoss requires batch['actor_logps'] for token IS.")
 
-        if shared is not None:
-            token_logp = shared.token_logp
-            token_mask = shared.token_mask
-            token_counts = shared.token_counts
-            actor_logps_shifted = shared.actor_logps_shifted
-        else:
-            input_ids = batch["input_ids"]
-            actor_logps = batch["actor_logps"]
-            if actor_logps.shape != input_ids.shape:
-                raise ValueError(
-                    f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
-                    f"{tuple(input_ids.shape)}."
-                )
-            token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
-            token_mask = action_mask[:, 1:].to(token_logp.dtype)
-            token_counts = token_mask.sum(dim=-1).clamp(min=1.0)
-            actor_logps_shifted = actor_logps[:, 1:]
+        input_ids = batch["input_ids"]
+        actor_logps = batch["actor_logps"]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)
+        actor_logps_shifted = actor_logps[:, 1:]
 
         log_ratio = token_logp - actor_logps_shifted
         ratio_raw = torch.exp(log_ratio)
@@ -963,8 +986,6 @@ class SAPOLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
         advantages = batch["weight"]  # [B]
@@ -972,25 +993,19 @@ class SAPOLoss:
         if "actor_logps" not in batch:
             raise KeyError("SAPOLoss requires batch['actor_logps'] for token IS.")
 
-        if shared is not None:
-            token_logp = shared.token_logp
-            token_mask = shared.token_mask
-            token_counts = shared.token_counts
-            actor_logps_shifted = shared.actor_logps_shifted
-        else:
-            input_ids = batch["input_ids"]
-            actor_logps = batch["actor_logps"]
-            if actor_logps.shape != input_ids.shape:
-                raise ValueError(
-                    f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
-                    f"{tuple(input_ids.shape)}."
-                )
+        input_ids = batch["input_ids"]
+        actor_logps = batch["actor_logps"]
+        if actor_logps.shape != input_ids.shape:
+            raise ValueError(
+                f"actor_logps shape {tuple(actor_logps.shape)} does not match input_ids "
+                f"{tuple(input_ids.shape)}."
+            )
 
-            # Compute token-level log probabilities
-            token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
-            token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
-            token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
-            actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
+        # Compute token-level log probabilities
+        token_logp = compute_token_logp(logits, input_ids)  # [B, T-1]
+        token_mask = action_mask[:, 1:].to(token_logp.dtype)  # [B, T-1]
+        token_counts = token_mask.sum(dim=-1).clamp(min=1.0)  # [B]
+        actor_logps_shifted = actor_logps[:, 1:]  # [B, T-1]
 
         # Compute importance ratios
         log_ratio = token_logp - actor_logps_shifted  # [B, T-1]
@@ -1131,8 +1146,6 @@ class GMPOLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
         advantages = batch["weight"]  # [B]
@@ -1140,6 +1153,7 @@ class GMPOLoss:
         if "actor_logps" not in batch:
             raise KeyError("GMPOLoss requires batch['actor_logps'] for token IS.")
 
+        shared = _get_shared_context(logits, batch=batch)
         if shared is not None:
             token_logp = shared.token_logp
             token_mask = shared.token_mask
@@ -1280,14 +1294,13 @@ class TokenKLLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
 
         if self.old_logp_key not in batch:
             raise KeyError(f"TokenKLLoss requires batch['{self.old_logp_key}'].")
 
+        shared = _get_shared_context(logits, batch=batch)
         if shared is not None:
             token_logp = shared.token_logp
             token_mask = shared.token_mask
@@ -1358,23 +1371,21 @@ class KLLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
         old_logp = batch[self.old_logp_key]       # [B]
 
+        input_ids = batch["input_ids"]
+        logp_new = compute_logp_action(
+            logits,
+            input_ids,
+            action_mask,
+            length_normalize=self.length_normalize,
+        )  # [B]
+        shared = _get_shared_context(logits, batch=batch)
         if shared is not None:
-            logp_new = shared.logp_action(length_normalize=self.length_normalize)
             token_counts = shared.token_counts
         else:
-            input_ids = batch["input_ids"]
-            logp_new = compute_logp_action(
-                logits,
-                input_ids,
-                action_mask,
-                length_normalize=self.length_normalize,
-            )  # [B]
             token_counts = action_mask[:, 1:].sum(dim=-1).clamp(min=1.0)
 
         if self.length_normalize:
@@ -1412,8 +1423,6 @@ class EntropyBonus:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         action_mask = batch["action_mask"]
 
@@ -1478,16 +1487,15 @@ class CompositeLoss:
     Memory Efficiency:
         CompositeLoss automatically creates a SharedContext to cache expensive
         intermediate tensors (like token_logp from log_softmax). All child losses
-        receive the same SharedContext, enabling them to share the cached tensors
-        and avoiding duplicate autograd graphs.
+        can access the same SharedContext implicitly, sharing cached tensors and
+        avoiding duplicate autograd graphs.
 
         Without SharedContext: N losses → N× [B, T, V] autograd activations
         With SharedContext:    N losses → 1× [B, T, V] autograd activations
 
     Note:
-        All child losses must accept a `shared` keyword argument of type
-        Optional[SharedContext]. Losses that don't support this will cause
-        a TypeError with a helpful message.
+        SharedContext is made available implicitly during computation so
+        compute_logp_action/compute_token_logp can reuse cached tensors.
     """
 
     terms: List[LossTerm]
@@ -1497,45 +1505,32 @@ class CompositeLoss:
         self,
         logits: Logits,
         batch: Batch,
-        *,
-        shared: Optional["SharedContext"] = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         if not self.terms:
             raise ValueError("CompositeLoss.terms must be non-empty")
 
-        # Create shared context for memory-efficient tensor sharing
-        if shared is None:
-            shared = SharedContext(logits, batch)
+        # Create shared context for memory-efficient tensor sharing.
+        shared = SharedContext(logits, batch)
 
         total_loss: Tensor | None = None
         stats: Dict[str, Any] = {}
 
-        for term in self.terms:
-            # Pass shared context to enable memory-efficient composition
-            try:
-                raw_loss, term_stats = term.loss.compute(logits, batch, shared=shared)
-            except TypeError as e:
-                if "shared" in str(e):
-                    raise TypeError(
-                        f"Loss '{term.name}' ({type(term.loss).__name__}) does not accept "
-                        f"'shared' parameter. All losses used in CompositeLoss must accept "
-                        f"Optional[SharedContext] for memory-efficient composition. "
-                        f"Update the loss class to add: def compute(..., *, shared: Optional[SharedContext] = None)"
-                    ) from e
-                raise
+        with _use_shared_context(shared):
+            for term in self.terms:
+                raw_loss, term_stats = term.loss.compute(logits, batch)
 
-            scaled_loss = term.weight * raw_loss
+                scaled_loss = term.weight * raw_loss
 
-            if total_loss is None:
-                total_loss = scaled_loss
-            else:
-                total_loss = total_loss + scaled_loss
+                if total_loss is None:
+                    total_loss = scaled_loss
+                else:
+                    total_loss = total_loss + scaled_loss
 
-            # per-term stats
-            stats[f"{term.name}/loss"] = raw_loss.detach()
-            stats[f"{term.name}/weight"] = term.weight
-            for k, v in term_stats.items():
-                stats[f"{term.name}/{k}"] = v
+                # per-term stats
+                stats[f"{term.name}/loss"] = raw_loss.detach()
+                stats[f"{term.name}/weight"] = term.weight
+                for k, v in term_stats.items():
+                    stats[f"{term.name}/{k}"] = v
 
         assert total_loss is not None
         stats["loss"] = total_loss.detach()

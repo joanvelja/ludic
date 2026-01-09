@@ -732,7 +732,7 @@ def make_sft(
 
 
 # ---------------------------------------------------------------------------
-# ScaleRL (CISPO + Hybrid Normalization + ZVP Filtering)
+# ScaleRL (CISPO + Hybrid Normalization)
 # ---------------------------------------------------------------------------
 
 
@@ -763,9 +763,9 @@ def make_scalerl(
     3. **Drop zero-weight samples**: After credit assignment, drop samples with
        near-zero weight to reduce no-op updates.
 
-    4. **FP32 logits** (via TrainerConfig.cast_logits_to_fp32=True):
+    4. **FP32 logits** (via TrainerConfig.cast_logits_to_fp32):
        Recommended for IS ratio stability. Not controlled by this preset—
-       set in TrainerConfig (default True).
+       set in TrainerConfig.
 
     Args:
         group_size: Number of rollouts per group (required for credit assignment).

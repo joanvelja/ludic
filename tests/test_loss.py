@@ -31,8 +31,6 @@ class MockLoss(Loss):
         self,
         logits: Tensor,
         batch: Batch,
-        *,
-        shared: Any = None,
     ) -> Tuple[Tensor, Dict[str, Any]]:
         return torch.tensor(self.loss_val, dtype=torch.float32), self.stats
 
@@ -561,12 +559,12 @@ def test_shared_context_caches_token_logp(monkeypatch):
 
     calls = {"count": 0}
 
-    def fake_compute_token_logp(logits: Tensor, input_ids: Tensor) -> Tensor:
+    def fake_compute_token_logp_raw(logits: Tensor, input_ids: Tensor) -> Tensor:
         calls["count"] += 1
         B, T, _ = logits.shape
         return torch.zeros((B, T - 1), dtype=logits.dtype)
 
-    monkeypatch.setattr(loss_mod, "compute_token_logp", fake_compute_token_logp)
+    monkeypatch.setattr(loss_mod, "_compute_token_logp_raw", fake_compute_token_logp_raw)
 
     seen: Dict[str, Tensor] = {}
 
@@ -575,24 +573,20 @@ def test_shared_context_caches_token_logp(monkeypatch):
             self,
             logits: Tensor,
             batch: Batch,
-            *,
-            shared: Any = None,
         ) -> Tuple[Tensor, Dict[str, Any]]:
-            assert shared is not None
-            seen["first"] = shared.token_logp
-            return shared.token_logp.sum(), {}
+            token_logp = loss_mod.compute_token_logp(logits, batch["input_ids"])
+            seen["first"] = token_logp
+            return token_logp.sum(), {}
 
     class UseLogpAgain:
         def compute(
             self,
             logits: Tensor,
             batch: Batch,
-            *,
-            shared: Any = None,
         ) -> Tuple[Tensor, Dict[str, Any]]:
-            assert shared is not None
-            seen["second"] = shared.token_logp
-            return shared.token_logp.sum(), {}
+            token_logp = loss_mod.compute_token_logp(logits, batch["input_ids"])
+            seen["second"] = token_logp
+            return token_logp.sum(), {}
 
     composite_loss = CompositeLoss(
         terms=[

@@ -131,7 +131,7 @@ class TrainerConfig:
     micro_token_budget: int = 8192
     sync_every_steps: int = 1
     mixed_precision_dtype: Optional[str] = "bf16"
-    cast_logits_to_fp32: bool = True  # ScaleRL: FP32 logits for IS ratio stability
+    cast_logits_to_fp32: bool = False  # ScaleRL: FP32 logits for IS ratio stability
 
     # PipelineRL specific settings
     max_lag: Optional[int] = None  # Drop batches older than N steps
