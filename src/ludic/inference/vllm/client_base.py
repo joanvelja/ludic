@@ -353,41 +353,19 @@ def sync_weights_batch(
 
 
 def _wait_for_batch_ready(
-    session: Session,
-    server_url: str,
-    batch_id: str,
-    *,
-    timeout_s: float = 5.0,
-    poll_interval: float = 0.1,
+    session: Session, server_url: str, batch_id: str, timeout_s: float = 5.0
 ) -> bool:
-    """Poll the server until a batch is ready for NCCL communication.
-
-    Args:
-        session: requests.Session for HTTP calls.
-        server_url: Base URL of the server.
-        batch_id: Batch ID returned from /update_param_batch.
-        timeout_s: Maximum seconds to wait for ready signal.
-        poll_interval: Seconds between polls.
-
-    Returns:
-        True if batch is ready, False if timeout exceeded.
-    """
+    """Poll server until batch is ready for NCCL. Returns True if ready, False on timeout."""
     url = f"{server_url}/batch_ready/{batch_id}"
     deadline = time.time() + timeout_s
-
     while time.time() < deadline:
         try:
             resp = session.get(url, timeout=1.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("ready", False):
-                    return True
+            if resp.status_code == 200 and resp.json().get("ready"):
+                return True
         except RequestException:
-            # Server may be temporarily unavailable
             pass
-
-        time.sleep(poll_interval)
-
+        time.sleep(0.1)
     return False
 
 

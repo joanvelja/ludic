@@ -31,39 +31,20 @@ if TYPE_CHECKING:
 # Weight Filtering by Training Mode
 # ---------------------------------------------------------------------------
 
-# Patterns for weight name matching
-HEAD_PATTERNS = ("score.", "classifier.", "lm_head.")
-LORA_PATTERNS = ("lora_", ".lora.")
+_MODE_PATTERNS: dict[str, tuple[str, ...]] = {
+    "head_only": ("score.", "classifier.", "lm_head."),
+    "lora": ("score.", "classifier.", "lm_head.", "lora_", ".lora."),
+}
 
 
 def _filter_weights_by_mode(
-    metadata: list[dict[str, Any]],
-    training_mode: str,
+    metadata: list[dict[str, Any]], training_mode: str
 ) -> list[dict[str, Any]]:
-    """Filter weight metadata based on training mode.
-
-    Args:
-        metadata: List of weight metadata dicts with "name", "dtype", "shape" keys.
-        training_mode: One of "full", "head_only", or "lora".
-
-    Returns:
-        Filtered list of metadata dicts for weights that should be updated.
-    """
-    if training_mode == "full":
-        return metadata
-    elif training_mode == "head_only":
-        return [
-            m for m in metadata
-            if any(p in m["name"] for p in HEAD_PATTERNS)
-        ]
-    elif training_mode == "lora":
-        patterns = HEAD_PATTERNS + LORA_PATTERNS
-        return [
-            m for m in metadata
-            if any(p in m["name"] for p in patterns)
-        ]
-    # Unknown mode - default to full update
-    return metadata
+    """Filter weight metadata based on training mode (full, head_only, lora)."""
+    patterns = _MODE_PATTERNS.get(training_mode)
+    if patterns is None:
+        return metadata  # "full" or unknown mode
+    return [m for m in metadata if any(p in m["name"] for p in patterns)]
 
 
 # ---------------------------------------------------------------------------
@@ -105,21 +86,16 @@ class ServerState:
         task.add_done_callback(self.background_tasks.discard)
         return task
 
-    def create_batch_id(self) -> str:
-        """Generate a unique batch ID for weight sync coordination."""
+    def new_batch(self) -> tuple[str, asyncio.Event]:
+        """Create a new batch for weight sync coordination. Returns (batch_id, event)."""
         self.batch_counter += 1
-        return f"batch-{self.batch_counter}"
+        batch_id = f"batch-{self.batch_counter}"
+        self.pending_batches[batch_id] = event = asyncio.Event()
+        return batch_id, event
 
-    def create_pending_batch(self, batch_id: str) -> asyncio.Event:
-        """Create an Event for a pending batch and register it."""
-        event = asyncio.Event()
-        self.pending_batches[batch_id] = event
-        return event
-
-    def mark_batch_ready(self, batch_id: str) -> None:
+    def signal_batch_ready(self, batch_id: str) -> None:
         """Signal that a batch is ready for NCCL communication."""
-        event = self.pending_batches.get(batch_id)
-        if event is not None:
+        if (event := self.pending_batches.get(batch_id)) is not None:
             event.set()
 
     def cleanup_batch(self, batch_id: str) -> None:
@@ -393,8 +369,7 @@ def register_weight_sync_endpoints(
         skipped = len(metadata_raw) - len(metadata)
 
         # Generate batch ID for ready-signal coordination
-        batch_id = state.create_batch_id()
-        ready_event = state.create_pending_batch(batch_id)
+        batch_id, _ = state.new_batch()
 
         print(f"\n{log_prefix} Receiving {len(metadata)} weights (mode: {training_mode}, batch: {batch_id})")
         if skipped > 0:
@@ -416,7 +391,7 @@ def register_weight_sync_endpoints(
                     # Signal ready before dispatching RPC - at this point the
                     # request has been validated and workers will be notified.
                     # The actual NCCL broadcast will block until client sends.
-                    state.mark_batch_ready(batch_id)
+                    state.signal_batch_ready(batch_id)
 
                     await engine.collective_rpc("update_param_batch", args=(rpc_args,))
                     await engine.reset_prefix_cache()

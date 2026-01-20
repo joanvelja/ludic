@@ -229,20 +229,16 @@ class VLLMClient(ChatClient):
             self._scoring_comm = None
 
     async def _get_async_session(self) -> aiohttp.ClientSession:
-        """Get or create a cached aiohttp ClientSession.
-
-        Lazily initializes the session on first call and reuses it for
-        subsequent calls. Creates a new session if the previous one was closed.
-        """
+        """Get or create a cached aiohttp ClientSession (lazy init, auto-recreate if closed)."""
         if self._async_session is None or self._async_session.closed:
             self._async_session = aiohttp.ClientSession()
         return self._async_session
 
     async def close_async_session(self) -> None:
-        """Close the cached aiohttp session if it exists."""
-        if self._async_session is not None and not self._async_session.closed:
+        """Close the cached aiohttp session."""
+        if self._async_session and not self._async_session.closed:
             await self._async_session.close()
-            self._async_session = None
+        self._async_session = None
 
     # ─────────────────────────────────────────────────────────────────
     # ChatClient.complete
