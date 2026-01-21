@@ -935,6 +935,8 @@ def make_bradley_terry(
     beta: float = 1.0,
     score_type: str = "reward",
     name: str = "bradley_terry",
+    lambda_regularization: float = 0.0,
+    regularization_type: str = "l2",
 ) -> RLAlgorithm:
     """Create Bradley-Terry preference learning algorithm.
 
@@ -995,7 +997,12 @@ def make_bradley_terry(
         - DPO: https://arxiv.org/abs/2305.18290
     """
     credit_assigner: CreditAssigner = ConstantCredit(value=1.0)
-    loss: Loss = BradleyTerryLoss(beta=beta, score_type=score_type)
+    loss: Loss = BradleyTerryLoss(
+        beta=beta,
+        score_type=score_type,
+        regularization_lambda=lambda_regularization,
+        regularization_type=regularization_type,
+    )
 
     return RLAlgorithm(
         name=name,

@@ -1226,10 +1226,14 @@ class BradleyTerryLoss:
         score_type: How to compute sequence scores:
             - "reward": Use model's scalar output directly (for reward models)
             - "logprob": Sum of log probs over action tokens (for DPO-style)
+        regularization_lambda: Lambda factor for regularization term. Default 0.0.
+        regularization_type: Type of regularization to apply. Default "l2".
     """
 
     beta: float = 1.0
     score_type: str = "reward"  # Literal["reward", "logprob"]
+    regularization_lambda: float = 0.0
+    regularization_type: str = "l2"  # Literal["l2", "l1"]
 
     def __post_init__(self) -> None:
         if self.score_type not in ("reward", "logprob"):
@@ -1238,6 +1242,14 @@ class BradleyTerryLoss:
             )
         if self.beta <= 0:
             raise ValueError(f"beta must be positive, got {self.beta}")
+        if self.regularization_lambda < 0:
+            raise ValueError(
+                f"regularization_lambda must be non-negative, got {self.regularization_lambda}"
+            )
+        if self.regularization_type not in ("l2", "l1"):
+            raise ValueError(
+                f"regularization_type must be 'l2' or 'l1', got {self.regularization_type!r}"
+            )
 
     @jaxtyped(typechecker=typechecker)
     def compute(
@@ -1322,13 +1334,20 @@ class BradleyTerryLoss:
             labels_tensor_list, device=scores.device, dtype=scores.dtype
         )
 
+        reg = 0
+        if self.regularization_lambda > 0:
+            if self.regularization_type == "l2":
+                reg = self.regularization_lambda * torch.norm(chosen_scores - rejected_scores, p=2)
+            elif self.regularization_type == "l1":
+                reg = self.regularization_lambda * torch.norm(chosen_scores - rejected_scores, p=1)
+
         # 4. Bradley-Terry loss with soft labels
         # Loss = -E[label * log(sigma(beta * (s_c - s_r))) + (1-label) * log(sigma(beta * (s_r - s_c)))]
         logit_diff = self.beta * (chosen_scores - rejected_scores)
-        loss = -(
+        loss = -((
             labels * F.logsigmoid(logit_diff)
-            + (1 - labels) * F.logsigmoid(-logit_diff)
-        ).mean()
+            + (1 - labels) * F.logsigmoid(-logit_diff) 
+        ) + reg).mean()
 
         # 5. Stats
         with torch.no_grad():

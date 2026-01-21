@@ -199,6 +199,11 @@ See `CONSIDERATIONS.md` for the canonical definitions and what gets propagated i
 
 Some older scripts in `examples/` may be stale (imports/layout changed); prefer the README-backed examples above as the "current" patterns.
 
+## Guidance on Isambard AI HPC
+Running scripts on Isambard AI HPC (docs.isambard.ac.uk) requires a certain degree of carefulness: you will be running on the **login node**, which means that you can set up your environment, but you cannot run any heavy computations there. You will need to use **Slurm** to request resources and run your jobs. You can either:
+1. allocate short, interactive CPU jobs for debugging and development (e.g., inspecting data from an huggingface dataset), while compilation and such things can be easily done on the login node itself.
+2. allocate GPU jobs for training and evaluation. For this, you will need to use the **sbatch** command to submit a job script to the scheduler. As a reference sbatch file for this purpose, see `/examples/code_exec/train_apps_isambard.slurm`. **ALWAYS** be mindful of requesting more than 2 GPUs. You will not be granted free permission to run scripts as you prefer. For launching bash commands, prepend your commands with `!`. For example, `!sbatch /examples/code_exec/train_apps_isambard.slurm`.
+
 ## Extending Ludic (Practical Checklist)
 
 - New task:
