@@ -19,8 +19,8 @@ checkpoints_*/
 wandb/
 
 # Slurm logs
-logs/
-*.log
+# logs/
+# *.log
 
 # Big jsonl files
 data/
@@ -37,4 +37,3 @@ RM_PLAN.md
 tests/
 docs/RM_TEST_PLAN.md
 .codex-bottleneck-analysis/
-.claude/

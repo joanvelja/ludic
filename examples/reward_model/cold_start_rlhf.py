@@ -113,6 +113,10 @@ class LocalRewardModelScorer:
 
     Loads the RM checkpoint and scores sequences directly.
     Adds rm_score to rollout.meta for use with RewardModelCreditAssigner.
+
+    IMPORTANT: If the RM was trained with chat templates (recommended), set
+    use_chat_template=True to ensure scoring uses the same format. Mismatched
+    formatting between training and inference will degrade RM quality.
     """
 
     def __init__(
@@ -121,10 +125,16 @@ class LocalRewardModelScorer:
         device: str = "cuda",
         batch_size: int = 16,
         score_key: str = "rm_score",
+        use_chat_template: bool = True,
+        system_prompt: Optional[str] = None,
+        max_length: int = 512,
     ):
         self.device = device
         self.batch_size = batch_size
         self.score_key = score_key
+        self.use_chat_template = use_chat_template
+        self.system_prompt = system_prompt
+        self.max_length = max_length
 
         logger.info(f"Loading reward model from: {checkpoint_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
@@ -138,39 +148,99 @@ class LocalRewardModelScorer:
         self.model.to(device)
         self.model.eval()
 
-    def _format_rollout(self, rollout: Rollout) -> str:
-        """Format rollout for scoring (prompt + completion)."""
-        parts = []
+        if use_chat_template:
+            if not hasattr(self.tokenizer, "apply_chat_template"):
+                raise ValueError(
+                    "use_chat_template=True requires a tokenizer with apply_chat_template(). "
+                    "Either use a tokenizer from an instruction-tuned model, or set "
+                    "use_chat_template=False (not recommended if RM was trained with templates)."
+                )
+            logger.info("RM scorer using chat template for tokenization")
+        else:
+            logger.warning("RM scorer NOT using chat template - may cause distribution mismatch")
+
+    def _extract_prompt_and_completion(self, rollout: Rollout) -> tuple[str, str]:
+        """Extract prompt (user message) and completion (assistant response) from rollout."""
+        # In a typical single-turn QA rollout:
+        # - step.prev_obs is the user's question/prompt
+        # - step.action is the assistant's response
+        prompt_parts = []
+        completion_parts = []
+
         for step in rollout.steps:
             if step.prev_obs:
-                parts.append(str(step.prev_obs))
+                prompt_parts.append(str(step.prev_obs))
             if step.action:
-                parts.append(str(step.action))
-        return "\n".join(parts)
+                completion_parts.append(str(step.action))
+
+        prompt = "\n".join(prompt_parts)
+        completion = "\n".join(completion_parts)
+        return prompt, completion
+
+    def _tokenize_with_chat_template(self, prompt: str, completion: str) -> List[int]:
+        """Tokenize using chat template format."""
+        messages: List[Dict[str, str]] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "assistant", "content": completion})
+
+        token_ids = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=False,
+            tokenize=True,
+        )
+
+        # Truncate if needed
+        if len(token_ids) > self.max_length:
+            token_ids = token_ids[:self.max_length]
+
+        return token_ids
 
     def score_rollouts(self, rollouts: List[Rollout]) -> None:
         """Score rollouts and store results in metadata (modifies in-place)."""
         if not rollouts:
             return
 
-        # Format rollouts for scoring
-        texts = [self._format_rollout(r) for r in rollouts]
         scores: List[float] = []
 
-        # Batch score
-        for i in range(0, len(texts), self.batch_size):
-            batch_texts = texts[i:i + self.batch_size]
+        # Process rollouts - extract prompt/completion pairs
+        rollout_data = [self._extract_prompt_and_completion(r) for r in rollouts]
 
-            # Tokenize
-            encoded = self.tokenizer(
-                batch_texts,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-            input_ids = encoded["input_ids"].to(self.device)
-            attention_mask = encoded["attention_mask"].to(self.device)
+        # Batch score
+        for i in range(0, len(rollout_data), self.batch_size):
+            batch_data = rollout_data[i:i + self.batch_size]
+
+            if self.use_chat_template:
+                # Tokenize each item with chat template
+                batch_token_ids = [
+                    self._tokenize_with_chat_template(prompt, completion)
+                    for prompt, completion in batch_data
+                ]
+
+                # Pad manually
+                max_len = max(len(ids) for ids in batch_token_ids)
+                padded_ids = []
+                attention_masks = []
+                for ids in batch_token_ids:
+                    pad_len = max_len - len(ids)
+                    padded_ids.append(ids + [self.tokenizer.pad_token_id] * pad_len)
+                    attention_masks.append([1] * len(ids) + [0] * pad_len)
+
+                input_ids = torch.tensor(padded_ids, device=self.device)
+                attention_mask = torch.tensor(attention_masks, device=self.device)
+            else:
+                # Legacy: raw text tokenization (not recommended)
+                batch_texts = [f"{prompt}\n{completion}" for prompt, completion in batch_data]
+                encoded = self.tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length,
+                    return_tensors="pt",
+                )
+                input_ids = encoded["input_ids"].to(self.device)
+                attention_mask = encoded["attention_mask"].to(self.device)
 
             # Score
             with torch.no_grad():
@@ -285,7 +355,13 @@ def train_policy_with_rm(
     model.to(device)
 
     # Create RM scorer for scoring rollouts
-    rm_scorer = LocalRewardModelScorer(rm_checkpoint, device=device)
+    # Uses chat template by default to match RM training format
+    rm_scorer = LocalRewardModelScorer(
+        rm_checkpoint,
+        device=device,
+        use_chat_template=True,
+        system_prompt=system_prompt if system_prompt else None,
+    )
 
     # Inference client for rollout generation
     client = VLLMChatClient(host=host, port=port, enable_weight_updates=True)

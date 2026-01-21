@@ -24,6 +24,14 @@ from .requests_from_dataset import (
     make_dataset_queue_requests_fn,
     make_dataset_sequence_requests_fn,
 )
+from .rm_batching import (
+    group_preference_pairs,
+    split_preference_pairs_by_token_budget,
+    collate_preference_items,
+    compute_pair_loss_scale,
+    validate_preference_batch,
+    count_pairs_in_items,
+)
 
 __all__ = [
     "RolloutEngine",
@@ -43,4 +51,11 @@ __all__ = [
     "make_dataset_queue_requests_fn",
     "make_dataset_sequence_requests_fn",
     "make_chat_template_step_to_item",
+    # RM batching
+    "group_preference_pairs",
+    "split_preference_pairs_by_token_budget",
+    "collate_preference_items",
+    "compute_pair_loss_scale",
+    "validate_preference_batch",
+    "count_pairs_in_items",
 ]

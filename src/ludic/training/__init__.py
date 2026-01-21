@@ -61,6 +61,7 @@ from .preference_utils import (
 from .reward_scorer import RewardModelScorer
 from .config import TrainerConfig
 from .checkpoint import CheckpointConfig
+from .classification_metrics import PreferenceMetrics
 from .batching import (
     RolloutEngine,
     RolloutBatchSource,
@@ -81,12 +82,17 @@ from .loggers import TrainingLogger, PrintLogger, RichLiveLogger, TeeLogger, Wan
 
 if TYPE_CHECKING:  # pragma: no cover
     from .trainer import Trainer as Trainer
+    from .rm_trainer import RMTrainer as RMTrainer, RMTrainerConfig as RMTrainerConfig
 
 __all__ = [
     # Core training loop
     "Trainer",
     "TrainerConfig",
     "CheckpointConfig",
+    # RM training
+    "RMTrainer",
+    "RMTrainerConfig",
+    "PreferenceMetrics",
     # Algorithm composition
     "RLAlgorithm",
     "make_reinforce",
@@ -170,4 +176,12 @@ def __getattr__(name: str) -> Any:  # pragma: no cover
         from .trainer import Trainer as _Trainer
 
         return _Trainer
+    if name == "RMTrainer":
+        from .rm_trainer import RMTrainer as _RMTrainer
+
+        return _RMTrainer
+    if name == "RMTrainerConfig":
+        from .rm_trainer import RMTrainerConfig as _RMTrainerConfig
+
+        return _RMTrainerConfig
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

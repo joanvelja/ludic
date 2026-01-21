@@ -1228,12 +1228,16 @@ class BradleyTerryLoss:
             - "logprob": Sum of log probs over action tokens (for DPO-style)
         regularization_lambda: Lambda factor for regularization term. Default 0.0.
         regularization_type: Type of regularization to apply. Default "l2".
+        label_smoothing: Label smoothing factor (0.0 to 1.0). Smooths labels
+            toward 0.5: smoothed_label = label * (1 - smooth) + 0.5 * smooth.
+            Default 0.0 (no smoothing).
     """
 
     beta: float = 1.0
     score_type: str = "reward"  # Literal["reward", "logprob"]
     regularization_lambda: float = 0.0
     regularization_type: str = "l2"  # Literal["l2", "l1"]
+    label_smoothing: float = 0.0
 
     def __post_init__(self) -> None:
         if self.score_type not in ("reward", "logprob"):
@@ -1249,6 +1253,10 @@ class BradleyTerryLoss:
         if self.regularization_type not in ("l2", "l1"):
             raise ValueError(
                 f"regularization_type must be 'l2' or 'l1', got {self.regularization_type!r}"
+            )
+        if not (0.0 <= self.label_smoothing <= 1.0):
+            raise ValueError(
+                f"label_smoothing must be between 0.0 and 1.0, got {self.label_smoothing}"
             )
 
     @jaxtyped(typechecker=typechecker)
@@ -1333,6 +1341,11 @@ class BradleyTerryLoss:
         labels = torch.tensor(
             labels_tensor_list, device=scores.device, dtype=scores.dtype
         )
+
+        # Apply label smoothing: smooth labels toward 0.5
+        # smoothed_label = label * (1 - smooth) + 0.5 * smooth
+        if self.label_smoothing > 0:
+            labels = labels * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
 
         reg = 0
         if self.regularization_lambda > 0:

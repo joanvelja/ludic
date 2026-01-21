@@ -60,7 +60,7 @@ class PrintLogger:
             keys = sorted(stats.keys())
         pairs = [f"{k}={self._fmt_val(stats[k])}" for k in keys]
         if not pairs:
-            print(f"{self.prefix} step={step}")
+            print(f"{self.prefix} step={step}", flush=True)
             return
 
         header = f"{self.prefix} step={step}"
@@ -68,10 +68,10 @@ class PrintLogger:
         for i in range(0, len(pairs), self.max_items_per_line):
             lines.append(" ".join(pairs[i : i + self.max_items_per_line]))
 
-        print(f"{header} {lines[0]}")
+        print(f"{header} {lines[0]}", flush=True)
         indent = " " * len(header)
         for line in lines[1:]:
-            print(f"{indent} {line}")
+            print(f"{indent} {line}", flush=True)
 
 
 class RichLiveLogger:

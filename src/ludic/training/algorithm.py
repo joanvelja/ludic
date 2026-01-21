@@ -937,6 +937,7 @@ def make_bradley_terry(
     name: str = "bradley_terry",
     lambda_regularization: float = 0.0,
     regularization_type: str = "l2",
+    label_smoothing: float = 0.0,
 ) -> RLAlgorithm:
     """Create Bradley-Terry preference learning algorithm.
 
@@ -970,6 +971,10 @@ def make_bradley_terry(
             - "reward": Use model's scalar output (for reward models)
             - "logprob": Sum of log probs over action tokens (for DPO-style)
         name: Algorithm name for logging/metrics.
+        lambda_regularization: Regularization strength for score magnitude.
+        regularization_type: Type of regularization ("l2" or "l1").
+        label_smoothing: Label smoothing factor (0.0 to 1.0). Smooths labels
+            toward 0.5 to reduce overconfidence. Default 0.0 (no smoothing).
 
     Returns:
         RLAlgorithm configured for Bradley-Terry preference learning.
@@ -1002,6 +1007,7 @@ def make_bradley_terry(
         score_type=score_type,
         regularization_lambda=lambda_regularization,
         regularization_type=regularization_type,
+        label_smoothing=label_smoothing,
     )
 
     return RLAlgorithm(

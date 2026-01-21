@@ -1,0 +1,14 @@
+{
+    "statusLine": {
+        "type": "command",
+        "command": "~/.claude/scripts/context-bar.sh"
+    },
+    "enabledPlugins": {
+        "code-simplifier@claude-plugins-official": true
+    },
+    "alwaysThinkingEnabled": true,
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-5-20251101",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-opus-4-5-20251101",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-sonnet-4-5-20250929",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-4-5-20251101"
+}

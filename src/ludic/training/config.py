@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -95,6 +95,40 @@ class TrainerConfig:
 
     - eval_timeout_s:
           Optional per-call timeout for eval rollouts.
+
+    ==========================
+    Learning Rate Scheduler
+    ==========================
+
+    - lr_scheduler_type:
+          Type of LR scheduler to use. Supported: "cosine", "linear",
+          "constant_with_warmup". If None, no scheduler is used.
+
+    - warmup_steps:
+          Number of warmup steps for the scheduler.
+
+    - warmup_ratio:
+          Alternative to warmup_steps: warmup as a fraction of total steps.
+          If both warmup_steps and warmup_ratio are provided, warmup_steps
+          takes precedence.
+
+    ==========================
+    Early Stopping
+    ==========================
+
+    - early_stopping_patience:
+          Number of evaluations without improvement before stopping.
+          If None, early stopping is disabled.
+
+    - early_stopping_metric:
+          Metric to monitor for early stopping (e.g., "eval_loss", "eval_accuracy").
+
+    - early_stopping_mode:
+          "min" if lower metric is better (e.g., loss), "max" if higher is better
+          (e.g., accuracy).
+
+    - early_stopping_min_delta:
+          Minimum change in metric to qualify as an improvement.
     """
 
     # ----- model / optimization -------------------
@@ -130,3 +164,14 @@ class TrainerConfig:
     eval_concurrency: int = 32
     eval_max_steps: int = 1
     eval_timeout_s: Optional[float] = None
+
+    # ----- LR scheduler ---------------------------
+    lr_scheduler_type: Optional[str] = None  # "cosine", "linear", "constant_with_warmup"
+    warmup_steps: int = 0
+    warmup_ratio: Optional[float] = None  # Alternative: warmup as fraction of total steps
+
+    # ----- early stopping -------------------------
+    early_stopping_patience: Optional[int] = None  # None = disabled
+    early_stopping_metric: str = "eval_loss"  # Metric to monitor
+    early_stopping_mode: str = "min"  # "min" or "max"
+    early_stopping_min_delta: float = 0.0  # Minimum improvement

@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 from torch import nn, optim, Tensor
+from torch.optim.lr_scheduler import LRScheduler
 import torch.distributed as dist
 from torch.distributed import fsdp
 from torch.distributed.checkpoint.state_dict import (
@@ -80,6 +81,7 @@ class Trainer:
         train_logger: Optional[TrainingLogger] = None,
         reducers: Optional[Mapping[str, Reducer]] = None,
         evaluator: Optional[Evaluator] = None,
+        total_training_steps: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -136,8 +138,13 @@ class Trainer:
 
             evaluator:
                 Optional evaluator object used for periodic evaluation runs.
+
+            total_training_steps:
+                Optional total number of training steps. Used to compute warmup
+                steps from warmup_ratio if configured.
         """
         self.cfg = cfg
+        self._total_training_steps = total_training_steps
         self.train_logger = train_logger
         self.reducers = reducers
 
@@ -191,6 +198,17 @@ class Trainer:
         # Assume gradients are zeroed at init
         self.optimizer.zero_grad(set_to_none=True)
 
+        # Initialize LR scheduler if configured
+        self._scheduler: Optional[LRScheduler] = None
+        if self.cfg.lr_scheduler_type is not None:
+            # Create scheduler with total_training_steps if known
+            self._scheduler = self._create_scheduler(self._total_training_steps)
+
+        # Initialize early stopping state
+        self._early_stopping_best_metric: Optional[float] = None
+        self._early_stopping_patience_counter: int = 0
+        self._early_stopping_best_step: int = 0
+
         # Optionally resume from a checkpoint (weights + optimizer)
         if resume_from is not None:
             if self._checkpointer is None:
@@ -212,6 +230,10 @@ class Trainer:
             )
             # Default to the saved step, else keep current.
             self._train_step_idx = int(meta.get("step", self._train_step_idx))
+            # Restore scheduler state if available
+            if self._scheduler is not None and "scheduler_state_dict" in meta:
+                self._scheduler.load_state_dict(meta["scheduler_state_dict"])
+                logger.info("Restored scheduler state from checkpoint")
             logger.info("✅ Resumed from checkpoint at step %s", self._train_step_idx)
 
     # ------------------------------------------------------------------
@@ -237,6 +259,106 @@ class Trainer:
             betas=self.cfg.betas,
             eps=self.cfg.eps,
         )
+
+    def _create_scheduler(
+        self,
+        total_training_steps: Optional[int] = None,
+    ) -> Optional[LRScheduler]:
+        """
+        Create LR scheduler based on config.
+
+        Args:
+            total_training_steps: Total number of training steps. Required if
+                warmup_ratio is specified.
+
+        Returns:
+            LRScheduler or None if no scheduler configured.
+        """
+        if self.cfg.lr_scheduler_type is None:
+            return None
+
+        try:
+            from transformers import get_scheduler
+        except ImportError:
+            logger.warning(
+                "transformers not installed; LR scheduler disabled. "
+                "Install with: pip install transformers"
+            )
+            return None
+
+        # Determine warmup steps
+        warmup_steps = self.cfg.warmup_steps
+        if self.cfg.warmup_ratio is not None and total_training_steps is not None:
+            computed_warmup = int(self.cfg.warmup_ratio * total_training_steps)
+            # warmup_steps takes precedence if explicitly set
+            if self.cfg.warmup_steps == 0:
+                warmup_steps = computed_warmup
+
+        # Use a large default if total_training_steps not known
+        num_training_steps = total_training_steps or 1_000_000
+
+        scheduler = get_scheduler(
+            name=self.cfg.lr_scheduler_type,
+            optimizer=self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        logger.info(
+            "Created %s scheduler with %d warmup steps",
+            self.cfg.lr_scheduler_type,
+            warmup_steps,
+        )
+
+        return scheduler
+
+    def _check_early_stopping(self, current_metric: float) -> Tuple[bool, bool]:
+        """
+        Check if early stopping should trigger.
+
+        Args:
+            current_metric: Current value of the monitored metric.
+
+        Returns:
+            (should_stop, is_improvement) tuple.
+        """
+        if self.cfg.early_stopping_patience is None:
+            return False, False
+
+        mode = self.cfg.early_stopping_mode
+        min_delta = self.cfg.early_stopping_min_delta
+
+        # First evaluation - initialize best
+        if self._early_stopping_best_metric is None:
+            self._early_stopping_best_metric = current_metric
+            self._early_stopping_patience_counter = 0
+            self._early_stopping_best_step = self._train_step_idx
+            return False, True
+
+        # Check for improvement
+        if mode == "min":
+            is_improvement = current_metric < self._early_stopping_best_metric - min_delta
+        else:  # mode == "max"
+            is_improvement = current_metric > self._early_stopping_best_metric + min_delta
+
+        if is_improvement:
+            self._early_stopping_best_metric = current_metric
+            self._early_stopping_patience_counter = 0
+            self._early_stopping_best_step = self._train_step_idx
+            return False, True
+        else:
+            self._early_stopping_patience_counter += 1
+            should_stop = self._early_stopping_patience_counter >= self.cfg.early_stopping_patience
+            if should_stop:
+                logger.info(
+                    "Early stopping triggered at step %d. "
+                    "Best %s: %.6f at step %d",
+                    self._train_step_idx,
+                    self.cfg.early_stopping_metric,
+                    self._early_stopping_best_metric,
+                    self._early_stopping_best_step,
+                )
+            return should_stop, False
 
     def _maybe_reduce_stats_across_ranks(
         self,
@@ -578,7 +700,7 @@ class Trainer:
                 loss, stats = self.algo.compute_loss(
                     self.model,
                     batch_tensors,
-                    cast_logits_to_fp32=self.config.cast_logits_to_fp32,
+                    cast_logits_to_fp32=self.cfg.cast_logits_to_fp32,
                 )
 
                 # Scale loss by micro-batch size to preserve macro-batch mean.
@@ -634,6 +756,10 @@ class Trainer:
         # ---- 4) Optimizer Step (one step for the macro-batch) ----------
         self.optimizer.step()
 
+        # ---- 4b) Scheduler Step -----------------------------------------
+        if self._scheduler is not None:
+            self._scheduler.step()
+
         # ---- 5) Free Gradients (as requested) --------------------------
         # Grads are freed *after* step and *before* weight sync
         self.optimizer.zero_grad(set_to_none=True)
@@ -646,11 +772,14 @@ class Trainer:
 
         # ---- 7) Optional Checkpoint ------------------------------------
         if self._checkpointer is not None:
+            extra_state = {}
+            if self._scheduler is not None:
+                extra_state["scheduler_state_dict"] = self._scheduler.state_dict()
             self._checkpointer.maybe_save(
                 self.model,
                 optimizer=self.optimizer,
                 step=self._train_step_idx,
-                metadata={"algorithm": self.algo.name},
+                metadata={"algorithm": self.algo.name, **extra_state},
             )
 
         # ---- 8) Stats aggregation (skip on non-logging steps) ----------
@@ -744,6 +873,8 @@ class Trainer:
             )
 
         merged_meta = {"algorithm": self.algo.name}
+        if self._scheduler is not None:
+            merged_meta["scheduler_state_dict"] = self._scheduler.state_dict()
         if metadata:
             merged_meta.update(metadata)
 
