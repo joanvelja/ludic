@@ -305,7 +305,11 @@ class AsyncBatchSource(BatchSource):
             self.items = shuffle_preference_pairs(items, seed=seed)
 
     async def next_batch(self) -> SAWBatch:
-        """Get next batch asynchronously."""
+        """Get next batch.
+
+        Note: async is required by BatchSource protocol, but this implementation
+        only does synchronous list operations. No actual async I/O occurs.
+        """
         if self._idx >= len(self.items):
             self._epoch += 1
             self._idx = 0

@@ -58,6 +58,11 @@ from .preference_utils import (
     preference_dataset_to_saw_items,
     shuffle_preference_pairs,
 )
+from .chat_template_utils import (
+    ChatTemplateResult,
+    tokenize_with_chat_template,
+    format_chat_template_text,
+)
 from .reward_scorer import RewardModelScorer
 from .config import TrainerConfig
 from .checkpoint import CheckpointConfig
@@ -135,6 +140,10 @@ __all__ = [
     "create_preference_saw_items",
     "preference_dataset_to_saw_items",
     "shuffle_preference_pairs",
+    # Chat template utilities
+    "ChatTemplateResult",
+    "tokenize_with_chat_template",
+    "format_chat_template_text",
     # Core data types
     "EnvSpec",
     "ProtocolSpec",

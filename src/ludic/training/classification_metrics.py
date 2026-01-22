@@ -59,10 +59,10 @@ class PreferenceMetrics:
             self._torchmetrics_available = False
 
         # Accumulated data for pairwise metrics (computed from scratch)
+        # Note: We only store margins and labels; raw scores are not needed
+        # after margin computation, so we avoid accumulating them.
         self._margins: List[Tensor] = []
         self._labels: List[Tensor] = []
-        self._chosen_scores: List[Tensor] = []
-        self._rejected_scores: List[Tensor] = []
 
     def update(
         self,
@@ -77,10 +77,10 @@ class PreferenceMetrics:
             rejected_scores: [N] tensor of scores for rejected responses.
             labels: [N] tensor of labels (1.0 = chosen preferred, 0.0 = rejected).
         """
-        # Ensure tensors are on CPU for accumulation
-        chosen_scores = chosen_scores.detach().float()
-        rejected_scores = rejected_scores.detach().float()
-        labels = labels.detach().float()
+        # Ensure tensors are on CPU for accumulation to avoid GPU memory leak
+        chosen_scores = chosen_scores.detach().cpu().float()
+        rejected_scores = rejected_scores.detach().cpu().float()
+        labels = labels.detach().cpu().float()
 
         # Compute margins
         margins = chosen_scores - rejected_scores
@@ -88,8 +88,6 @@ class PreferenceMetrics:
         # Accumulate for pairwise metrics
         self._margins.append(margins)
         self._labels.append(labels)
-        self._chosen_scores.append(chosen_scores)
-        self._rejected_scores.append(rejected_scores)
 
         # Update torchmetrics if available
         if self._torchmetrics_available:
@@ -218,8 +216,6 @@ class PreferenceMetrics:
         """Reset all accumulated state."""
         self._margins = []
         self._labels = []
-        self._chosen_scores = []
-        self._rejected_scores = []
 
         if self._torchmetrics_available:
             self._auroc.reset()

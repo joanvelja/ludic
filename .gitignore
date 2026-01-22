@@ -37,3 +37,5 @@ RM_PLAN.md
 tests/
 docs/RM_TEST_PLAN.md
 .codex-bottleneck-analysis/
+.bottleneck-analysis/
+.bugfinder/

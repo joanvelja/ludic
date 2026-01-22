@@ -356,7 +356,11 @@ def main():
             {"role": "system", "content": APPS_SYSTEM_PROMPT},
             {"role": "user", "content": sample["question"]},
         ]
-        token_ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        token_ids = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+        )
         return len(token_ids) <= args.max_prompt_tokens
 
     pre_filter_count = len(all_samples)

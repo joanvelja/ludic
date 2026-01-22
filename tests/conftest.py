@@ -6,13 +6,44 @@ import subprocess
 import sys
 import time
 from typing import Optional, Tuple
+from unittest.mock import MagicMock
 
 import pytest
 import requests
 from requests import ConnectionError as RequestsConnectionError
 
-from ludic.inference.vllm_client import VLLMChatClient
+# Mock vLLM imports if not available - allows tests to run without vLLM installed
+def _check_vllm_available() -> bool:
+    """Check if vllm is actually importable."""
+    try:
+        import vllm  # noqa: F401
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False
 
+VLLM_AVAILABLE = _check_vllm_available()
+
+if not VLLM_AVAILABLE:
+    # Create comprehensive mocks for vllm modules
+    _vllm_mock = MagicMock()
+    _vllm_distributed = MagicMock()
+    _vllm_device_comm = MagicMock()
+    _vllm_pynccl = MagicMock()
+    _vllm_parallel_state = MagicMock()
+    _vllm_utils = MagicMock()
+    _vllm_engine = MagicMock()
+    _vllm_async_engine = MagicMock()
+
+    sys.modules["vllm"] = _vllm_mock
+    sys.modules["vllm.distributed"] = _vllm_distributed
+    sys.modules["vllm.distributed.device_communicators"] = _vllm_device_comm
+    sys.modules["vllm.distributed.device_communicators.pynccl"] = _vllm_pynccl
+    sys.modules["vllm.distributed.parallel_state"] = _vllm_parallel_state
+    sys.modules["vllm.distributed.utils"] = _vllm_utils
+    sys.modules["vllm.engine"] = _vllm_engine
+    sys.modules["vllm.engine.async_llm_engine"] = _vllm_async_engine
+
+from ludic.inference.vllm_client import VLLMChatClient
 from ludic.context.full_dialog import FullDialog
 from tests._mocks import MockEnv, MockAgent
 

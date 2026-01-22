@@ -160,10 +160,18 @@ class LocalRewardModelScorer:
             logger.warning("RM scorer NOT using chat template - may cause distribution mismatch")
 
     def _extract_prompt_and_completion(self, rollout: Rollout) -> tuple[str, str]:
-        """Extract prompt (user message) and completion (assistant response) from rollout."""
-        # In a typical single-turn QA rollout:
-        # - step.prev_obs is the user's question/prompt
-        # - step.action is the assistant's response
+        """Extract prompt (user message) and completion (assistant response) from rollout.
+
+        WARNING: This assumes single-turn format. All observations are concatenated
+        into a single "user" message, and all actions into a single "assistant" message.
+
+        If the RM was trained on multi-turn conversations (e.g., [user, assistant, user, assistant]),
+        this flattening will cause format mismatch and degrade scoring accuracy.
+
+        To support multi-turn:
+        1. Preserve turn structure: iterate steps and create alternating user/assistant messages
+        2. Or configure the RM training to also use flattened single-turn format
+        """
         prompt_parts = []
         completion_parts = []
 
@@ -178,7 +186,11 @@ class LocalRewardModelScorer:
         return prompt, completion
 
     def _tokenize_with_chat_template(self, prompt: str, completion: str) -> List[int]:
-        """Tokenize using chat template format."""
+        """Tokenize using chat template format.
+
+        Note: Creates a single-turn structure: [system?, user, assistant].
+        See _extract_prompt_and_completion() for multi-turn considerations.
+        """
         messages: List[Dict[str, str]] = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})

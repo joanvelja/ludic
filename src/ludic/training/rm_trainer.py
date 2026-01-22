@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
@@ -37,6 +37,10 @@ from ludic.distributed.interfaces import PolicyPublisher
 from ludic.eval.evaluator import Evaluator
 
 logger = logging.getLogger(__name__)
+
+# Patterns for detecting reward head parameters in model architectures.
+# Used consistently for LoRA modules_to_save and differential LR grouping.
+REWARD_HEAD_PATTERNS = ["score", "classifier", "lm_head", "reward_head", "v_head"]
 
 
 @dataclass
@@ -195,23 +199,16 @@ class RMTrainer(Trainer):
             )
 
         # Auto-detect reward head name for modules_to_save
-        head_names = ["score", "classifier", "lm_head", "reward_head"]
         modules_to_save = []
-        for name in head_names:
+        for name in REWARD_HEAD_PATTERNS:
             if hasattr(model, name):
                 modules_to_save.append(name)
                 break
 
         # If lora_config doesn't have modules_to_save, add the detected head
         if modules_to_save and not getattr(lora_config, "modules_to_save", None):
-            # Create a new config with modules_to_save
-            lora_config = LoraConfig(
-                r=lora_config.r,
-                lora_alpha=lora_config.lora_alpha,
-                lora_dropout=getattr(lora_config, "lora_dropout", 0.0),
-                target_modules=lora_config.target_modules,
-                modules_to_save=modules_to_save,
-            )
+            # Copy config with modules_to_save, preserving all other attributes
+            lora_config = replace(lora_config, modules_to_save=modules_to_save)
             logger.info(f"Auto-detected reward head: {modules_to_save}")
 
         peft_model = get_peft_model(model, lora_config)
@@ -256,12 +253,11 @@ class RMTrainer(Trainer):
         # Differential LR: separate backbone and head parameters
         backbone_params = []
         head_params = []
-        head_keywords = ["score", "classifier", "head", "lm_head"]
 
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            if any(keyword in name.lower() for keyword in head_keywords):
+            if any(keyword in name.lower() for keyword in REWARD_HEAD_PATTERNS):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
@@ -316,7 +312,17 @@ class RMTrainer(Trainer):
 
         # ---- 1) Fetch Macro-Batch ---------------------------------------
         self.model.train()
-        saw_batch = await self._batch_source.next_batch()
+        batch_fetch_timeout = 60.0
+        try:
+            saw_batch = await asyncio.wait_for(
+                self._batch_source.next_batch(),
+                timeout=batch_fetch_timeout,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Batch fetch timed out after {batch_fetch_timeout}s. "
+                "Check batch_source connectivity and throughput."
+            ) from None
 
         # Algorithm-specific preprocessing
         if self.algo.preprocess is not None:

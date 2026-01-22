@@ -36,7 +36,8 @@ Train a reward model on preference data:
 ```bash
 uv run python examples/reward_model/train_rm_bradley_terry.py \
   --model Qwen/Qwen2.5-0.5B \
-  --dataset data/preferences.jsonl \
+  --hf-dataset stanfordnlp/SHP \
+  --hf-split train \
   --steps 100 \
   --batch-size 8
 ```

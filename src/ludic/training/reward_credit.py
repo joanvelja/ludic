@@ -139,7 +139,7 @@ class RewardModelCreditAssigner:
             Dict mapping (rollout_id, step_index) to scalar weight.
 
         Raises:
-            ValueError: If mode is unknown.
+            ValueError: If rm_score is missing from rollout.meta, or if mode is unknown.
         """
         out: Dict[RolloutStepKey, float] = {}
 
@@ -157,11 +157,10 @@ class RewardModelCreditAssigner:
         for rollout in rollouts:
             rm_score = rollout.meta.get(self.rm_score_key)
             if rm_score is None:
-                logger.warning(
-                    f"Rollout {rollout.id} missing '{self.rm_score_key}' in meta, using 0.0. "
-                    f"Did you forget to run RewardModelScorer?"
+                raise ValueError(
+                    f"Rollout {rollout.id} missing '{self.rm_score_key}' in meta. "
+                    f"Run RewardModelScorer before credit assignment."
                 )
-                rm_score = 0.0
 
             for step in rollout.steps:
                 key: RolloutStepKey = (rollout.id, step.index)
