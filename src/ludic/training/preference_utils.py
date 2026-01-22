@@ -19,6 +19,7 @@ import textwrap
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, runtime_checkable
 from uuid import uuid4
 
+from ludic.training.chat_template_utils import tokenize_with_chat_template
 from ludic.training.types import SAWItem
 
 logger = logging.getLogger(__name__)
@@ -161,76 +162,54 @@ def _make_item_with_chat_template(
 
     The action_mask covers only the assistant's response content, not the
     chat template tokens (e.g., <|im_start|>assistant).
+
+    Uses the shared tokenize_with_chat_template() helper for consistent
+    boundary detection and truncation handling across the codebase.
     """
-    # Build messages for the prompt (user turn only)
-    prompt_messages: List[Dict[str, str]] = []
-    if system_prompt:
-        prompt_messages.append({"role": "system", "content": system_prompt})
-    prompt_messages.append({"role": "user", "content": prompt})
+    try:
+        result = tokenize_with_chat_template(
+            tokenizer,
+            prompt=prompt,
+            completion=completion,
+            system_prompt=system_prompt,
+            max_length=max_length,
+        )
+    except ValueError as e:
+        # Re-raise with role context for better error messages
+        raise ValueError(f"{e} (role={role})") from e
 
-    # Tokenize prompt with generation prompt to get boundary
-    # This gives us: <template>user_content</template><assistant_start>
-    prompt_tokens = tokenizer.apply_chat_template(
-        prompt_messages,
-        add_generation_prompt=True,
-        tokenize=True,
-    )
-    prompt_len = len(prompt_tokens)
-
-    # Build full conversation with assistant response
-    full_messages = prompt_messages + [{"role": "assistant", "content": completion}]
-
-    # Tokenize full conversation
-    tokens = tokenizer.apply_chat_template(
-        full_messages,
-        add_generation_prompt=False,
-        tokenize=True,
-    )
+    tokens = result.tokens
+    prompt_len = result.prompt_len
     seq_len = len(tokens)
-
-    # Action tokens = everything after the prompt (assistant content + EOS)
     completion_len = seq_len - prompt_len
 
-    # Validate we have completion tokens
-    if completion_len <= 0:
-        raise ValueError(
-            f"Chat template produced no completion tokens for {role} response. "
-            f"prompt_len={prompt_len}, seq_len={seq_len}. "
-            f"Check that the completion is not empty."
-        )
-
-    # Apply max_length truncation if needed
-    if max_length is not None and seq_len > max_length:
-        if prompt_len >= max_length:
-            raise ValueError(
-                f"Prompt with chat template exceeds max_length for {role} response. "
-                f"prompt_len={prompt_len}, max_length={max_length}. "
-                f"Increase max_length or use shorter prompts."
-            )
-        # Truncate from the end (loses completion tokens)
-        tokens = tokens[:max_length]
-        seq_len = max_length
-        completion_len = seq_len - prompt_len
-
-        if completion_len <= 0:
-            raise ValueError(
-                f"Truncation eliminated all completion tokens for {role} response. "
-                f"prompt_len={prompt_len}, max_length={max_length}. "
-                f"Increase max_length or use shorter prompts."
-            )
-
     action_mask = [0] * prompt_len + [1] * completion_len
+
+    # Build metadata with preference info
+    meta: Dict[str, Any] = {
+        "pair_id": pair_id,
+        "role": role,
+        "label": label,
+    }
+
+    # Add truncation info if truncation occurred (per CONSIDERATIONS.md semantics)
+    if result.truncation_meta is not None:
+        truncation_meta = dict(result.truncation_meta)
+        truncation_meta.setdefault("prompt_truncated", False)
+        meta["truncation"] = truncation_meta
+        meta["truncated"] = True
+        meta["truncation_reason"] = "max_length"
+        meta["seq_len_truncated"] = True
+        meta["seq_len_original"] = truncation_meta["original_len"]
+        meta["seq_len_retained"] = seq_len
+        meta["seq_len_retained_frac"] = float(seq_len) / float(truncation_meta["original_len"])
 
     return SAWItem(
         input_ids=tokens,
         attention_mask=[1] * seq_len,
         action_mask=action_mask,
         weight=1.0,
-        meta={
-            "pair_id": pair_id,
-            "role": role,
-            "label": label,
-        },
+        meta=meta,
     )
 
 
@@ -282,9 +261,19 @@ def _make_item_raw(
             f"max_length={max_length}."
         )
 
+    # Track original lengths after any special-token stripping
+    original_prompt_len = prompt_len
+    original_completion_len = completion_len
+
     # Concatenate tokens
     tokens = prompt_tokens + completion_tokens
     seq_len = len(tokens)
+    original_seq_len = seq_len
+
+    # Track truncation for downstream filtering/logging (per CONSIDERATIONS.md)
+    truncation_meta: Optional[Dict[str, Any]] = None
+    prompt_truncated = False
+    completion_truncated = False
 
     # Apply max_length truncation if specified.
     # Prefer preserving completion tokens by truncating the prompt from the left.
@@ -301,6 +290,16 @@ def _make_item_raw(
         tokens = prompt_tokens + completion_tokens
         seq_len = len(tokens)
 
+        # Record truncation metadata
+        prompt_truncated = prompt_len < original_prompt_len
+        completion_truncated = completion_len < original_completion_len
+        truncation_meta = {
+            "original_len": original_seq_len,
+            "truncated_len": original_seq_len - seq_len,
+            "prompt_truncated": prompt_truncated,
+            "completion_truncated": completion_truncated,
+        }
+
     # Recalculate effective lengths after truncation
     effective_prompt_len = min(prompt_len, seq_len)
     num_completion_tokens = seq_len - effective_prompt_len
@@ -316,16 +315,29 @@ def _make_item_raw(
 
     action_mask = [0] * effective_prompt_len + [1] * num_completion_tokens
 
+    # Build metadata with preference info
+    meta: Dict[str, Any] = {
+        "pair_id": pair_id,
+        "role": role,
+        "label": label,
+    }
+
+    # Add truncation info if truncation occurred
+    if truncation_meta is not None:
+        meta["truncation"] = truncation_meta
+        meta["truncated"] = True
+        meta["truncation_reason"] = "max_length"
+        meta["seq_len_truncated"] = True
+        meta["seq_len_original"] = truncation_meta["original_len"]
+        meta["seq_len_retained"] = seq_len
+        meta["seq_len_retained_frac"] = float(seq_len) / float(truncation_meta["original_len"])
+
     return SAWItem(
         input_ids=tokens,
         attention_mask=[1] * seq_len,
         action_mask=action_mask,
         weight=1.0,
-        meta={
-            "pair_id": pair_id,
-            "role": role,
-            "label": label,
-        },
+        meta=meta,
     )
 
 

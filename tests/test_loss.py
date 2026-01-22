@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import pytest
 import torch
@@ -27,7 +27,13 @@ class MockLoss(Loss):
     loss_val: float
     stats: Dict[str, Any]
 
-    def compute(self, logits: Tensor, batch: Batch) -> Tuple[Tensor, Dict[str, Any]]:
+    def compute(
+        self,
+        logits: Tensor,
+        batch: Batch,
+        *,
+        shared: Optional[object] = None,
+    ) -> Tuple[Tensor, Dict[str, Any]]:
         return torch.tensor(self.loss_val, dtype=torch.float32), self.stats
 
 

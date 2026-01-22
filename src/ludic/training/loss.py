@@ -1196,6 +1196,42 @@ class CompositeLoss:
 # ---------------------------------------------------------------------------
 
 
+def _bradley_terry_loss_core(
+    chosen_scores: Tensor,
+    rejected_scores: Tensor,
+    labels: Tensor,
+    beta: float,
+) -> Tuple[Tensor, Tensor]:
+    """Core Bradley-Terry loss computation (compilable).
+
+    This is the pure tensor math portion of Bradley-Terry loss, extracted
+    to enable torch.compile. The control flow and grouping logic remain
+    in the main compute() method.
+
+    Args:
+        chosen_scores: [N] scores for chosen items
+        rejected_scores: [N] scores for rejected items
+        labels: [N] preference labels (1.0 = chosen preferred)
+        beta: Temperature scaling
+
+    Returns:
+        (per_pair_loss, logit_diff) where both are [N] tensors
+    """
+    logit_diff = beta * (chosen_scores - rejected_scores)
+    per_pair_loss = -(
+        labels * F.logsigmoid(logit_diff)
+        + (1 - labels) * F.logsigmoid(-logit_diff)
+    )
+    return per_pair_loss, logit_diff
+
+
+# Compiled version for when compile=True
+# Note: dynamic=True is critical for varying batch sizes
+_bradley_terry_loss_core_compiled = torch.compile(
+    _bradley_terry_loss_core, dynamic=True
+)
+
+
 @dataclass
 class BradleyTerryLoss:
     """Bradley-Terry preference loss over paired SAWItems.
@@ -1231,6 +1267,8 @@ class BradleyTerryLoss:
         label_smoothing: Label smoothing factor (0.0 to 1.0). Smooths labels
             toward 0.5: smoothed_label = label * (1 - smooth) + 0.5 * smooth.
             Default 0.0 (no smoothing).
+        compile: If True, use torch.compile for the core loss computation.
+            Can provide 10-30% speedup. Default None (auto-detects CUDA availability).
     """
 
     beta: float = 1.0
@@ -1238,6 +1276,7 @@ class BradleyTerryLoss:
     regularization_lambda: float = 0.0
     regularization_type: str = "l2"  # Literal["l2", "l1"]
     label_smoothing: float = 0.0
+    compile: Optional[bool] = None  # None = auto (True if CUDA available)
 
     def __post_init__(self) -> None:
         if self.score_type not in ("reward", "logprob"):
@@ -1258,6 +1297,9 @@ class BradleyTerryLoss:
             raise ValueError(
                 f"label_smoothing must be between 0.0 and 1.0, got {self.label_smoothing}"
             )
+        # Auto-detect compile setting: default to True on CUDA
+        if self.compile is None:
+            object.__setattr__(self, "compile", torch.cuda.is_available())
 
     @jaxtyped(typechecker=typechecker)
     def compute(
@@ -1302,45 +1344,85 @@ class BradleyTerryLoss:
         labels_list: List[float] = meta["label"]
 
         # 3. Group by pair_id and separate chosen/rejected
-        pair_map: Dict[str, Dict[str, int]] = {}
-        for i, (pid, role) in enumerate(zip(pair_ids, roles)):
-            if pid not in pair_map:
-                pair_map[pid] = {}
-            if role in pair_map[pid]:
-                logger.warning(
-                    f"BradleyTerryLoss: Duplicate role '{role}' for pair_id '{pid}'. "
-                    f"Index {pair_map[pid][role]} will be overwritten by index {i}."
-                )
-            pair_map[pid][role] = i
+        B = scores.shape[0]
+        if len(pair_ids) != B or len(roles) != B or len(labels_list) != B:
+            raise ValueError(
+                "BradleyTerryLoss: meta lengths must match batch size. "
+                f"len(pair_id)={len(pair_ids)}, len(role)={len(roles)}, "
+                f"len(label)={len(labels_list)}, batch={B}."
+            )
 
-        chosen_scores_list: List[Tensor] = []
-        rejected_scores_list: List[Tensor] = []
-        labels_tensor_list: List[float] = []
+        # Fast path for interleaved batches: [chosen_0, rejected_0, chosen_1, ...]
+        def _is_interleaved() -> bool:
+            if B < 2 or B % 2 != 0:
+                return False
+            return all(
+                roles[i] == "chosen"
+                and roles[i + 1] == "rejected"
+                and pair_ids[i] == pair_ids[i + 1]
+                and labels_list[i] == labels_list[i + 1]
+                for i in range(0, B - 1, 2)
+            )
 
-        for pid, indices in pair_map.items():
-            if "chosen" in indices and "rejected" in indices:
-                chosen_scores_list.append(scores[indices["chosen"]])
-                rejected_scores_list.append(scores[indices["rejected"]])
-                labels_tensor_list.append(labels_list[indices["chosen"]])
+        if _is_interleaved():
+            # O(1) indexing for interleaved layout
+            chosen_idx = torch.arange(0, B, 2, device=scores.device)
+            rejected_idx = torch.arange(1, B, 2, device=scores.device)
+            chosen_scores = scores[chosen_idx]
+            rejected_scores = scores[rejected_idx]
+            labels = torch.tensor(
+                [labels_list[i] for i in range(0, B, 2)],
+                device=scores.device,
+                dtype=scores.dtype,
+            )
+        else:
+            # Fallback: dict-based grouping for non-interleaved batches
+            pair_map: Dict[str, Dict[str, int]] = {}
+            pair_labels: Dict[str, float] = {}
+            for i, (pid, role) in enumerate(zip(pair_ids, roles)):
+                if pid not in pair_map:
+                    pair_map[pid] = {}
+                    pair_labels[pid] = labels_list[i]
+                elif labels_list[i] != pair_labels[pid]:
+                    raise ValueError(
+                        "BradleyTerryLoss: inconsistent labels for pair_id "
+                        f"'{pid}': {pair_labels[pid]} vs {labels_list[i]}."
+                    )
+                if role in pair_map[pid]:
+                    logger.warning(
+                        f"BradleyTerryLoss: Duplicate role '{role}' for pair_id '{pid}'. "
+                        f"Index {pair_map[pid][role]} will be overwritten by index {i}."
+                    )
+                pair_map[pid][role] = i
 
-        if not chosen_scores_list:
-            # No complete pairs found - return zero loss with grad
-            zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
-            zero.requires_grad_(True)
-            return zero, {
-                "loss": zero.detach(),
-                "num_pairs": torch.zeros((), device=logits.device),
-                "accuracy": torch.zeros((), device=logits.device),
-                "chosen_score": torch.zeros((), device=logits.device),
-                "rejected_score": torch.zeros((), device=logits.device),
-                "margin": torch.zeros((), device=logits.device),
-            }
+            chosen_scores_list: List[Tensor] = []
+            rejected_scores_list: List[Tensor] = []
+            labels_tensor_list: List[float] = []
 
-        chosen_scores = torch.stack(chosen_scores_list)
-        rejected_scores = torch.stack(rejected_scores_list)
-        labels = torch.tensor(
-            labels_tensor_list, device=scores.device, dtype=scores.dtype
-        )
+            for pid, indices in pair_map.items():
+                if "chosen" in indices and "rejected" in indices:
+                    chosen_scores_list.append(scores[indices["chosen"]])
+                    rejected_scores_list.append(scores[indices["rejected"]])
+                    labels_tensor_list.append(pair_labels[pid])
+
+            if not chosen_scores_list:
+                # No complete pairs found - return zero loss with grad
+                zero = torch.zeros((), device=logits.device, dtype=logits.dtype)
+                zero.requires_grad_(True)
+                return zero, {
+                    "loss": zero.detach(),
+                    "num_pairs": torch.zeros((), device=logits.device),
+                    "accuracy": torch.zeros((), device=logits.device),
+                    "chosen_score": torch.zeros((), device=logits.device),
+                    "rejected_score": torch.zeros((), device=logits.device),
+                    "margin": torch.zeros((), device=logits.device),
+                }
+
+            chosen_scores = torch.stack(chosen_scores_list)
+            rejected_scores = torch.stack(rejected_scores_list)
+            labels = torch.tensor(
+                labels_tensor_list, device=scores.device, dtype=scores.dtype
+            )
 
         # Apply label smoothing: smooth labels toward 0.5
         # smoothed_label = label * (1 - smooth) + 0.5 * smooth
@@ -1355,12 +1437,16 @@ class BradleyTerryLoss:
                 reg = self.regularization_lambda * torch.norm(chosen_scores - rejected_scores, p=1)
 
         # 4. Bradley-Terry loss with soft labels
-        # Loss = -E[label * log(sigma(beta * (s_c - s_r))) + (1-label) * log(sigma(beta * (s_r - s_c)))]
-        logit_diff = self.beta * (chosen_scores - rejected_scores)
-        loss = -((
-            labels * F.logsigmoid(logit_diff)
-            + (1 - labels) * F.logsigmoid(-logit_diff) 
-        ) + reg).mean()
+        # Use compiled version if enabled (can provide 10-30% speedup)
+        core_fn = (
+            _bradley_terry_loss_core_compiled
+            if self.compile
+            else _bradley_terry_loss_core
+        )
+        per_pair_loss, logit_diff = core_fn(
+            chosen_scores, rejected_scores, labels, self.beta
+        )
+        loss = per_pair_loss.mean() + reg
 
         # 5. Stats
         with torch.no_grad():
@@ -1377,7 +1463,7 @@ class BradleyTerryLoss:
                 "rejected_score": rejected_scores.mean().detach(),
                 "margin": logit_diff.mean().detach(),
                 "num_pairs": torch.tensor(
-                    float(len(chosen_scores_list)), device=logits.device
+                    float(chosen_scores.shape[0]), device=logits.device
                 ),
             }
 
