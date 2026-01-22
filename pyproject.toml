@@ -27,6 +27,7 @@ dependencies = [
     "torch-c-dlpack-ext>=0.1.4",
     "vllm>=0.12.0; sys_platform == 'linux'",
     "wandb>=0.23.1",
+    "pynvml>=13.0.1",
 ]
 
 [project.optional-dependencies]

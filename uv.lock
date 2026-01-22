@@ -1011,6 +1011,7 @@ dependencies = [
     { name = "jaxtyping" },
     { name = "openai" },
     { name = "peft" },
+    { name = "pynvml" },
     { name = "rich" },
     { name = "setuptools" },
     { name = "torch", version = "2.9.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
@@ -1055,6 +1056,7 @@ requires-dist = [
     { name = "jaxtyping", specifier = ">=0.3.4" },
     { name = "openai", specifier = ">=2.7.1" },
     { name = "peft", specifier = ">=0.18.0" },
+    { name = "pynvml", specifier = ">=13.0.1" },
     { name = "rich", specifier = ">=14.2.0" },
     { name = "setuptools", specifier = ">=79.0.1" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.9.0", index = "https://download.pytorch.org/whl/cpu" },
@@ -1926,6 +1928,18 @@ wheels = [
 [package.optional-dependencies]
 crypto = [
     { name = "cryptography", marker = "sys_platform == 'linux'" },
+]
+
+[[package]]
+name = "pynvml"
+version = "13.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-ml-py" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5c/57/da7dc63a79f59e082e26a66ac02d87d69ea316b35b35b7a00d82f3ce3d2f/pynvml-13.0.1.tar.gz", hash = "sha256:1245991d9db786b4d2f277ce66869bd58f38ac654e38c9397d18f243c8f6e48f", size = 35226, upload-time = "2025-09-05T20:33:25.377Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/4a/cac76c174bb439a0c46c9a4413fcbea5c6cabfb01879f7bbdb9fdfaed76c/pynvml-13.0.1-py3-none-any.whl", hash = "sha256:e2b20e0a501eeec951e2455b7ab444759cf048e0e13a57b08049fa2775266aa8", size = 28810, upload-time = "2025-09-05T20:33:24.13Z" },
 ]
 
 [[package]]
