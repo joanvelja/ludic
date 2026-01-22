@@ -938,6 +938,7 @@ def make_bradley_terry(
     lambda_regularization: float = 0.0,
     regularization_type: str = "l2",
     label_smoothing: float = 0.0,
+    score_regularization_lambda: float = 0.0,
 ) -> RLAlgorithm:
     """Create Bradley-Terry preference learning algorithm.
 
@@ -971,10 +972,16 @@ def make_bradley_terry(
             - "reward": Use model's scalar output (for reward models)
             - "logprob": Sum of log probs over action tokens (for DPO-style)
         name: Algorithm name for logging/metrics.
-        lambda_regularization: Regularization strength for score magnitude.
+        lambda_regularization: Regularization strength for margin (chosen - rejected).
+            Penalizes large gaps between scores. Default 0.0.
         regularization_type: Type of regularization ("l2" or "l1").
         label_smoothing: Label smoothing factor (0.0 to 1.0). Smooths labels
             toward 0.5 to reduce overconfidence. Default 0.0 (no smoothing).
+        score_regularization_lambda: L2 regularization on individual reward scores.
+            Unlike lambda_regularization which penalizes the margin, this bounds
+            the absolute magnitude of rewards (r_chosen² + r_rejected²).
+            Prevents unbounded score growth in Bradley-Terry optimization.
+            Default 0.0 (no score regularization).
 
     Returns:
         RLAlgorithm configured for Bradley-Terry preference learning.
@@ -994,6 +1001,12 @@ def make_bradley_terry(
         # DPO-style policy training
         algorithm = make_bradley_terry(score_type="logprob", beta=0.1)
         trainer = Trainer(model=policy_model, algorithm=algorithm, ...)
+
+        # With score regularization to bound reward magnitudes
+        algorithm = make_bradley_terry(
+            score_type="reward",
+            score_regularization_lambda=0.01,
+        )
         ```
 
     References:
@@ -1008,6 +1021,7 @@ def make_bradley_terry(
         regularization_lambda=lambda_regularization,
         regularization_type=regularization_type,
         label_smoothing=label_smoothing,
+        score_regularization_lambda=score_regularization_lambda,
     )
 
     return RLAlgorithm(

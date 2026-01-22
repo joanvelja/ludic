@@ -1277,6 +1277,7 @@ class BradleyTerryLoss:
     regularization_type: str = "l2"  # Literal["l2", "l1"]
     label_smoothing: float = 0.0
     compile: Optional[bool] = None  # None = auto (True if CUDA available)
+    score_regularization_lambda: float = 0.0  # L2 penalty on individual scores
 
     def __post_init__(self) -> None:
         if self.score_type not in ("reward", "logprob"):
@@ -1296,6 +1297,10 @@ class BradleyTerryLoss:
         if not (0.0 <= self.label_smoothing <= 1.0):
             raise ValueError(
                 f"label_smoothing must be between 0.0 and 1.0, got {self.label_smoothing}"
+            )
+        if self.score_regularization_lambda < 0:
+            raise ValueError(
+                f"score_regularization_lambda must be non-negative, got {self.score_regularization_lambda}"
             )
         # Auto-detect compile setting: default to True on CUDA
         if self.compile is None:
@@ -1448,6 +1453,16 @@ class BradleyTerryLoss:
         )
         loss = per_pair_loss.mean() + reg
 
+        # 4b. Score regularization: L2 penalty on individual scores (prevents margin explosion)
+        # This bounds the absolute magnitude of rewards, unlike margin regularization
+        # which only penalizes the gap between chosen and rejected.
+        score_reg_term = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        if self.score_regularization_lambda > 0:
+            score_reg_term = self.score_regularization_lambda * (
+                chosen_scores.pow(2).mean() + rejected_scores.pow(2).mean()
+            )
+            loss = loss + score_reg_term
+
         # 5. Stats
         with torch.no_grad():
             # Accuracy: prediction matches label direction
@@ -1466,6 +1481,9 @@ class BradleyTerryLoss:
                     float(chosen_scores.shape[0]), device=logits.device
                 ),
             }
+            # Add score regularization term if active
+            if self.score_regularization_lambda > 0:
+                stats["score_reg"] = score_reg_term.detach()
 
         return loss, stats
 

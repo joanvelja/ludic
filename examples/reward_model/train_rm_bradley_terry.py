@@ -44,12 +44,151 @@ import csv
 import json
 import logging
 import random
+import threading
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
+
+
+class GPUStatsCollector:
+    """Collect GPU utilization stats during training.
+
+    Runs a background thread that samples GPU utilization and memory usage
+    at regular intervals. Provides averaged stats for each training step.
+    """
+
+    def __init__(self, sample_interval_ms: int = 100):
+        """Initialize the GPU stats collector.
+
+        Args:
+            sample_interval_ms: How often to sample GPU stats (in milliseconds).
+        """
+        self.sample_interval = sample_interval_ms / 1000.0
+        self._samples: List[Dict[str, float]] = []
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+        # Check if pynvml is available for detailed GPU stats
+        self._use_pynvml = False
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._pynvml = pynvml
+            self._use_pynvml = True
+            self._device_count = pynvml.nvmlDeviceGetCount()
+            self._handles = [
+                pynvml.nvmlDeviceGetHandleByIndex(i)
+                for i in range(self._device_count)
+            ]
+        except (ImportError, Exception):
+            pass
+
+    def _sample_stats(self) -> Dict[str, float]:
+        """Sample current GPU stats."""
+        stats = {}
+
+        if torch.cuda.is_available():
+            # Basic PyTorch CUDA stats
+            device_idx = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(device_idx) / (1024**3)
+            reserved = torch.cuda.memory_reserved(device_idx) / (1024**3)
+            stats["gpu_memory_allocated_gb"] = allocated
+            stats["gpu_memory_reserved_gb"] = reserved
+
+            if self._use_pynvml and device_idx < len(self._handles):
+                try:
+                    handle = self._handles[device_idx]
+                    # GPU utilization (compute)
+                    util = self._pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    stats["gpu_utilization_pct"] = util.gpu
+                    stats["gpu_memory_util_pct"] = util.memory
+
+                    # Memory info
+                    mem_info = self._pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    stats["gpu_memory_total_gb"] = mem_info.total / (1024**3)
+                    stats["gpu_memory_used_gb"] = mem_info.used / (1024**3)
+                    stats["gpu_memory_free_gb"] = mem_info.free / (1024**3)
+
+                    # Power usage
+                    try:
+                        power = self._pynvml.nvmlDeviceGetPowerUsage(handle)
+                        stats["gpu_power_w"] = power / 1000.0  # mW to W
+                    except Exception:
+                        pass
+
+                    # Temperature
+                    try:
+                        temp = self._pynvml.nvmlDeviceGetTemperature(
+                            handle, self._pynvml.NVML_TEMPERATURE_GPU
+                        )
+                        stats["gpu_temp_c"] = temp
+                    except Exception:
+                        pass
+
+                except Exception:
+                    pass
+
+        return stats
+
+    def _collection_loop(self):
+        """Background thread that collects GPU stats."""
+        while self._running:
+            stats = self._sample_stats()
+            with self._lock:
+                self._samples.append(stats)
+            time.sleep(self.sample_interval)
+
+    def start(self):
+        """Start collecting GPU stats in the background."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._collection_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop collecting GPU stats."""
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def get_step_stats(self) -> Dict[str, float]:
+        """Get averaged stats for the current step and reset samples.
+
+        Returns:
+            Dict with averaged GPU stats since last call.
+        """
+        with self._lock:
+            samples = self._samples
+            self._samples = []
+
+        if not samples:
+            return {}
+
+        # Average all numeric stats
+        result = {}
+        keys = samples[0].keys()
+        for key in keys:
+            values = [s[key] for s in samples if key in s]
+            if values:
+                result[f"avg_{key}"] = sum(values) / len(values)
+                result[f"max_{key}"] = max(values)
+
+        result["gpu_samples_count"] = len(samples)
+        return result
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
 from torch import nn
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
@@ -112,6 +251,12 @@ def log_distribution_samples(
             return list(item.input_ids)
         return [tok for tok, mask in zip(item.input_ids, item.action_mask) if mask]
 
+    def extract_prompt_ids(item: SAWItem) -> List[int]:
+        """Return prompt (non-action) token IDs from a SAWItem."""
+        if not item.action_mask or len(item.action_mask) != len(item.input_ids):
+            return []
+        return [tok for tok, mask in zip(item.input_ids, item.action_mask) if not mask]
+
     # Sample preference pairs
     pair_indices = rng.sample(range(len(pref_data)), min(n_samples, len(pref_data)))
 
@@ -165,20 +310,52 @@ def log_distribution_samples(
         }
 
         if saw_chosen is not None:
+            # Full sequence (prompt + completion) to verify chat template
+            full_ids = list(saw_chosen.input_ids)
+            full_decoded = tokenizer.decode(full_ids, skip_special_tokens=False)
+            prompt_ids = extract_prompt_ids(saw_chosen)
+            prompt_decoded = tokenizer.decode(prompt_ids, skip_special_tokens=False)
             chosen_ids = extract_action_ids(saw_chosen)
             chosen_decoded = tokenizer.decode(chosen_ids, skip_special_tokens=False)
-            sample_entry["chosen_token_ids"] = chosen_ids[:50]  # First 50 tokens
+
+            # Check for chat template markers (Qwen-style)
+            has_chat_template = "<|im_start|>" in full_decoded or "<|user|>" in full_decoded
+
+            sample_entry["chosen_full_len"] = len(full_ids)
+            sample_entry["chosen_prompt_len"] = len(prompt_ids)
             sample_entry["chosen_token_len"] = len(chosen_ids)
-            sample_entry["chosen_decoded_preview"] = chosen_decoded[:300]
-            logger.info(f"CHOSEN TOKENS ({len(chosen_ids)} tokens): {chosen_ids[:30]}...")
+            sample_entry["chosen_has_chat_template"] = has_chat_template
+            sample_entry["chosen_full_decoded"] = full_decoded  # Full text for JSON
+            sample_entry["chosen_prompt_decoded"] = prompt_decoded
+            sample_entry["chosen_action_decoded"] = chosen_decoded
+
+            logger.info(f"CHOSEN FULL SEQ ({len(full_ids)} tokens, chat_template={has_chat_template}):")
+            logger.info(f"  PROMPT PART ({len(prompt_ids)} tokens): {prompt_decoded[:400]}{'...' if len(prompt_decoded) > 400 else ''}")
+            logger.info(f"  ACTION PART ({len(chosen_ids)} tokens): {chosen_decoded}")
 
         if saw_rejected is not None:
+            # Full sequence (prompt + completion) to verify chat template
+            full_ids = list(saw_rejected.input_ids)
+            full_decoded = tokenizer.decode(full_ids, skip_special_tokens=False)
+            prompt_ids = extract_prompt_ids(saw_rejected)
+            prompt_decoded = tokenizer.decode(prompt_ids, skip_special_tokens=False)
             rejected_ids = extract_action_ids(saw_rejected)
             rejected_decoded = tokenizer.decode(rejected_ids, skip_special_tokens=False)
-            sample_entry["rejected_token_ids"] = rejected_ids[:50]
+
+            # Check for chat template markers
+            has_chat_template = "<|im_start|>" in full_decoded or "<|user|>" in full_decoded
+
+            sample_entry["rejected_full_len"] = len(full_ids)
+            sample_entry["rejected_prompt_len"] = len(prompt_ids)
             sample_entry["rejected_token_len"] = len(rejected_ids)
-            sample_entry["rejected_decoded_preview"] = rejected_decoded[:300]
-            logger.info(f"REJECTED TOKENS ({len(rejected_ids)} tokens): {rejected_ids[:30]}...")
+            sample_entry["rejected_has_chat_template"] = has_chat_template
+            sample_entry["rejected_full_decoded"] = full_decoded  # Full text for JSON
+            sample_entry["rejected_prompt_decoded"] = prompt_decoded
+            sample_entry["rejected_action_decoded"] = rejected_decoded
+
+            logger.info(f"REJECTED FULL SEQ ({len(full_ids)} tokens, chat_template={has_chat_template}):")
+            logger.info(f"  PROMPT PART ({len(prompt_ids)} tokens): {prompt_decoded[:400]}{'...' if len(prompt_decoded) > 400 else ''}")
+            logger.info(f"  ACTION PART ({len(rejected_ids)} tokens): {rejected_decoded}")
 
         samples_data["samples"].append(sample_entry)
 
@@ -206,6 +383,10 @@ def load_hf_preferences(
     split: str = "train",
     limit: Optional[int] = None,
     min_response_length: int = 10,
+    diagnostic_mode: Optional[str] = None,
+    diagnostic_length_threshold: int = 50,
+    diagnostic_shuffle_rate: float = 0.5,
+    diagnostic_seed: int = 42,
 ) -> List[Dict[str, Any]]:
     """Load preference data from HuggingFace datasets.
 
@@ -218,6 +399,14 @@ def load_hf_preferences(
         min_response_length: Minimum character length for responses.
             Samples where either chosen or rejected is shorter than this
             are filtered out (handles garbage data like single-char responses).
+        diagnostic_mode: Diagnostic mode for pipeline integrity testing:
+            - "label_shuffle": Randomly flip labels (expect ~50% accuracy)
+            - "prompt_only": Replace responses with empty (expect ~50% accuracy)
+            - "random_negatives": Replace rejected with cross-prompt response
+            - "length_matched": Filter to pairs with similar length responses
+        diagnostic_length_threshold: Max |len(chosen)-len(rejected)| for length_matched
+        diagnostic_shuffle_rate: Fraction of labels to shuffle in label_shuffle mode
+        diagnostic_seed: Random seed for diagnostic transformations
     """
     try:
         from datasets import load_dataset
@@ -278,6 +467,61 @@ def load_hf_preferences(
             f"{min_response_length} characters"
         )
 
+    # Apply diagnostic mode transformations AFTER loading data
+    if diagnostic_mode == "label_shuffle":
+        rng = random.Random(diagnostic_seed)
+        shuffled = 0
+        for row in data:
+            if rng.random() < diagnostic_shuffle_rate:
+                row["chosen"], row["rejected"] = row["rejected"], row["chosen"]
+                shuffled += 1
+        logger.info(
+            f"DIAGNOSTIC label_shuffle: flipped {shuffled}/{len(data)} labels "
+            f"({100*shuffled/len(data):.1f}%)"
+        )
+
+    elif diagnostic_mode == "prompt_only":
+        # Use minimal placeholder that survives tokenization
+        # Single space gets filtered out, so use "[empty]" which tokenizes to real tokens
+        placeholder = "[empty]"
+        for row in data:
+            row["chosen"] = placeholder
+            row["rejected"] = placeholder
+        logger.info(
+            f"DIAGNOSTIC prompt_only: all {len(data)} completions replaced with '{placeholder}'"
+        )
+
+    elif diagnostic_mode == "random_negatives":
+        rng = random.Random(diagnostic_seed)
+        all_responses = [r["chosen"] for r in data] + [r["rejected"] for r in data]
+        replaced = 0
+        for i, row in enumerate(data):
+            # Pick a response from a different pair
+            attempts = 0
+            while attempts < 100:
+                random_idx = rng.randint(0, len(all_responses) - 1)
+                # Different pair: random_idx // 2 != i (each pair contributes 2 responses)
+                if random_idx // 2 != i:
+                    row["rejected"] = all_responses[random_idx]
+                    replaced += 1
+                    break
+                attempts += 1
+        logger.info(
+            f"DIAGNOSTIC random_negatives: replaced {replaced}/{len(data)} rejected "
+            f"responses with cross-prompt responses"
+        )
+
+    elif diagnostic_mode == "length_matched":
+        original_len = len(data)
+        data = [
+            row for row in data
+            if abs(len(row["chosen"]) - len(row["rejected"])) < diagnostic_length_threshold
+        ]
+        logger.info(
+            f"DIAGNOSTIC length_matched: {len(data)}/{original_len} pairs "
+            f"({100*len(data)/original_len:.1f}%) with |Δlen| < {diagnostic_length_threshold}"
+        )
+
     return data
 
 
@@ -336,6 +580,9 @@ def evaluate(
     device: str,
     pad_token_id: int,
     batch_size: int = 16,
+    *,
+    step: Optional[int] = None,
+    split: str = "eval",
 ) -> Dict[str, Any]:
     """Evaluate model on a held-out set.
 
@@ -355,6 +602,11 @@ def evaluate(
 
     chosen_scores: List[float] = []
     rejected_scores: List[float] = []
+    labels_all: List[float] = []
+    chosen_lengths: List[float] = []
+    rejected_lengths: List[float] = []
+    item_scores: List[float] = []
+    item_lengths: List[float] = []
 
     # Process in batches
     for i in range(0, len(eval_items), batch_size * 2):
@@ -397,9 +649,7 @@ def evaluate(
             total_margin += float(stats.get("margin", 0)) * num_pairs
             total_pairs += num_pairs
 
-            # Track reward distributions
-            chosen_scores.append(float(stats.get("chosen_score", 0)))
-            rejected_scores.append(float(stats.get("rejected_score", 0)))
+            # Track reward distributions (per-pair, not batch means)
 
             # Update calibration/AUROC metrics with per-pair scores
             if logits.ndim == 1:
@@ -421,23 +671,50 @@ def evaluate(
                     pair_map[pid] = {}
                 pair_map[pid][role] = idx
 
-            chosen_list = []
-            rejected_list = []
-            label_list = []
+            action_lengths = collated["action_mask"].sum(dim=1)
+
+            chosen_list: List[torch.Tensor] = []
+            rejected_list: List[torch.Tensor] = []
+            label_list: List[float] = []
+            chosen_len_list: List[float] = []
+            rejected_len_list: List[float] = []
             for pid, indices in pair_map.items():
                 if "chosen" in indices and "rejected" in indices:
-                    chosen_list.append(scores[indices["chosen"]])
-                    rejected_list.append(scores[indices["rejected"]])
+                    c_idx = indices["chosen"]
+                    r_idx = indices["rejected"]
+                    chosen_list.append(scores[c_idx])
+                    rejected_list.append(scores[r_idx])
                     label_list.append(labels_list[indices["chosen"]])
+                    chosen_len_list.append(float(action_lengths[c_idx].item()))
+                    rejected_len_list.append(float(action_lengths[r_idx].item()))
 
             if chosen_list:
-                metrics.update(
-                    chosen_scores=torch.stack(chosen_list),
-                    rejected_scores=torch.stack(rejected_list),
-                    labels=torch.tensor(
-                        label_list, device=scores.device, dtype=scores.dtype
-                    ),
+                chosen_tensor = torch.stack(chosen_list)
+                rejected_tensor = torch.stack(rejected_list)
+                labels_tensor = torch.tensor(
+                    label_list, device=scores.device, dtype=scores.dtype
                 )
+                metrics.update(
+                    chosen_scores=chosen_tensor,
+                    rejected_scores=rejected_tensor,
+                    labels=labels_tensor,
+                )
+
+                chosen_cpu = chosen_tensor.detach().cpu().float().tolist()
+                rejected_cpu = rejected_tensor.detach().cpu().float().tolist()
+                labels_cpu = labels_tensor.detach().cpu().float().tolist()
+
+                chosen_scores.extend(chosen_cpu)
+                rejected_scores.extend(rejected_cpu)
+                labels_all.extend(labels_cpu)
+                chosen_lengths.extend(chosen_len_list)
+                rejected_lengths.extend(rejected_len_list)
+                for score, length in zip(chosen_cpu, chosen_len_list):
+                    item_scores.append(score)
+                    item_lengths.append(length)
+                for score, length in zip(rejected_cpu, rejected_len_list):
+                    item_scores.append(score)
+                    item_lengths.append(length)
 
     if total_pairs == 0:
         return {
@@ -449,9 +726,59 @@ def evaluate(
             "eval_roc_auc": 0.0,
             "chosen_scores": [],
             "rejected_scores": [],
+            "eval_delta_mean": 0.0,
+            "eval_delta_std": 0.0,
+            "eval_delta_p05": 0.0,
+            "eval_delta_p50": 0.0,
+            "eval_delta_p95": 0.0,
+            "eval_delta_neg_rate": 0.0,
+            "eval_reward_chosen_mean": 0.0,
+            "eval_reward_chosen_std": 0.0,
+            "eval_reward_rejected_mean": 0.0,
+            "eval_reward_rejected_std": 0.0,
+            "eval_reward_abs_max": 0.0,
+            "eval_reward_len_corr": float("nan"),
+            "eval_delta_len_diff_corr": float("nan"),
+            "eval_len_diff_mean": 0.0,
+            "eval_len_diff_std": 0.0,
+            "eval_calib_bins": {
+                "edges": [],
+                "counts": [],
+                "acc": [],
+                "conf": [],
+                "gap": [],
+            },
+            "eval_diag_step": step,
+            "eval_diag_split": split,
         }
 
     metric_results = metrics.compute()
+
+    delta_values = [c - r for c, r in zip(chosen_scores, rejected_scores)]
+    delta_stats = _summarize_distribution(delta_values)
+
+    chosen_stats = _summarize_distribution(chosen_scores)
+    rejected_stats = _summarize_distribution(rejected_scores)
+    reward_abs_max = 0.0
+    if chosen_scores or rejected_scores:
+        reward_abs_max = float(
+            max(
+                max((abs(v) for v in chosen_scores), default=0.0),
+                max((abs(v) for v in rejected_scores), default=0.0),
+            )
+        )
+
+    reward_len_corr = _safe_corrcoef(item_scores, item_lengths)
+    len_diff = [c - r for c, r in zip(chosen_lengths, rejected_lengths)]
+    delta_len_diff_corr = _safe_corrcoef(delta_values, len_diff)
+    len_diff_stats = _summarize_distribution(len_diff)
+
+    calibration_bins = _compute_calibration_bins(
+        delta_values,
+        labels_all,
+        beta=getattr(algorithm.loss, "beta", 1.0),
+        num_bins=metrics.calibration_bins,
+    )
 
     return {
         "eval_loss": total_loss / total_pairs,
@@ -462,20 +789,135 @@ def evaluate(
         "eval_roc_auc": metric_results.get("roc_auc", 0.0),
         "chosen_scores": chosen_scores,
         "rejected_scores": rejected_scores,
+        "eval_delta_mean": delta_stats["mean"],
+        "eval_delta_std": delta_stats["std"],
+        "eval_delta_p05": delta_stats["p05"],
+        "eval_delta_p50": delta_stats["p50"],
+        "eval_delta_p95": delta_stats["p95"],
+        "eval_delta_neg_rate": delta_stats["neg_rate"],
+        "eval_reward_chosen_mean": chosen_stats["mean"],
+        "eval_reward_chosen_std": chosen_stats["std"],
+        "eval_reward_rejected_mean": rejected_stats["mean"],
+        "eval_reward_rejected_std": rejected_stats["std"],
+        "eval_reward_abs_max": reward_abs_max,
+        "eval_reward_len_corr": reward_len_corr,
+        "eval_delta_len_diff_corr": delta_len_diff_corr,
+        "eval_len_diff_mean": len_diff_stats["mean"],
+        "eval_len_diff_std": len_diff_stats["std"],
+        "eval_calib_bins": calibration_bins,
+        "eval_diag_step": step,
+        "eval_diag_split": split,
+    }
+
+
+def _summarize_distribution(values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "p05": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "neg_rate": 0.0,
+        }
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 1:
+        p05 = p50 = p95 = float(arr[0])
+    else:
+        p05, p50, p95 = np.quantile(arr, [0.05, 0.5, 0.95]).tolist()
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std(ddof=0)) if arr.size > 1 else 0.0,
+        "p05": float(p05),
+        "p50": float(p50),
+        "p95": float(p95),
+        "neg_rate": float((arr < 0).mean()),
+    }
+
+
+def _safe_corrcoef(x_values: List[float], y_values: List[float]) -> float:
+    if len(x_values) < 2 or len(y_values) < 2:
+        return float("nan")
+    x_arr = np.asarray(x_values, dtype=np.float64)
+    y_arr = np.asarray(y_values, dtype=np.float64)
+    if x_arr.size != y_arr.size:
+        return float("nan")
+    if np.std(x_arr) == 0.0 or np.std(y_arr) == 0.0:
+        return float("nan")
+    return float(np.corrcoef(x_arr, y_arr)[0, 1])
+
+
+def _compute_calibration_bins(
+    delta_values: List[float],
+    labels: List[float],
+    *,
+    beta: float,
+    num_bins: int,
+) -> Dict[str, List[float]]:
+    if not delta_values or not labels or len(delta_values) != len(labels):
+        return {"edges": [], "counts": [], "acc": [], "conf": [], "gap": []}
+    delta_arr = np.asarray(delta_values, dtype=np.float64)
+    labels_arr = np.asarray(labels, dtype=np.float64)
+    probs = 1.0 / (1.0 + np.exp(-beta * delta_arr))
+    targets = (labels_arr > 0.5).astype(np.float64)
+
+    edges = np.linspace(0.0, 1.0, num_bins + 1)
+    counts: List[int] = []
+    accs: List[float] = []
+    confs: List[float] = []
+    gaps: List[float] = []
+    for i in range(num_bins):
+        if i == num_bins - 1:
+            mask = (probs >= edges[i]) & (probs <= edges[i + 1])
+        else:
+            mask = (probs >= edges[i]) & (probs < edges[i + 1])
+        count = int(mask.sum())
+        if count > 0:
+            acc = float(targets[mask].mean())
+            conf = float(probs[mask].mean())
+            gap = conf - acc
+        else:
+            acc = 0.0
+            conf = 0.0
+            gap = 0.0
+        counts.append(count)
+        accs.append(acc)
+        confs.append(conf)
+        gaps.append(gap)
+    return {
+        "edges": edges.tolist(),
+        "counts": counts,
+        "acc": accs,
+        "conf": confs,
+        "gap": gaps,
     }
 
 
 class MetricsLogger:
     """Log metrics to CSV file."""
 
-    def __init__(self, output_path: Path):
+    def __init__(self, output_path: Path, track_gpu: bool = False):
         self.output_path = output_path
         self.rows: List[Dict[str, Any]] = []
         self.fieldnames = [
             "step", "train_loss", "train_acc", "train_margin",
             "eval_loss", "eval_acc", "eval_margin", "eval_pairs",
             "eval_ece", "eval_roc_auc",
+            "eval_delta_mean", "eval_delta_std", "eval_delta_p05",
+            "eval_delta_p50", "eval_delta_p95", "eval_delta_neg_rate",
+            "eval_reward_chosen_mean", "eval_reward_chosen_std",
+            "eval_reward_rejected_mean", "eval_reward_rejected_std",
+            "eval_reward_abs_max",
+            "eval_reward_len_corr", "eval_delta_len_diff_corr",
+            "eval_len_diff_mean", "eval_len_diff_std",
+            "eval_calib_bins_json",
         ]
+        if track_gpu:
+            self.fieldnames.extend([
+                "avg_gpu_utilization_pct", "max_gpu_utilization_pct",
+                "avg_gpu_memory_used_gb", "max_gpu_memory_used_gb",
+                "avg_gpu_power_w", "gpu_samples_count",
+            ])
 
     def log(
         self,
@@ -489,6 +931,8 @@ class MetricsLogger:
         eval_pairs: Optional[int] = None,
         eval_ece: Optional[float] = None,
         eval_roc_auc: Optional[float] = None,
+        gpu_stats: Optional[Dict[str, float]] = None,
+        extra_metrics: Optional[Dict[str, Any]] = None,
     ):
         row = {
             "step": step,
@@ -502,6 +946,19 @@ class MetricsLogger:
             "eval_ece": eval_ece,
             "eval_roc_auc": eval_roc_auc,
         }
+        if extra_metrics:
+            for key, value in extra_metrics.items():
+                if key not in self.fieldnames:
+                    self.fieldnames.append(key)
+                if isinstance(value, (dict, list)):
+                    row[key] = json.dumps(value, sort_keys=True)
+                else:
+                    row[key] = value
+        if gpu_stats:
+            # Only include GPU fields that are in fieldnames
+            for key in self.fieldnames:
+                if key in gpu_stats:
+                    row[key] = gpu_stats[key]
         self.rows.append(row)
         self._write()
 
@@ -536,7 +993,17 @@ async def async_main(args):
 
     # Load preference data
     logger.info(f"Loading preferences from HF: {args.hf_dataset}")
-    pref_data = load_hf_preferences(args.hf_dataset, args.hf_split, limit=args.limit)
+    if args.diagnostic_mode:
+        logger.info(f"DIAGNOSTIC MODE: {args.diagnostic_mode}")
+    pref_data = load_hf_preferences(
+        args.hf_dataset,
+        args.hf_split,
+        limit=args.limit,
+        diagnostic_mode=args.diagnostic_mode,
+        diagnostic_length_threshold=args.diagnostic_length_threshold,
+        diagnostic_shuffle_rate=args.diagnostic_shuffle_rate,
+        diagnostic_seed=args.diagnostic_seed,
+    )
 
     logger.info(f"Loaded {len(pref_data)} preference pairs")
 
@@ -608,6 +1075,7 @@ async def async_main(args):
         lambda_regularization=args.regularization_lambda,
         regularization_type=args.regularization_type,
         label_smoothing=args.label_smoothing,
+        score_regularization_lambda=args.score_regularization_lambda,
     )
 
     # Create batch source (batch_size is number of items, so 2x pairs)
@@ -655,18 +1123,40 @@ async def async_main(args):
     if args.lora:
         try:
             from peft import LoraConfig
+
+            # rsLoRA: scale alpha by sqrt(r) for rank-independent gradient magnitudes
+            if args.rslora:
+                effective_alpha = int(args.lora_alpha * (args.lora_rank ** 0.5))
+                logger.info(f"rsLoRA: alpha={args.lora_alpha} * sqrt({args.lora_rank}) = {effective_alpha}")
+            else:
+                effective_alpha = args.lora_alpha
+
+            # Parse modules_to_save if provided
+            modules_to_save = None
+            if args.lora_modules_to_save:
+                modules_to_save = [m.strip() for m in args.lora_modules_to_save.split(",")]
+                logger.info(f"LoRA modules to save (fully trainable): {modules_to_save}")
+
             lora_config = LoraConfig(
                 r=args.lora_rank,
-                lora_alpha=args.lora_alpha,
+                lora_alpha=effective_alpha,
                 lora_dropout=args.lora_dropout,
                 target_modules=args.lora_target_modules.split(",") if args.lora_target_modules else None,
+                modules_to_save=modules_to_save,
             )
-            logger.info(f"LoRA enabled: rank={args.lora_rank}, alpha={args.lora_alpha}")
+            logger.info(f"LoRA enabled: rank={args.lora_rank}, alpha={effective_alpha} (base={args.lora_alpha}, rsLoRA={args.rslora})")
         except ImportError:
             raise ImportError("PEFT is required for LoRA. Install with: pip install peft")
 
     # Initialize metrics logger (output_dir already created earlier for sample logging)
-    metrics_logger = MetricsLogger(output_dir / "metrics.csv")
+    metrics_logger = MetricsLogger(output_dir / "metrics.csv", track_gpu=args.track_gpu)
+
+    # Initialize GPU stats collector if requested
+    gpu_collector: Optional[GPUStatsCollector] = None
+    if args.track_gpu:
+        gpu_collector = GPUStatsCollector(sample_interval_ms=args.gpu_sample_interval_ms)
+        gpu_collector.start()
+        logger.info(f"GPU tracking enabled (sampling every {args.gpu_sample_interval_ms}ms)")
 
     # Create trainer
     trainer = RMTrainer(
@@ -696,6 +1186,8 @@ async def async_main(args):
             device=device,
             pad_token_id=tokenizer.pad_token_id,
             batch_size=args.batch_size,
+            step=0,
+            split="baseline",
         )
         logger.info(
             f"Baseline | "
@@ -713,7 +1205,56 @@ async def async_main(args):
             eval_pairs=eval_results["eval_pairs"],
             eval_ece=eval_results["eval_ece"],
             eval_roc_auc=eval_results["eval_roc_auc"],
+            extra_metrics={
+                "eval_delta_mean": eval_results["eval_delta_mean"],
+                "eval_delta_std": eval_results["eval_delta_std"],
+                "eval_delta_p05": eval_results["eval_delta_p05"],
+                "eval_delta_p50": eval_results["eval_delta_p50"],
+                "eval_delta_p95": eval_results["eval_delta_p95"],
+                "eval_delta_neg_rate": eval_results["eval_delta_neg_rate"],
+                "eval_reward_chosen_mean": eval_results["eval_reward_chosen_mean"],
+                "eval_reward_chosen_std": eval_results["eval_reward_chosen_std"],
+                "eval_reward_rejected_mean": eval_results["eval_reward_rejected_mean"],
+                "eval_reward_rejected_std": eval_results["eval_reward_rejected_std"],
+                "eval_reward_abs_max": eval_results["eval_reward_abs_max"],
+                "eval_reward_len_corr": eval_results["eval_reward_len_corr"],
+                "eval_delta_len_diff_corr": eval_results["eval_delta_len_diff_corr"],
+                "eval_len_diff_mean": eval_results["eval_len_diff_mean"],
+                "eval_len_diff_std": eval_results["eval_len_diff_std"],
+                "eval_calib_bins_json": eval_results["eval_calib_bins"],
+            },
         )
+        logger.info("RM_DIAG %s", json.dumps({
+            "step": 0,
+            "split": "baseline",
+            "loss": eval_results["eval_loss"],
+            "accuracy": eval_results["eval_accuracy"],
+            "margin": eval_results["eval_margin"],
+            "ece": eval_results["eval_ece"],
+            "auroc": eval_results["eval_roc_auc"],
+            "delta_stats": {
+                "mean": eval_results["eval_delta_mean"],
+                "std": eval_results["eval_delta_std"],
+                "p05": eval_results["eval_delta_p05"],
+                "p50": eval_results["eval_delta_p50"],
+                "p95": eval_results["eval_delta_p95"],
+                "neg_rate": eval_results["eval_delta_neg_rate"],
+            },
+            "reward_stats": {
+                "chosen_mean": eval_results["eval_reward_chosen_mean"],
+                "chosen_std": eval_results["eval_reward_chosen_std"],
+                "rejected_mean": eval_results["eval_reward_rejected_mean"],
+                "rejected_std": eval_results["eval_reward_rejected_std"],
+                "abs_max": eval_results["eval_reward_abs_max"],
+            },
+            "length_stats": {
+                "reward_len_corr": eval_results["eval_reward_len_corr"],
+                "delta_len_diff_corr": eval_results["eval_delta_len_diff_corr"],
+                "len_diff_mean": eval_results["eval_len_diff_mean"],
+                "len_diff_std": eval_results["eval_len_diff_std"],
+            },
+            "calibration_bins": eval_results["eval_calib_bins"],
+        }, sort_keys=True))
         # Track reward distributions
         reward_distributions["steps"].append(0)
         reward_distributions["chosen_scores"].append(eval_results["chosen_scores"])
@@ -742,11 +1283,23 @@ async def async_main(args):
             avg_loss = running_loss / args.log_every
             avg_acc = running_acc / args.log_every
             avg_margin = running_margin / args.log_every
+
+            # Collect GPU stats if tracking
+            gpu_stats = None
+            if gpu_collector is not None:
+                gpu_stats = gpu_collector.get_step_stats()
+                if gpu_stats and "avg_gpu_utilization_pct" in gpu_stats:
+                    logger.info(
+                        f"GPU: {gpu_stats.get('avg_gpu_utilization_pct', 0):.1f}% util, "
+                        f"{gpu_stats.get('avg_gpu_memory_used_gb', 0):.2f}GB used"
+                    )
+
             metrics_logger.log(
                 step=step,
                 train_loss=avg_loss,
                 train_acc=avg_acc,
                 train_margin=avg_margin,
+                gpu_stats=gpu_stats,
             )
             running_loss = 0.0
             running_acc = 0.0
@@ -761,6 +1314,8 @@ async def async_main(args):
                 device=device,
                 pad_token_id=tokenizer.pad_token_id,
                 batch_size=args.batch_size,
+                step=step,
+                split="eval",
             )
             eval_acc = eval_results["eval_accuracy"]
             logger.info(
@@ -779,7 +1334,56 @@ async def async_main(args):
                 eval_pairs=eval_results["eval_pairs"],
                 eval_ece=eval_results["eval_ece"],
                 eval_roc_auc=eval_results["eval_roc_auc"],
+                extra_metrics={
+                    "eval_delta_mean": eval_results["eval_delta_mean"],
+                    "eval_delta_std": eval_results["eval_delta_std"],
+                    "eval_delta_p05": eval_results["eval_delta_p05"],
+                    "eval_delta_p50": eval_results["eval_delta_p50"],
+                    "eval_delta_p95": eval_results["eval_delta_p95"],
+                    "eval_delta_neg_rate": eval_results["eval_delta_neg_rate"],
+                    "eval_reward_chosen_mean": eval_results["eval_reward_chosen_mean"],
+                    "eval_reward_chosen_std": eval_results["eval_reward_chosen_std"],
+                    "eval_reward_rejected_mean": eval_results["eval_reward_rejected_mean"],
+                    "eval_reward_rejected_std": eval_results["eval_reward_rejected_std"],
+                    "eval_reward_abs_max": eval_results["eval_reward_abs_max"],
+                    "eval_reward_len_corr": eval_results["eval_reward_len_corr"],
+                    "eval_delta_len_diff_corr": eval_results["eval_delta_len_diff_corr"],
+                    "eval_len_diff_mean": eval_results["eval_len_diff_mean"],
+                    "eval_len_diff_std": eval_results["eval_len_diff_std"],
+                    "eval_calib_bins_json": eval_results["eval_calib_bins"],
+                },
             )
+            logger.info("RM_DIAG %s", json.dumps({
+                "step": step,
+                "split": "eval",
+                "loss": eval_results["eval_loss"],
+                "accuracy": eval_results["eval_accuracy"],
+                "margin": eval_results["eval_margin"],
+                "ece": eval_results["eval_ece"],
+                "auroc": eval_results["eval_roc_auc"],
+                "delta_stats": {
+                    "mean": eval_results["eval_delta_mean"],
+                    "std": eval_results["eval_delta_std"],
+                    "p05": eval_results["eval_delta_p05"],
+                    "p50": eval_results["eval_delta_p50"],
+                    "p95": eval_results["eval_delta_p95"],
+                    "neg_rate": eval_results["eval_delta_neg_rate"],
+                },
+                "reward_stats": {
+                    "chosen_mean": eval_results["eval_reward_chosen_mean"],
+                    "chosen_std": eval_results["eval_reward_chosen_std"],
+                    "rejected_mean": eval_results["eval_reward_rejected_mean"],
+                    "rejected_std": eval_results["eval_reward_rejected_std"],
+                    "abs_max": eval_results["eval_reward_abs_max"],
+                },
+                "length_stats": {
+                    "reward_len_corr": eval_results["eval_reward_len_corr"],
+                    "delta_len_diff_corr": eval_results["eval_delta_len_diff_corr"],
+                    "len_diff_mean": eval_results["eval_len_diff_mean"],
+                    "len_diff_std": eval_results["eval_len_diff_std"],
+                },
+                "calibration_bins": eval_results["eval_calib_bins"],
+            }, sort_keys=True))
             # Track reward distributions
             reward_distributions["steps"].append(step)
             reward_distributions["chosen_scores"].append(eval_results["chosen_scores"])
@@ -833,6 +1437,8 @@ async def async_main(args):
             device=device,
             pad_token_id=tokenizer.pad_token_id,
             batch_size=args.batch_size,
+            step=final_step,
+            split="final",
         )
         logger.info(
             f"Final | "
@@ -850,7 +1456,56 @@ async def async_main(args):
             eval_pairs=eval_results["eval_pairs"],
             eval_ece=eval_results["eval_ece"],
             eval_roc_auc=eval_results["eval_roc_auc"],
+            extra_metrics={
+                "eval_delta_mean": eval_results["eval_delta_mean"],
+                "eval_delta_std": eval_results["eval_delta_std"],
+                "eval_delta_p05": eval_results["eval_delta_p05"],
+                "eval_delta_p50": eval_results["eval_delta_p50"],
+                "eval_delta_p95": eval_results["eval_delta_p95"],
+                "eval_delta_neg_rate": eval_results["eval_delta_neg_rate"],
+                "eval_reward_chosen_mean": eval_results["eval_reward_chosen_mean"],
+                "eval_reward_chosen_std": eval_results["eval_reward_chosen_std"],
+                "eval_reward_rejected_mean": eval_results["eval_reward_rejected_mean"],
+                "eval_reward_rejected_std": eval_results["eval_reward_rejected_std"],
+                "eval_reward_abs_max": eval_results["eval_reward_abs_max"],
+                "eval_reward_len_corr": eval_results["eval_reward_len_corr"],
+                "eval_delta_len_diff_corr": eval_results["eval_delta_len_diff_corr"],
+                "eval_len_diff_mean": eval_results["eval_len_diff_mean"],
+                "eval_len_diff_std": eval_results["eval_len_diff_std"],
+                "eval_calib_bins_json": eval_results["eval_calib_bins"],
+            },
         )
+        logger.info("RM_DIAG %s", json.dumps({
+            "step": final_step,
+            "split": "final",
+            "loss": eval_results["eval_loss"],
+            "accuracy": eval_results["eval_accuracy"],
+            "margin": eval_results["eval_margin"],
+            "ece": eval_results["eval_ece"],
+            "auroc": eval_results["eval_roc_auc"],
+            "delta_stats": {
+                "mean": eval_results["eval_delta_mean"],
+                "std": eval_results["eval_delta_std"],
+                "p05": eval_results["eval_delta_p05"],
+                "p50": eval_results["eval_delta_p50"],
+                "p95": eval_results["eval_delta_p95"],
+                "neg_rate": eval_results["eval_delta_neg_rate"],
+            },
+            "reward_stats": {
+                "chosen_mean": eval_results["eval_reward_chosen_mean"],
+                "chosen_std": eval_results["eval_reward_chosen_std"],
+                "rejected_mean": eval_results["eval_reward_rejected_mean"],
+                "rejected_std": eval_results["eval_reward_rejected_std"],
+                "abs_max": eval_results["eval_reward_abs_max"],
+            },
+            "length_stats": {
+                "reward_len_corr": eval_results["eval_reward_len_corr"],
+                "delta_len_diff_corr": eval_results["eval_delta_len_diff_corr"],
+                "len_diff_mean": eval_results["eval_len_diff_mean"],
+                "len_diff_std": eval_results["eval_len_diff_std"],
+            },
+            "calibration_bins": eval_results["eval_calib_bins"],
+        }, sort_keys=True))
         # Track reward distributions
         if final_step not in reward_distributions["steps"]:
             reward_distributions["steps"].append(final_step)
@@ -866,6 +1521,11 @@ async def async_main(args):
     with open(reward_dist_path, "w") as f:
         json.dump(reward_distributions, f, indent=2)
     logger.info(f"Saved reward distributions to {reward_dist_path}")
+
+    # Stop GPU tracking and log summary
+    if gpu_collector is not None:
+        gpu_collector.stop()
+        logger.info("GPU tracking stopped")
 
     logger.info("Training complete!")
 
@@ -984,11 +1644,29 @@ def main():
         "--lora-target-modules", type=str, default=None,
         help="Comma-separated list of LoRA target modules (e.g., 'q_proj,v_proj')"
     )
+    parser.add_argument(
+        "--rslora", action="store_true",
+        help="Use rsLoRA scaling (alpha = alpha * sqrt(r)) for rank-independent gradients"
+    )
+    parser.add_argument(
+        "--lora-modules-to-save", type=str, default=None,
+        help="Comma-separated modules to keep fully trainable (e.g., 'input_layernorm,post_attention_layernorm')"
+    )
 
     # Sample logging
     parser.add_argument(
         "--log-samples", type=int, default=5,
         help="Number of random samples to log from train/eval distributions (0 to disable)"
+    )
+
+    # GPU tracking arguments
+    parser.add_argument(
+        "--track-gpu", action="store_true",
+        help="Track GPU utilization during training (requires pynvml for detailed stats)"
+    )
+    parser.add_argument(
+        "--gpu-sample-interval-ms", type=int, default=100,
+        help="GPU stats sampling interval in milliseconds (default: 100)"
     )
 
     # Differential LR arguments
@@ -1017,6 +1695,29 @@ def main():
     parser.add_argument(
         "--system-prompt", type=str, default=None,
         help="System prompt to prepend when using chat template"
+    )
+
+    # Diagnostic mode arguments (V5 experiments)
+    parser.add_argument(
+        "--diagnostic-mode", type=str, default=None,
+        choices=["label_shuffle", "prompt_only", "random_negatives", "length_matched"],
+        help="Diagnostic mode for testing pipeline integrity"
+    )
+    parser.add_argument(
+        "--diagnostic-length-threshold", type=int, default=50,
+        help="Max |len(chosen)-len(rejected)| for length_matched mode (default: 50)"
+    )
+    parser.add_argument(
+        "--diagnostic-shuffle-rate", type=float, default=0.5,
+        help="Label shuffle rate for label_shuffle mode (default: 0.5)"
+    )
+    parser.add_argument(
+        "--diagnostic-seed", type=int, default=42,
+        help="Seed for diagnostic randomization (default: 42)"
+    )
+    parser.add_argument(
+        "--score-regularization-lambda", type=float, default=0.0,
+        help="L2 regularization on individual reward scores (not margin)"
     )
 
     args = parser.parse_args()
