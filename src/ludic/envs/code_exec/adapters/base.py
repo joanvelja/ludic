@@ -247,3 +247,41 @@ class FloatTolerantVerifier:
         except ValueError:
             # Not floats, exact match already failed
             return False
+
+
+@runtime_checkable
+class ReferenceSolutionProvider(Protocol):
+    """
+    Protocol for adapters that can provide reference (honest) solutions.
+
+    Used by SneakyCodeExecEnv to get the honest solution for comparison.
+    """
+
+    def get_reference_solution(self, sample: Dict[str, Any]) -> Optional[str]:
+        """
+        Get the reference solution code for a sample.
+
+        Args:
+            sample: Dataset sample containing problem and solutions
+
+        Returns:
+            The reference solution code, or None if not available
+            (e.g., if passes_tests=False or is_nondeterministic=True)
+        """
+        ...
+
+    def is_valid_for_sneaky(self, sample: Dict[str, Any]) -> bool:
+        """
+        Check if a sample is valid for sneaky verification.
+
+        A sample is valid if:
+        - It has a valid reference solution (passes_tests=True)
+        - It is not nondeterministic
+
+        Args:
+            sample: Dataset sample
+
+        Returns:
+            True if the sample can be used for sneaky verification
+        """
+        ...

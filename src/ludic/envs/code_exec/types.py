@@ -7,6 +7,8 @@ providing RL-relevant signals for reward shaping and analysis.
 
 from __future__ import annotations
 
+import json
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -256,3 +258,81 @@ class BatchTestResult:
     def get_successes(self) -> List[TestResult]:
         """All tests that passed."""
         return [r for r in self.results if r.passed]
+
+
+# ---------------------------------------------------------------------
+# Sneaky Verification Types
+# ---------------------------------------------------------------------
+
+
+@dataclass
+class SneakySubmission:
+    """
+    Parsed submission containing code and certificate.
+
+    This is the input format expected by SneakyCodeExecEnv.
+    """
+
+    code: str
+    certificate: str
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "SneakySubmission":
+        """Parse JSON string into SneakySubmission."""
+        try:
+            data = json.loads(json_str)
+            code = data.get("code")
+            certificate = data.get("certificate")
+            if code is None:
+                raise ValueError("Missing 'code' field")
+            if certificate is None:
+                raise ValueError("Missing 'certificate' field")
+            return cls(code=str(code), certificate=str(certificate))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON: {e}")
+
+
+@dataclass
+class SneakyResult:
+    """
+    Result of sneaky verification.
+
+    Contains all signals from the verification process:
+    - test_pass_rate: How many tests the sneaky code passed
+    - sneaky_certified: True if honest and sneaky outputs differ on certificate
+    - similarity_score: Code similarity between sneaky and honest solutions
+    """
+
+    test_pass_rate: float
+    sneaky_certified: bool
+    honest_pass_rate: float = 1.0
+    similarity_score: Optional[float] = None
+    certificate_executed: bool = False
+    honest_output: Optional[str] = None
+    sneaky_output: Optional[str] = None
+    timing_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "test_pass_rate": self.test_pass_rate,
+            "sneaky_certified": self.sneaky_certified,
+            "honest_pass_rate": self.honest_pass_rate,
+            "similarity_score": self.similarity_score,
+            "certificate_executed": self.certificate_executed,
+            "honest_output": self.honest_output,
+            "sneaky_output": self.sneaky_output,
+            "timing_ms": self.timing_ms,
+        }
+
+
+@dataclass
+class SneakyConfig:
+    """Configuration for sneaky verification."""
+
+    enabled: bool = True
+    require_test_pass: bool = True
+    min_honest_pass_rate: float = 0.8
+    compute_similarity: bool = True
+    certificate_max_length: int = 10000
+    certificate_timeout_s: float = 5.0

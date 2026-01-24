@@ -40,6 +40,18 @@ from .sandbox import Sandbox, SandboxPool
 from .adapters.base import TestAdapter, OutputVerifier, ExactMatchVerifier
 from .runners import CodeRunner, StdinStdoutRunner, compute_hash, hash_tests
 from .env import CodeExecConfig, CodeExecEnv
+from .eval_cache import EvalCache, CacheStats, compute_hash as eval_compute_hash
+from .similarity import (
+    compute_similarity,
+    canonicalize,
+    opcode_bigram_jaccard,
+    ast_edge_jaccard,
+    control_flow_cosine,
+    literal_signature_cosine,
+    WEIGHTS as SIMILARITY_WEIGHTS,
+)
+from .sneaky_env import SneakyCodeExecEnv, CertificateCheckResult
+from .types import SneakySubmission, SneakyResult, SneakyConfig
 
 # Backend detection and factory (always available)
 from .backend import (
@@ -100,6 +112,23 @@ __all__ = [
     # Utilities
     "compute_hash",
     "hash_tests",
+    # Eval cache (for sneaky verification)
+    "EvalCache",
+    "CacheStats",
+    # Similarity computation (for sneaky verification)
+    "compute_similarity",
+    "canonicalize",
+    "opcode_bigram_jaccard",
+    "ast_edge_jaccard",
+    "control_flow_cosine",
+    "literal_signature_cosine",
+    "SIMILARITY_WEIGHTS",
+    # Sneaky verification environment
+    "SneakyCodeExecEnv",
+    "CertificateCheckResult",
+    "SneakySubmission",
+    "SneakyResult",
+    "SneakyConfig",
     # Backend detection
     "SandboxBackend",
     "detect_available_backend",

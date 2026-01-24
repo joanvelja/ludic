@@ -10,7 +10,7 @@ Compatible with:
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..types import TestCase
 
@@ -128,3 +128,29 @@ class APPSTestAdapter:
 
         # Return first 16 hex characters
         return hash_obj.hexdigest()[:16]
+
+    def get_reference_solution(self, sample: Dict[str, Any]) -> Optional[str]:
+        """Get the first solution that passes tests, if available."""
+        # Filter nondeterministic samples
+        if sample.get("is_nondeterministic", False):
+            return None
+
+        solutions = sample.get("solutions", [])
+        if not solutions:
+            return None
+
+        # For apps-control-arena, solutions is a list of dicts with 'code' and 'passes_tests'
+        first = solutions[0]
+        if isinstance(first, dict):
+            if not first.get("passes_tests", False):
+                return None
+            return first.get("code")
+
+        # For original APPS format, solutions might be just strings
+        return first if isinstance(first, str) else None
+
+    def is_valid_for_sneaky(self, sample: Dict[str, Any]) -> bool:
+        """Check if sample is valid for sneaky verification."""
+        if sample.get("is_nondeterministic", False):
+            return False
+        return self.get_reference_solution(sample) is not None
