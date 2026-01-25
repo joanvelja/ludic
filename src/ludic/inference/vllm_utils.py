@@ -15,6 +15,8 @@ def _default_env() -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("VLLM_USE_V1", "1")
     env.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # Propagate HF_HUB_DISABLE_LOCKING to avoid Lustre lock issues
+    env.setdefault("HF_HUB_DISABLE_LOCKING", "1")
     return env
 
 
@@ -28,12 +30,17 @@ def start_vllm_server(
     enforce_eager: bool = True,
     stream_output: bool = True,
     extra_args: list[str] | None = None,
+    cuda_visible_devices: str | None = None,
 ) -> subprocess.Popen[str]:
     """
     Launch a local vLLM server using ludic.inference.vllm_server.
 
     Set stream_output=False if the caller needs to capture stdout/stderr;
     otherwise logs stream to the parent to avoid pipe backpressure.
+
+    Args:
+        cuda_visible_devices: Comma-separated GPU IDs to make visible (e.g., "0,1").
+            If None, inherits from parent environment.
     """
     extra_args = extra_args or []
     cmd = [
@@ -66,9 +73,14 @@ def start_vllm_server(
     stdout = None if stream_output else subprocess.PIPE
     stderr = None if stream_output else subprocess.PIPE
 
+    # Build environment, optionally restricting visible GPUs
+    env = _default_env()
+    if cuda_visible_devices is not None:
+        env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+
     return subprocess.Popen(
         cmd,
-        env=_default_env(),
+        env=env,
         stdout=stdout,
         stderr=stderr,
         text=True,
