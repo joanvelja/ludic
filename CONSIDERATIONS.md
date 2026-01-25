@@ -124,3 +124,9 @@ Planned refactor (breaking change):
 - Handle multiplicity at a higher layer by explicitly generating more requests, e.g. via:
   - `RequestStrategy.expand(...)` (one-to-many request transforms), and/or
   - a small helper to “repeat” a request with deterministic seeding.
+
+## Philosophy
+
+This codebase will outlive you. Every shortcut, hacky implementation, non-extensible script, or ad-hoc solution becomes someone else's burden. Every hack compounds into technical debt that slows the whole team down. You are not just writing code. You are shaping the future of this project. The patterns you establish will be copied. The corners you cut will be cut again.
+
+Fight entropy. Leave the codebase better than you found it.

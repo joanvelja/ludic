@@ -4,33 +4,52 @@ Ludic is an LLM-RL *library* built to be hackable. The core idea is to keep comp
 
 This repo is *research scaffolding*, not production infrastructure.
 
-## Tooling (uv)
-
-Use `uv run` for all Python invocations, including shell scripts that call Python.  
-If you update or add a shell script that runs Python, wrap it as `uv run python ...` (or `uv run --env-file .env python ...` when needed).
-
 ## What This Is *Not* (Avoid RLHF Mental Models)
 
-Ludic is **not** primarily an “RLHF framework” in the common 2023–2024 sense (preference optimization / alignment pipelines).
+Ludic is **not** primarily an "RLHF framework" in the common 2023–2024 sense (preference optimization / alignment pipelines).
 
-- **Not DPO-style training**: the default mental model is *not* “optimize preferences directly against a reference policy” (DPO/IPO/KTO/etc.).
-- **Not the classical RLHF stack**: it is *not* organized around “SFT → train reward model → PPO with KL-to-reference”.
+- **Not DPO-style training**: the default mental model is *not* "optimize preferences directly against a reference policy" (DPO/IPO/KTO/etc.).
+- **Not the classical RLHF stack**: it is *not* organized around "SFT → train reward model → PPO with KL-to-reference".
 
 Instead, Ludic is closer to **classical RL** – specifically policy-gradient methods – where:
 - The LLM is the **policy**.
 - The environment (plus verifiers/judges/parsers) provides **rewards**.
-- “Algorithms” are expressed as **credit assignment** (how you turn rewards into per-step weights) + a **loss** (how you turn weights + tokens into gradients).
+- "Algorithms" are expressed as **credit assignment** (how you turn rewards into per-step weights) + a **loss** (how you turn weights + tokens into gradients).
+
+## Working on Ludic (Judgment Guidelines)
+
+This codebase is research scaffolding, which shapes how to reason about changes:
+
+**When priorities conflict, prefer:**
+1. Not breaking existing experiments or rollouts
+2. Preserving loose coupling and hackability
+3. Clarity over cleverness
+4. Simplicity over handling every edge case (researchers can extend; they can't easily simplify)
+
+**The "seasoned RL researcher" heuristic:**
+When unsure about a response or change, imagine a researcher who cares about clean, modular code but also ships experiments under deadline pressure. Would they find this helpful? Confusing? Overengineered? Incomplete?
+
+**Asking vs. assuming:**
+- If a change touches core types (`types.py`, `env.py`, `base_agent.py`), ask before making structural changes
+- If the request is ambiguous but low-stakes (e.g., which example to look at), make a reasonable choice and mention it
+- If you notice something that seems off but wasn't asked about, point it out but don't fix it unless asked
+
+**Being explicit about uncertainty:**
+If you're uncertain whether a change will interact badly with a subsystem you don't fully understand (FSDP2 integration, vLLM weight pushing, distributed checkpointing), say so explicitly rather than guessing. "I'm not confident this won't break X" is more valuable than silent doubt.
 
 ## Design Intent (Condensed)
+
+**Spirit of the design:**
+Ludic is built to let researchers experiment freely without fighting the framework. If you find yourself writing boilerplate or working around the library, something is wrong—either with the approach or with Ludic itself. The goal is that swapping a component (env, parser, credit assigner, loss) should be trivial and shouldn't require understanding unrelated parts of the codebase.
 
 - **Separate Agent vs Environment**
   - **Environment** = state transition function (+ optional scalar reward) with minimal assumptions; can be multi-agent by default.
   - **Agent** = LLM *with state* (prompt harness + memory + parsing + optional auxiliary tools).
     - auxiliary tools = tools that don't change the state of the environment
-  - Rationale: reuse environments across different “agent harnesses” (memory schemes, parsers, prompts, tools) and reuse harness pieces across environments.
+  - Rationale: reuse environments across different "agent harnesses" (memory schemes, parsers, prompts, tools) and reuse harness pieces across environments.
 
 - **Make the interaction loop explicit**
-  - Neither env nor agent “owns” rollout generation. An **InteractionProtocol** owns the agent<-->env loop and produces rollouts.
+  - Neither env nor agent "owns" rollout generation. An **InteractionProtocol** owns the agent<-->env loop and produces rollouts.
   - This makes rollouts modifiable (single-agent, turn-based, multi-agent, tool-augmented, etc.) without entangling env/agent internals.
 
 - **Decouple inference from training**
@@ -39,7 +58,7 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
 
 - **One Trainer, many algorithms**
   - The Trainer is just an optimization loop.
-  - “Algorithm” = (credit assignment → weights) + (loss on tensors). No `PPOTrainer`/`GRPOTrainer` class explosion.
+  - "Algorithm" = (credit assignment → weights) + (loss on tensors). No `PPOTrainer`/`GRPOTrainer` class explosion.
 
 ## Mental Model: Data Flow
 
@@ -87,7 +106,7 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
   - Utility: `src/ludic/interaction/info.py` provides `merge_step_info()` for safely merging step metadata with collision detection on reserved keys.
 
 - **Rollout execution + collation**: `src/ludic/training/batching/rollout_engine.py`
-  - Stateless “factory floor”: instantiates env + protocol per request, runs episodes concurrently, returns rollouts.
+  - Stateless "factory floor": instantiates env + protocol per request, runs episodes concurrently, returns rollouts.
   - Converts rollouts → `SAWItem`s using either:
     - exact token IDs returned by the inference backend (preferred), or
     - `retokenize=True` with a caller-provided tokenizer.
@@ -123,6 +142,28 @@ Instead, Ludic is closer to **classical RL** – specifically policy-gradient me
   - vLLM utilities: `src/ludic/inference/vllm_utils.py` – `start_vllm_server()`, `wait_for_vllm_health()` for process management.
   - Sampling config: `src/ludic/inference/sampling.py` (`SamplingConfig`, `resolve_sampling_args()`) – fully-resolved sampling parameters with OpenAI mapping.
   - vLLM publisher adapter: `src/ludic/distributed/adapters/vllm.py`
+
+## Reading the Codebase
+
+**Entry points for understanding:**
+- Start with `types.py` for the core data structures
+- Then `envs/env.py` and `agents/base_agent.py` for the two main "actors"
+- Then `interaction/base.py` to see how they connect
+- Then `training/trainer.py` to see how rollouts become gradients
+
+**What to ignore initially:**
+- Distributed/FSDP2 code (unless specifically relevant)
+- vLLM server internals (treat as "inference backend")
+- Pipeline/Redis batching (the sync path is simpler)
+
+**Where complexity lives:**
+- Truncation semantics (see CONSIDERATIONS.md)
+- Multi-agent protocols and trace collection
+- FSDP2 + checkpointing interactions
+- Tool call handling in ReActAgent (known limitation documented in CONSIDERATIONS.md)
+
+**Using subagents for exploration:**
+Spawning subagents to explore the codebase is heavily endorsed. This is especially effective when different subagents are instructed to examine the repo at different layers of abstraction—e.g., one subagent reads core types and interfaces, another looks at concrete implementations, another examines examples. This parallelizes understanding and surfaces connections that sequential reading might miss.
 
 ## GRPO in Ludic (Sampling Strategy + Credit Assignment)
 
@@ -204,10 +245,22 @@ See `CONSIDERATIONS.md` for the canonical definitions and what gets propagated i
 
 Some older scripts in `examples/` may be stale (imports/layout changed); prefer the README-backed examples above as the "current" patterns.
 
-## Guidance on Isambard AI HPC
-Running scripts on Isambard AI HPC (docs.isambard.ac.uk) requires a certain degree of carefulness: you will be running on the **login node**, which means that you can set up your environment, but you cannot run any heavy computations there. You will need to use **Slurm** to request resources and run your jobs. You can either:
-1. allocate short, interactive CPU jobs for debugging and development (e.g., inspecting data from an huggingface dataset), while compilation and such things can be easily done on the login node itself.
-2. allocate GPU jobs for training and evaluation. For this, you will need to use the **sbatch** command to submit a job script to the scheduler. As a reference sbatch file for this purpose, see `/examples/code_exec/train_apps_isambard.slurm`. **ALWAYS** be mindful of requesting more than 2 GPUs. You will not be granted free permission to run scripts as you prefer. For launching bash commands, prepend your commands with `!`. For example, `!sbatch /examples/code_exec/train_apps_isambard.slurm`.
+**When encountering potentially stale code:**
+- Don't assume it's wrong; it may work but use older patterns
+- If asked to modify stale code, mention the staleness and ask whether to modernize or preserve compatibility
+- The README-backed examples represent current idioms; use them as reference for style and structure
+
+## Hard Constraints (Non-Negotiables)
+
+Some properties should be preserved regardless of what seems locally reasonable:
+
+- **Env/agent separation**: Environments must remain parser-agnostic. Parsers live in agents, not envs.
+- **Protocol owns the loop**: Neither env nor agent should "own" rollout generation. If you're tempted to put loop logic in an env or agent, reconsider.
+- **`Step` and `Rollout` are the canonical trajectory types**: Don't introduce parallel trajectory representations. Extend these if needed.
+- **Training doesn't block on rollout latency**: The `BatchSource` abstraction exists to maintain this. Don't couple the trainer directly to rollout execution.
+- **Truncation semantics are precise**: `terminated`, `truncated`, and `finish_reason` mean specific things (see CONSIDERATIONS.md). Don't conflate them.
+
+If a task seems to require violating one of these, flag it—either the task needs rethinking or the constraint needs revisiting.
 
 ## Extending Ludic (Practical Checklist)
 
@@ -215,7 +268,14 @@ Running scripts on Isambard AI HPC (docs.isambard.ac.uk) requires a certain degr
   - Implement an env (`SingleAgentEnv` is the easiest path).
   - Decide on output contract and implement a `Parser` (or compose existing ones).
   - Choose a `ContextStrategy` (or write one).
-  - Pick/write an `InteractionProtocol` if the default loops aren’t enough.
+  - Pick/write an `InteractionProtocol` if the default loops aren't enough.
   - Register env + protocol factories with a `RolloutEngine`.
   - Choose `BatchSource` (sync for debugging; pipeline for throughput).
   - Choose `CreditAssigner` + `Loss` (assemble an `RLAlgorithm`).
+
+**Code style notes:**
+- Type hints are expected; use them consistently
+- Prefer explicit over implicit (e.g., pass `group_size` explicitly rather than inferring from batch structure)
+- Docstrings for public APIs; comments for non-obvious internal logic
+- If you're adding a new abstraction, explain *why* it exists, not just *what* it does
+- Err toward making things configurable via dataclasses/configs rather than hardcoding
