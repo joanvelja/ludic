@@ -32,6 +32,23 @@ data/
 .env.*
 .DS_Store
 
+# Coverage
+.coverage
+htmlcov/
+
+# Outputs
+outputs/
+
+# Claude tooling
+.claude/commands/
+.handoffs/
+
+# Planning/design docs (temporary)
+HANDOFF.md
+SNEAKY_PLAN.md
+SIMILARITTY_META.md
+SIMILARITY-APPROACHES.md
+
 # Hiding
 RM_PLAN.md
 .bottleneck-analysis-rm-overall/
