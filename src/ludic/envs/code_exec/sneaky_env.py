@@ -144,8 +144,17 @@ class SneakyCodeExecEnv(SingleAgentEnv):
             Tuple of (prompt, info) containing problem description
         """
         obs, info = await self._inner_env.env_reset(seed=seed)
-        self._current_obs = obs
         self._tests_hash = info.get("tests_hash")
+
+        # Add honest solution reference if sequential observation is enabled
+        if self._sneaky_config.sequential_observation:
+            reference_block = self._sneaky_config.reference_block_template.format(
+                honest_code=self._honest_code
+            )
+            obs = obs + reference_block
+
+        # Update stored observation
+        self._current_obs = obs
 
         # Add sneaky-specific info
         info["sneaky_enabled"] = self._sneaky_config.enabled

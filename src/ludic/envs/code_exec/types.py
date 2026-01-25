@@ -336,3 +336,18 @@ class SneakyConfig:
     compute_similarity: bool = True
     certificate_max_length: int = 10000
     certificate_timeout_s: float = 5.0
+
+    # Sequential observation mode (PVG)
+    sequential_observation: bool = False  # If True, include honest solution in prompt
+    reference_block_template: str = (
+        "\n\n## Reference Solution (for comparison)\n```python\n{honest_code}\n```\n"
+    )
+
+    def __post_init__(self) -> None:
+        """Validate configuration consistency."""
+        if self.sequential_observation:
+            if "{honest_code}" not in self.reference_block_template:
+                raise ValueError(
+                    "reference_block_template must contain {honest_code} placeholder "
+                    "when sequential_observation=True"
+                )

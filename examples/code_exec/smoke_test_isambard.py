@@ -573,9 +573,9 @@ async def test_training_step(minimal_config: bool = True) -> bool:
         # Create trainer
         trainer_config = TrainerConfig(
             model_device="cpu",
-            grad_accum_steps=1,
             max_grad_norm=1.0,
             pad_token_id=0,  # dummy pad token ID
+            micro_token_budget=1024,  # Small budget for smoke test
         )
 
         # Mock publisher (no-op)

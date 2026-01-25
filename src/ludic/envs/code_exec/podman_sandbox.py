@@ -856,13 +856,13 @@ class PodmanHPCSandboxPool(BaseSandboxPool[PodmanHPCSandbox]):
 
         # Resolve workspace_base_dir
         if workspace_base_dir == "auto":
-            # Auto-detect: use /local if on HPC, else None
+            # Auto-detect: use user's home directory on HPC if SLURM_JOB_ID is set
             slurm_job_id = os.environ.get("SLURM_JOB_ID")
-            if (
-                slurm_job_id and Path("/home/u5ds/joanv.u5ds").exists()
-            ):  # TODO [joan]: Remove hardcoding
-                self._workspace_base_dir: Optional[str] = (
-                    f"/home/u5ds/joanv.u5ds/sandbox/ludic-{slurm_job_id}"
+            if slurm_job_id:
+                # Use user's home directory for sandbox workspaces
+                user_home = Path.home()
+                self._workspace_base_dir: Optional[str] = str(
+                    user_home / f"sandbox/ludic-{slurm_job_id}"
                 )
             else:
                 self._workspace_base_dir = None
