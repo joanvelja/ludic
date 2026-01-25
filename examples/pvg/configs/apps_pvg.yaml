@@ -1,0 +1,147 @@
+# PVG Training Configuration for APPS Dataset
+#
+# This config implements the Prover-Verifier Game training loop
+# on the APPS dataset for code generation with sneaky behavior detection.
+#
+# Reference: Prover-Verifier Games (arXiv:2407.13692)
+
+# Model Configuration
+verifier_model: "meta-llama/Llama-3.1-8B"
+prover_model: "meta-llama/Llama-3.1-8B"
+
+# Dataset Configuration
+dataset: "apps"
+dataset_subset: "introductory"  # introductory, interview, competition
+max_samples: 5000  # Limit for faster iteration
+
+# Data Split (D_V for verifier, D_π for prover)
+data_split:
+  split_ratio: 0.5  # 50% for verifier training, 50% for prover training
+  split_seed: 42
+  stratify_by: "difficulty"
+
+# Training Configuration
+num_rounds: 5
+
+# Per-Round Configuration
+round_configs:
+  default:
+    verifier_steps: 1000
+    prover_steps: 2000
+    sneaky_incorrect_threshold: 0.85
+    score_parity_threshold: 0.1
+    irm_mode: "vrex"
+    sequential_observation: false  # Will be enabled after round 0
+
+  # Override for specific rounds if needed
+  round_0:
+    verifier_steps: 500  # Less training on bootstrap data
+    prover_steps: 1000
+
+# IRM Regularization
+irm:
+  mode: "vrex"  # vrex, balanced, both, none
+  beta: 1.0  # V-REx penalty coefficient
+  balanced_min_per_env: 16  # Minimum samples per environment in batch
+
+# Reward Strategy for Prover
+reward:
+  strategy: "composite"
+  w_test: 0.5
+  w_cert: 0.25
+  w_sim: 0.0  # Similarity penalty (disabled)
+  w_verifier: 0.25
+  require_certified_for_verifier: true
+
+# Verifier Training
+verifier_training:
+  learning_rate: 5.0e-5  # Higher LR for LoRA
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  warmup_steps: 100
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Bradley-Terry loss config
+  bt_beta: 1.0
+  label_smoothing: 0.05  # Helps with calibration
+  score_regularization: 0.001  # L2 on individual scores
+
+  # LoRA config for Verifier
+  # Rationale: "Is this code correct?" may require multi-step verification,
+  # which is not necessarily pre-computed in hidden states. LoRA elicits
+  # this latent capability with efficient parameter updates.
+  lora:
+    enabled: true
+    rank: 16  # r=16 is a good balance; increase to 32-64 for complex tasks
+    alpha: 32  # Typically 2x rank
+    dropout: 0.0
+    target_modules: "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    use_rslora: true  # Rank-scaled alpha for stable gradients across ranks
+    modules_to_save: null  # Reward head auto-detected and always trainable
+
+# Prover Training
+prover_training:
+  learning_rate: 5.0e-5  # Higher LR for LoRA
+  batch_size: 4
+  gradient_accumulation_steps: 8
+  warmup_steps: 100
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Algorithm: ScaleRL (CISPO + Hybrid normalization)
+  algorithm: "scalerl"
+  clip_eps_high: 0.2
+  group_size: 4  # GRPO group size
+  positive_only: false
+
+  # LoRA config for Prover (Sneaky)
+  # Rationale: Generating sneaky code requires subtle modifications to
+  # coding behavior. Lower rank LoRA enables efficient policy updates
+  # without catastrophic forgetting of base coding capabilities.
+  lora:
+    enabled: true
+    rank: 8  # Lower rank than verifier (policy updates are simpler)
+    alpha: 16
+    dropout: 0.0
+    target_modules: "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    use_rslora: true
+
+# Inference Configuration
+inference:
+  inference_gpu_ids: [0]
+  training_gpu_ids: [1, 2, 3]
+  sync_interval: 1
+  vllm_tensor_parallel: 1
+  max_tokens: 2048
+  temperature: 0.7
+  top_p: 0.95
+
+# Checkpointing
+checkpointing:
+  save_every_n_steps: 500
+  keep_last_n: 3
+  save_optimizer_state: true
+
+# Logging
+logging:
+  log_every_n_steps: 10
+  eval_every_n_steps: 100
+  wandb_project: "pvg-training"
+  wandb_entity: null  # Set via environment variable
+
+# Edge Case Handling
+edge_cases:
+  collapse_threshold: 0.1  # Alert if valid sneaky rate < 10%
+  collapse_recovery:
+    increase_temperature: true
+    fallback_to_sft: true
+    curriculum_easier_problems: true
+
+  goodharting_detection: true
+  goodharting_recovery:
+    increase_irm_beta: true
+    add_environment_diversity: true
+
+# Output
+output_dir: "./outputs/pvg_apps"
