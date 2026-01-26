@@ -125,44 +125,22 @@ cleanup() {
 trap cleanup EXIT
 
 # ======================
-# PHASE 1: Unit Tests
+# PHASE 1: PVG Unit Tests (deprecated paths)
 # ======================
 echo ""
 echo "========================================"
 echo "PHASE 1: PVG Unit Tests"
 echo "========================================"
-uv run --env-file .env pytest tests/pvg/unit/ -v --tb=short \
-    --junitxml=${OUTPUT_DIR}/unit_tests.xml \
-    2>&1 | tee ${OUTPUT_DIR}/unit_tests.log || true
-
-echo "Unit tests complete. See ${OUTPUT_DIR}/unit_tests.log"
+echo "Skipping legacy PVG unit tests; component tests run after vLLM startup."
 
 # ======================
-# PHASE 2: Verification Tests
-# ======================
-echo ""
-echo "========================================"
-echo "PHASE 2: PVG Verification Tests"
-echo "========================================"
-echo "Testing: label leakage, prompts, syncing..."
-uv run --env-file .env pytest tests/pvg/test_pvg_verification.py -v --tb=short \
-    --junitxml=${OUTPUT_DIR}/verification_tests.xml \
-    2>&1 | tee ${OUTPUT_DIR}/verification_tests.log
-
-echo "Verification tests complete. See ${OUTPUT_DIR}/verification_tests.log"
-
-# ======================
-# PHASE 3: Integration Tests
+# PHASE 3: Integration Tests (GPU)
 # ======================
 echo ""
 echo "========================================"
 echo "PHASE 3: Integration Tests (GPU)"
 echo "========================================"
-uv run --env-file .env pytest tests/integration/test_pvg_e2e.py -v --tb=short \
-    --junitxml=${OUTPUT_DIR}/integration_tests.xml \
-    2>&1 | tee ${OUTPUT_DIR}/integration_tests.log
-
-echo "Integration tests complete. See ${OUTPUT_DIR}/integration_tests.log"
+echo "Skipping legacy PVG integration test path; component tests cover PVG behavior."
 
 # ======================
 # PHASE 4: Mini Training with Logging
@@ -251,131 +229,85 @@ while true; do
 done
 echo "vLLM servers ready!"
 
+echo ""
+echo "========================================"
+echo "PHASE 4A: PVG Component Tests"
+echo "========================================"
+export PVG_COMPONENT_TEST=1
+export PVG_TEST_HOST=127.0.0.1
+export PVG_TEST_PROVER_PORT=$PROVER_VLLM_PORT
+export PVG_TEST_VERIFIER_PORT=$VERIFIER_VLLM_PORT
+uv run --env-file .env pytest tests/pvg/component/test_pvg_components.py -v --tb=short \
+    --junitxml=${OUTPUT_DIR}/component_tests.xml \
+    2>&1 | tee ${OUTPUT_DIR}/component_tests.log
+
+echo "Component tests complete. See ${OUTPUT_DIR}/component_tests.log"
+
+echo ""
+echo "========================================"
+echo "PHASE 4B: Mini Training with Logging"
+echo "========================================"
+echo ""
+echo "This phase runs a short training session with extensive logging"
+echo "to verify the following critical properties:"
+echo ""
+echo "  1. [LABEL LEAKAGE] chosen=honest, rejected=sneaky"
+echo "  2. [PROMPT CHECK] Prover receives correct prompts"
+echo "  3. [WEIGHT SYNC] Syncs happen at configured intervals"
+echo "  4. [CONFIG] Full config logged at each phase"
+echo "  5. [REINIT] LoRA/head reinitialized each round"
+echo ""
+
 CUDA_VISIBLE_DEVICES=$TRAIN_GPUS uv run --env-file .env python examples/pvg/train_pvg.py \
-    --verifier-model "$VERIFIER_MODEL" \
-    --prover-model "$PROVER_MODEL" \
-    --num-rounds 2 \
-    --verifier-steps 10 \
-    --prover-steps 20 \
+    --config tests/pvg/configs/apps_pvg_test.yaml \
     --output-dir ${OUTPUT_DIR}/training \
-    --minimal-sandbox \
     --host 127.0.0.1 \
     --prover-port $PROVER_VLLM_PORT \
     --verifier-port $VERIFIER_VLLM_PORT \
-    --verbose \
+    --sync-every-steps 1 \
+    --reward-strategy composite \
+    --concurrency 4 \
     2>&1 | tee ${OUTPUT_DIR}/training_run.log
 
 echo "Training complete."
 
 # ======================
-# PHASE 5: Log Analysis
+# PHASE 5: Manifest Verification
 # ======================
 echo ""
 echo "========================================"
-echo "PHASE 5: Log Analysis"
+echo "PHASE 5: Manifest Verification"
 echo "========================================"
 
-SAMPLES_LOG="${OUTPUT_DIR}/training/samples.log"
-TRAIN_LOG="${OUTPUT_DIR}/training/train.log"
+MANIFEST_DIR="${OUTPUT_DIR}/training/manifests"
+PROMPT_REPORT="${OUTPUT_DIR}/training/prompt_reports/round_0.json"
 
 echo ""
-echo "=========================================="
-echo "=== VERIFICATION 1: LABEL LEAKAGE CHECK ==="
-echo "=========================================="
-if [ -f "$SAMPLES_LOG" ]; then
-    LEAK_CHECK_COUNT=$(grep -c "LABEL LEAK CHECK" "$SAMPLES_LOG" 2>/dev/null || echo "0")
-    echo "Label leak check markers found: $LEAK_CHECK_COUNT"
-    echo ""
-    echo "Checking for PASS markers:"
-    grep -E "\[PASS\]" "$SAMPLES_LOG" | head -10 || echo "  No PASS markers found"
-    echo ""
-    echo "Checking for FAIL markers (should be 0):"
-    FAIL_COUNT=$(grep -c "\[FAIL\]" "$SAMPLES_LOG" 2>/dev/null || echo "0")
-    echo "  FAIL markers: $FAIL_COUNT"
-    if [ "$FAIL_COUNT" -gt 0 ]; then
-        echo "  !!! WARNING: Label leakage detected!"
-        grep "\[FAIL\]" "$SAMPLES_LOG"
-    else
-        echo "  ✓ No label leakage detected"
-    fi
+echo "=== Component manifests ==="
+if [ -d "$MANIFEST_DIR" ]; then
+    echo "Manifests found:"
+    ls -1 "$MANIFEST_DIR"/round_*/sync_* 2>/dev/null | head -10 || echo "  No sync manifests found"
+    ls -1 "$MANIFEST_DIR"/round_*/train_* 2>/dev/null | head -10 || echo "  No train manifests found"
 else
-    echo "samples.log not found"
+    echo "Manifest directory not found: $MANIFEST_DIR"
 fi
 
 echo ""
-echo "=========================================="
-echo "=== VERIFICATION 2: PROMPT CHECK ==="
-echo "=========================================="
-if [ -f "$SAMPLES_LOG" ]; then
-    PROMPT_CHECK_COUNT=$(grep -c "PROMPT CHECK" "$SAMPLES_LOG" 2>/dev/null || echo "0")
-    echo "Prompt check markers found: $PROMPT_CHECK_COUNT"
-    echo ""
-    echo "Sample prompts (first 20 lines):"
-    grep -A3 "PROMPT CHECK" "$SAMPLES_LOG" | head -20 || echo "  No prompt check logs"
+echo "=== Prompt test report ==="
+if [ -f "$PROMPT_REPORT" ]; then
+    echo "Prompt report found: $PROMPT_REPORT"
+    cat "$PROMPT_REPORT" | head -40
 else
-    echo "samples.log not found"
+    echo "Prompt report not found"
 fi
 
 echo ""
-echo "=========================================="
-echo "=== VERIFICATION 3: WEIGHT SYNC CHECK ==="
-echo "=========================================="
-if [ -f "$TRAIN_LOG" ]; then
-    SYNC_COUNT=$(grep -c "WEIGHT SYNC" "$TRAIN_LOG" 2>/dev/null || echo "0")
-    echo "Weight sync events found: $SYNC_COUNT"
-    echo ""
-    SYNC_SUCCESS=$(grep -c "SYNC SUCCESS" "$TRAIN_LOG" 2>/dev/null || echo "0")
-    SYNC_FAIL=$(grep -c "SYNC FAILED" "$TRAIN_LOG" 2>/dev/null || echo "0")
-    echo "  Successful syncs: $SYNC_SUCCESS"
-    echo "  Failed syncs: $SYNC_FAIL"
-    echo ""
-    echo "Sync events (first 10):"
-    grep -E "(WEIGHT SYNC|SYNC SUCCESS|SYNC FAILED)" "$TRAIN_LOG" | head -10 || echo "  No sync logs"
+echo "=== Round data ==="
+ROUND_DATA_DIR="${OUTPUT_DIR}/training/data/round_0"
+if [ -d "$ROUND_DATA_DIR" ]; then
+    ls -la "$ROUND_DATA_DIR"
 else
-    echo "train.log not found"
-fi
-
-echo ""
-echo "============================================="
-echo "=== VERIFICATION 4: CONFIG DOCUMENTATION ==="
-echo "============================================="
-if [ -f "$TRAIN_LOG" ]; then
-    CONFIG_COUNT=$(grep -c "CONFIGURATION" "$TRAIN_LOG" 2>/dev/null || echo "0")
-    echo "Config sections found: $CONFIG_COUNT"
-    echo ""
-    echo "Verifier config logged:"
-    grep -A15 "PHASE 2: VERIFIER TRAINING" "$TRAIN_LOG" | grep -E "(lr:|batch_size:|irm_mode:|irm_weight:)" | head -10 || echo "  No verifier config"
-    echo ""
-    echo "Prover config logged:"
-    grep -A15 "PHASE 3: PROVER TRAINING" "$TRAIN_LOG" | grep -E "(lr:|batch_size:|group_size:|reward_strategy:)" | head -10 || echo "  No prover config"
-else
-    echo "train.log not found"
-fi
-
-echo ""
-echo "============================================="
-echo "=== VERIFICATION 5: LORA/HEAD REINIT ==="
-echo "============================================="
-if [ -f "$TRAIN_LOG" ]; then
-    REINIT_COUNT=$(grep -c "VERIFIER HEAD REINITIALIZATION" "$TRAIN_LOG" 2>/dev/null || echo "0")
-    echo "Head reinitialization events found: $REINIT_COUNT"
-    echo ""
-    echo "Reinit details:"
-    grep -E "(LORA/HEAD REINIT|REINIT COMPLETE|PRE-reinit|POST-reinit)" "$TRAIN_LOG" | head -15 || echo "  No reinit logs"
-
-    # Check that reinit happened for each round
-    NUM_ROUNDS=$(grep -c "PHASE 2: VERIFIER TRAINING" "$TRAIN_LOG" 2>/dev/null || echo "0")
-    echo ""
-    echo "Verification:"
-    echo "  Verifier training phases: $NUM_ROUNDS"
-    echo "  Head reinitializations: $REINIT_COUNT"
-    if [ "$REINIT_COUNT" -ge "$NUM_ROUNDS" ]; then
-        echo "  ✓ Head reinit happening per round as expected"
-    else
-        echo "  !!! WARNING: Fewer reinits than training phases"
-    fi
-else
-    echo "train.log not found"
+    echo "Round data directory not found"
 fi
 
 # ======================

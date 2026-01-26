@@ -66,10 +66,14 @@ DATASET="${DATASET:-apps}"
 LIMIT="${LIMIT:-500}"
 SPLIT_RATIO="${SPLIT_RATIO:-0.5}"
 
+# Componentized config
+CONFIG_PATH="${CONFIG_PATH:-examples/pvg/configs/apps_pvg.yaml}"
+
 # Training rounds
 NUM_ROUNDS="${NUM_ROUNDS:-5}"
 VERIFIER_STEPS="${VERIFIER_STEPS:-500}"
 PROVER_STEPS="${PROVER_STEPS:-1000}"
+SYNC_EVERY_STEPS="${SYNC_EVERY_STEPS:-1}"
 
 # Batch sizing (based on empirical memory measurements)
 # ======================================================
@@ -341,25 +345,16 @@ echo "========================================"
 OUTPUT_DIR="${LOG_DIR}/output"
 mkdir -p "$OUTPUT_DIR"
 
-# Build command
+# Build command (componentized runner)
 TRAIN_CMD="uv run --env-file .env python examples/pvg/train_pvg.py"
-TRAIN_CMD="$TRAIN_CMD --verifier-model $VERIFIER_MODEL"
-TRAIN_CMD="$TRAIN_CMD --prover-model $PROVER_MODEL"
-TRAIN_CMD="$TRAIN_CMD --dataset $DATASET"
-TRAIN_CMD="$TRAIN_CMD --split-ratio $SPLIT_RATIO"
-TRAIN_CMD="$TRAIN_CMD --num-rounds $NUM_ROUNDS"
-TRAIN_CMD="$TRAIN_CMD --verifier-steps $VERIFIER_STEPS"
-TRAIN_CMD="$TRAIN_CMD --prover-steps $PROVER_STEPS"
-TRAIN_CMD="$TRAIN_CMD --irm-mode $IRM_MODE"
-TRAIN_CMD="$TRAIN_CMD --irm-beta $IRM_BETA"
-TRAIN_CMD="$TRAIN_CMD --reward-strategy $REWARD_STRATEGY"
-TRAIN_CMD="$TRAIN_CMD --sneaky-incorrect-threshold $SNEAKY_THRESHOLD"
-TRAIN_CMD="$TRAIN_CMD --score-parity-threshold $SCORE_PARITY"
+TRAIN_CMD="$TRAIN_CMD --config $CONFIG_PATH"
 TRAIN_CMD="$TRAIN_CMD --output-dir $OUTPUT_DIR"
 TRAIN_CMD="$TRAIN_CMD --host 127.0.0.1"
 TRAIN_CMD="$TRAIN_CMD --prover-port $PROVER_VLLM_PORT"
 TRAIN_CMD="$TRAIN_CMD --verifier-port $VERIFIER_VLLM_PORT"
-TRAIN_CMD="$TRAIN_CMD --verbose"
+TRAIN_CMD="$TRAIN_CMD --sync-every-steps $SYNC_EVERY_STEPS"
+TRAIN_CMD="$TRAIN_CMD --reward-strategy $REWARD_STRATEGY"
+TRAIN_CMD="$TRAIN_CMD --concurrency $CONCURRENCY"
 
 # Add WandB configuration when enabled
 if [ "$USE_WANDB" = "1" ]; then
@@ -369,16 +364,7 @@ if [ "$USE_WANDB" = "1" ]; then
 fi
 
 # Add LoRA arguments if enabled
-if [ "$USE_LORA" = "1" ]; then
-    TRAIN_CMD="$TRAIN_CMD --verifier-lora --verifier-lora-rank $VERIFIER_LORA_RANK"
-    TRAIN_CMD="$TRAIN_CMD --verifier-lora-alpha $((VERIFIER_LORA_RANK * LORA_ALPHA_MULT))"
-    TRAIN_CMD="$TRAIN_CMD --prover-lora --prover-lora-rank $PROVER_LORA_RANK"
-    TRAIN_CMD="$TRAIN_CMD --prover-lora-alpha $((PROVER_LORA_RANK * LORA_ALPHA_MULT))"
-    TRAIN_CMD="$TRAIN_CMD --lora-target-modules $LORA_TARGET_MODULES"
-    if [ "$USE_RSLORA" = "1" ]; then
-        TRAIN_CMD="$TRAIN_CMD --use-rslora"
-    fi
-fi
+# LoRA flags are controlled by config in componentized runner
 
 echo "Command: $TRAIN_CMD"
 echo ""

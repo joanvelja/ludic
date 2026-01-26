@@ -57,34 +57,126 @@ export HF_HUB_CACHE="${HF_HOME}/hub"
 mkdir -p "$HF_HOME"
 echo "HF cache: $HF_HOME"
 
-# Phase 1: PVG Unit Tests
-echo ""
-echo "========================================"
-echo "Phase 1: PVG Unit Tests"
-echo "========================================"
-uv run --env-file .env pytest tests/pvg/unit/ -v --tb=short 2>&1 || true
-# Don't fail on unit tests (sandbox errors expected on some envs)
+# Sandbox backend (podman-hpc for HPC)
+export LUDIC_SANDBOX_BACKEND="podman-hpc"
 
-# Phase 2: PVG Integration Tests with GPU
-echo ""
-echo "========================================"
-echo "Phase 2: PVG Integration Tests (GPU)"
-echo "========================================"
-uv run --env-file .env pytest tests/integration/test_pvg_e2e.py -v --tb=short
+# Cleanup function
+cleanup() {
+    echo ""
+    echo "Cleaning up..."
+    if [ -n "$PROVER_VLLM_PID" ] && kill -0 $PROVER_VLLM_PID 2>/dev/null; then
+        echo "  Stopping prover vLLM (PID: $PROVER_VLLM_PID)..."
+        kill $PROVER_VLLM_PID 2>/dev/null || true
+        wait $PROVER_VLLM_PID 2>/dev/null || true
+    fi
+    if [ -n "$VERIFIER_VLLM_PID" ] && kill -0 $VERIFIER_VLLM_PID 2>/dev/null; then
+        echo "  Stopping verifier vLLM (PID: $VERIFIER_VLLM_PID)..."
+        kill $VERIFIER_VLLM_PID 2>/dev/null || true
+        wait $VERIFIER_VLLM_PID 2>/dev/null || true
+    fi
+    echo "Cleanup complete."
+}
+trap cleanup EXIT
 
-# Phase 3: Dry-run training to verify full pipeline
+# Phase 1: PVG Component Tests (requires vLLM)
 echo ""
 echo "========================================"
-echo "Phase 3: PVG Training Dry Run"
+echo "Phase 1: PVG Component Tests"
 echo "========================================"
 OUTPUT_DIR="outputs/pvg_test_${SLURM_JOB_ID}"
 mkdir -p "$OUTPUT_DIR"
 
-uv run --env-file .env python examples/pvg/train_pvg.py \
-    --dry-run \
-    --mock-inference \
+# Use Qwen3-4B (non-gated) for testing
+VERIFIER_MODEL="Qwen/Qwen3-4B"
+PROVER_MODEL="Qwen/Qwen3-4B"
+
+VLLM_GPU=0
+TRAIN_GPUS="1,2,3"
+PROVER_VLLM_PORT="${PROVER_VLLM_PORT:-8000}"
+VERIFIER_VLLM_PORT="${VERIFIER_VLLM_PORT:-8001}"
+PROVER_VLLM_GPU_MEMORY="${PROVER_VLLM_GPU_MEMORY:-0.77}"
+VERIFIER_VLLM_GPU_MEMORY="${VERIFIER_VLLM_GPU_MEMORY:-0.18}"
+
+echo "Starting vLLM servers for PVG component tests..."
+PROVER_VLLM_LOG="${OUTPUT_DIR}/vllm_prover.log"
+VERIFIER_VLLM_LOG="${OUTPUT_DIR}/vllm_verifier.log"
+
+CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_server \
+    --model "$PROVER_MODEL" \
+    --port $PROVER_VLLM_PORT \
+    --trust-remote-code \
+    --gpu-memory-utilization $PROVER_VLLM_GPU_MEMORY \
+    > "$PROVER_VLLM_LOG" 2>&1 &
+PROVER_VLLM_PID=$!
+
+CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_reward_server \
+    --model "$VERIFIER_MODEL" \
+    --port $VERIFIER_VLLM_PORT \
+    --trust-remote-code \
+    --gpu-memory-utilization $VERIFIER_VLLM_GPU_MEMORY \
+    > "$VERIFIER_VLLM_LOG" 2>&1 &
+VERIFIER_VLLM_PID=$!
+
+echo "Waiting for vLLM servers to be ready..."
+MAX_WAIT=300
+WAITED=0
+while true; do
+    PROVER_READY=0
+    VERIFIER_READY=0
+    if curl -s "http://127.0.0.1:$PROVER_VLLM_PORT/health" > /dev/null 2>&1; then
+        PROVER_READY=1
+    fi
+    if curl -s "http://127.0.0.1:$VERIFIER_VLLM_PORT/health" > /dev/null 2>&1; then
+        VERIFIER_READY=1
+    fi
+    if [ $PROVER_READY -eq 1 ] && [ $VERIFIER_READY -eq 1 ]; then
+        break
+    fi
+    if ! kill -0 $PROVER_VLLM_PID 2>/dev/null; then
+        echo "ERROR: Prover vLLM died. Check $PROVER_VLLM_LOG"
+        tail -50 "$PROVER_VLLM_LOG"
+        exit 1
+    fi
+    if ! kill -0 $VERIFIER_VLLM_PID 2>/dev/null; then
+        echo "ERROR: Verifier vLLM died. Check $VERIFIER_VLLM_LOG"
+        tail -50 "$VERIFIER_VLLM_LOG"
+        exit 1
+    fi
+    if [ $WAITED -ge $MAX_WAIT ]; then
+        echo "ERROR: vLLM timeout"
+        kill $PROVER_VLLM_PID 2>/dev/null || true
+        kill $VERIFIER_VLLM_PID 2>/dev/null || true
+        exit 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
+done
+echo "vLLM servers ready!"
+
+export PVG_COMPONENT_TEST=1
+export PVG_TEST_HOST=127.0.0.1
+export PVG_TEST_PROVER_PORT=$PROVER_VLLM_PORT
+export PVG_TEST_VERIFIER_PORT=$VERIFIER_VLLM_PORT
+
+uv run --env-file .env pytest tests/pvg/component/test_pvg_components.py -v --tb=short \
+    --junitxml=${OUTPUT_DIR}/component_tests.xml \
+    2>&1 | tee ${OUTPUT_DIR}/component_tests.log
+
+# Phase 2: Componentized training run (single round)
+echo ""
+echo "========================================"
+echo "Phase 2: PVG Training Run"
+echo "========================================"
+
+CUDA_VISIBLE_DEVICES=$TRAIN_GPUS uv run --env-file .env python examples/pvg/train_pvg.py \
+    --config tests/pvg/configs/apps_pvg_test.yaml \
     --output-dir "$OUTPUT_DIR" \
-    --verbose
+    --host 127.0.0.1 \
+    --prover-port $PROVER_VLLM_PORT \
+    --verifier-port $VERIFIER_VLLM_PORT \
+    --sync-every-steps 1 \
+    --reward-strategy composite \
+    --concurrency 4
 
 # Show generated logs
 echo ""

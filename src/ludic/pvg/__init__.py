@@ -84,6 +84,23 @@ from ludic.pvg.verifier_trainer import (
     reinitialize_verifier_head,
     train_verifier_phase,
 )
+from ludic.pvg.manifest import (
+    ComponentManifest,
+    build_manifest_path,
+    compute_config_hash,
+    read_manifest,
+    write_manifest,
+)
+from ludic.pvg.components import (
+    run_bootstrap,
+    run_mint,
+    run_train_verifier,
+    run_sync_verifier,
+    run_train_prover,
+    run_sync_prover,
+    run_prompt_test,
+    run_metrics_checkpoint,
+)
 
 __all__ = [
     # Algorithm
@@ -158,4 +175,19 @@ __all__ = [
     "VerifierTrainingConfig",
     "reinitialize_verifier_head",
     "train_verifier_phase",
+    # Manifests
+    "ComponentManifest",
+    "build_manifest_path",
+    "compute_config_hash",
+    "read_manifest",
+    "write_manifest",
+    # Components
+    "run_bootstrap",
+    "run_mint",
+    "run_train_verifier",
+    "run_sync_verifier",
+    "run_train_prover",
+    "run_sync_prover",
+    "run_prompt_test",
+    "run_metrics_checkpoint",
 ]

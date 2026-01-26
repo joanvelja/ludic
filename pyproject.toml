@@ -63,6 +63,7 @@ markers = [
     "integration: marks tests as integration tests",
     "gpu: marks tests as needing a GPU",
     "diagnostic: marks tests that primarily emit diagnostic reports rather than asserting strict correctness",
+    "pvg_component: marks PVG component tests that require live services",
 ]
 testpaths = ["tests"]
 

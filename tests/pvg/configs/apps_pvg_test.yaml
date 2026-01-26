@@ -1,0 +1,23 @@
+verifier_model: "Qwen/Qwen3-4B"
+prover_model: "Qwen/Qwen3-4B"
+
+# Dataset
+dataset: "apps"
+num_rounds: 1
+max_samples: 8
+dataset_subset: "introductory"
+
+data_split:
+  split_ratio: 0.5
+  split_seed: 42
+
+round_configs:
+  default:
+    verifier_steps: 2
+    prover_steps: 2
+    sneaky_incorrect_threshold: 0.95
+    score_parity_threshold: 0.1
+    irm_mode: "vrex"
+    sequential_observation: false
+
+output_dir: "./outputs/pvg_component_test"
