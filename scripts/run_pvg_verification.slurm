@@ -107,6 +107,16 @@ echo "  Image ready"
 cleanup() {
     echo ""
     echo "Cleaning up..."
+    if [ -n "$PROVER_VLLM_PID" ] && kill -0 $PROVER_VLLM_PID 2>/dev/null; then
+        echo "  Stopping prover vLLM (PID: $PROVER_VLLM_PID)..."
+        kill $PROVER_VLLM_PID 2>/dev/null || true
+        wait $PROVER_VLLM_PID 2>/dev/null || true
+    fi
+    if [ -n "$VERIFIER_VLLM_PID" ] && kill -0 $VERIFIER_VLLM_PID 2>/dev/null; then
+        echo "  Stopping verifier vLLM (PID: $VERIFIER_VLLM_PID)..."
+        kill $VERIFIER_VLLM_PID 2>/dev/null || true
+        wait $VERIFIER_VLLM_PID 2>/dev/null || true
+    fi
     # Clean up any ludic sandbox containers
     echo "  Cleaning up sandbox containers..."
     podman-hpc ps -aq --filter "name=ludic-sandbox" 2>/dev/null | xargs -r podman-hpc rm -f 2>/dev/null || true
@@ -176,7 +186,72 @@ echo ""
 VERIFIER_MODEL="Qwen/Qwen3-4B"
 PROVER_MODEL="Qwen/Qwen3-4B"
 
-uv run --env-file .env python examples/pvg/train_pvg.py \
+# vLLM server config (prover + verifier reward)
+VLLM_GPU=0
+TRAIN_GPUS="1,2,3"
+PROVER_VLLM_PORT="${PROVER_VLLM_PORT:-8000}"
+VERIFIER_VLLM_PORT="${VERIFIER_VLLM_PORT:-8001}"
+PROVER_VLLM_GPU_MEMORY="${PROVER_VLLM_GPU_MEMORY:-0.77}"
+VERIFIER_VLLM_GPU_MEMORY="${VERIFIER_VLLM_GPU_MEMORY:-0.18}"
+
+echo ""
+echo "Starting vLLM servers for PVG training..."
+PROVER_VLLM_LOG="${OUTPUT_DIR}/vllm_prover.log"
+VERIFIER_VLLM_LOG="${OUTPUT_DIR}/vllm_verifier.log"
+
+CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_server \
+    --model "$PROVER_MODEL" \
+    --port $PROVER_VLLM_PORT \
+    --trust-remote-code \
+    --gpu-memory-utilization $PROVER_VLLM_GPU_MEMORY \
+    > "$PROVER_VLLM_LOG" 2>&1 &
+PROVER_VLLM_PID=$!
+
+CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_reward_server \
+    --model "$VERIFIER_MODEL" \
+    --port $VERIFIER_VLLM_PORT \
+    --trust-remote-code \
+    --gpu-memory-utilization $VERIFIER_VLLM_GPU_MEMORY \
+    > "$VERIFIER_VLLM_LOG" 2>&1 &
+VERIFIER_VLLM_PID=$!
+
+echo "Waiting for vLLM servers to be ready..."
+MAX_WAIT=300
+WAITED=0
+while true; do
+    PROVER_READY=0
+    VERIFIER_READY=0
+    if curl -s "http://127.0.0.1:$PROVER_VLLM_PORT/health" > /dev/null 2>&1; then
+        PROVER_READY=1
+    fi
+    if curl -s "http://127.0.0.1:$VERIFIER_VLLM_PORT/health" > /dev/null 2>&1; then
+        VERIFIER_READY=1
+    fi
+    if [ $PROVER_READY -eq 1 ] && [ $VERIFIER_READY -eq 1 ]; then
+        break
+    fi
+    if ! kill -0 $PROVER_VLLM_PID 2>/dev/null; then
+        echo "ERROR: Prover vLLM died. Check $PROVER_VLLM_LOG"
+        tail -50 "$PROVER_VLLM_LOG"
+        exit 1
+    fi
+    if ! kill -0 $VERIFIER_VLLM_PID 2>/dev/null; then
+        echo "ERROR: Verifier vLLM died. Check $VERIFIER_VLLM_LOG"
+        tail -50 "$VERIFIER_VLLM_LOG"
+        exit 1
+    fi
+    if [ $WAITED -ge $MAX_WAIT ]; then
+        echo "ERROR: vLLM timeout"
+        kill $PROVER_VLLM_PID 2>/dev/null || true
+        kill $VERIFIER_VLLM_PID 2>/dev/null || true
+        exit 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
+done
+echo "vLLM servers ready!"
+
+CUDA_VISIBLE_DEVICES=$TRAIN_GPUS uv run --env-file .env python examples/pvg/train_pvg.py \
     --verifier-model "$VERIFIER_MODEL" \
     --prover-model "$PROVER_MODEL" \
     --num-rounds 2 \
@@ -184,6 +259,9 @@ uv run --env-file .env python examples/pvg/train_pvg.py \
     --prover-steps 20 \
     --output-dir ${OUTPUT_DIR}/training \
     --minimal-sandbox \
+    --host 127.0.0.1 \
+    --prover-port $PROVER_VLLM_PORT \
+    --verifier-port $VERIFIER_VLLM_PORT \
     --verbose \
     2>&1 | tee ${OUTPUT_DIR}/training_run.log
 

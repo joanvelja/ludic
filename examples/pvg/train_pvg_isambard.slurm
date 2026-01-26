@@ -11,7 +11,7 @@
 # =============================================================================
 #
 # This script runs multi-round PVG training:
-#   - GPU 0: vLLM server (prover inference + verifier scoring)
+#   - GPU 0: vLLM servers (prover + verifier) sharing GPU memory
 #   - GPU 1-3: FSDP training (prover policy gradient)
 #
 # The training loop alternates between:
@@ -135,7 +135,10 @@ LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_pro
 # Execution
 SANDBOX_WORKERS="${SANDBOX_WORKERS:-32}"
 CONCURRENCY="${CONCURRENCY:-32}"
-VLLM_PORT="${VLLM_PORT:-8000}"
+PROVER_VLLM_PORT="${PROVER_VLLM_PORT:-8000}"
+VERIFIER_VLLM_PORT="${VERIFIER_VLLM_PORT:-8001}"
+PROVER_VLLM_GPU_MEMORY="${PROVER_VLLM_GPU_MEMORY:-0.77}"
+VERIFIER_VLLM_GPU_MEMORY="${VERIFIER_VLLM_GPU_MEMORY:-0.18}"
 
 # Logging
 USE_WANDB="${USE_WANDB:-1}"
@@ -245,53 +248,84 @@ export NPROC_PER_NODE=3  # For torchrun
 
 echo ""
 echo "GPU assignment:"
-echo "  GPU $VLLM_GPU: vLLM inference server (prover + verifier)"
+echo "  GPU $VLLM_GPU: vLLM servers (prover + verifier)"
 echo "  GPU $TRAIN_GPUS: FSDP training ($NPROC_PER_NODE processes)"
 
 # =============================================================================
-# Start vLLM server
+# Start vLLM servers
 # =============================================================================
 echo ""
 echo "========================================"
-echo "Starting vLLM server..."
+echo "Starting vLLM servers..."
 echo "========================================"
 
-VLLM_LOG="${LOG_DIR}/vllm.log"
+PROVER_VLLM_LOG="${LOG_DIR}/vllm_prover.log"
+VERIFIER_VLLM_LOG="${LOG_DIR}/vllm_verifier.log"
 
 CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_server \
     --model "$PROVER_MODEL" \
-    --port $VLLM_PORT \
+    --port $PROVER_VLLM_PORT \
     --trust-remote-code \
     --max-model-len $MAX_SEQ_LEN \
-    > "$VLLM_LOG" 2>&1 &
+    --gpu-memory-utilization $PROVER_VLLM_GPU_MEMORY \
+    > "$PROVER_VLLM_LOG" 2>&1 &
 
-VLLM_PID=$!
-echo "vLLM server started (PID: $VLLM_PID)"
+PROVER_VLLM_PID=$!
+echo "Prover vLLM server started (PID: $PROVER_VLLM_PID)"
+
+CUDA_VISIBLE_DEVICES=$VLLM_GPU uv run --env-file .env python -m ludic.inference.vllm_reward_server \
+    --model "$VERIFIER_MODEL" \
+    --port $VERIFIER_VLLM_PORT \
+    --trust-remote-code \
+    --max-model-len $MAX_SEQ_LEN \
+    --gpu-memory-utilization $VERIFIER_VLLM_GPU_MEMORY \
+    > "$VERIFIER_VLLM_LOG" 2>&1 &
+
+VERIFIER_VLLM_PID=$!
+echo "Verifier vLLM server started (PID: $VERIFIER_VLLM_PID)"
 
 # Wait for vLLM
-echo "Waiting for vLLM server..."
+echo "Waiting for vLLM servers..."
 MAX_WAIT=300
 WAITED=0
-while ! curl -s "http://127.0.0.1:$VLLM_PORT/health" > /dev/null 2>&1; do
-    if ! kill -0 $VLLM_PID 2>/dev/null; then
-        echo "ERROR: vLLM died. Check $VLLM_LOG"
-        tail -50 "$VLLM_LOG"
+while true; do
+    PROVER_READY=0
+    VERIFIER_READY=0
+    if curl -s "http://127.0.0.1:$PROVER_VLLM_PORT/health" > /dev/null 2>&1; then
+        PROVER_READY=1
+    fi
+    if curl -s "http://127.0.0.1:$VERIFIER_VLLM_PORT/health" > /dev/null 2>&1; then
+        VERIFIER_READY=1
+    fi
+    if [ $PROVER_READY -eq 1 ] && [ $VERIFIER_READY -eq 1 ]; then
+        break
+    fi
+    if ! kill -0 $PROVER_VLLM_PID 2>/dev/null; then
+        echo "ERROR: Prover vLLM died. Check $PROVER_VLLM_LOG"
+        tail -50 "$PROVER_VLLM_LOG"
+        exit 1
+    fi
+    if ! kill -0 $VERIFIER_VLLM_PID 2>/dev/null; then
+        echo "ERROR: Verifier vLLM died. Check $VERIFIER_VLLM_LOG"
+        tail -50 "$VERIFIER_VLLM_LOG"
         exit 1
     fi
     if [ $WAITED -ge $MAX_WAIT ]; then
         echo "ERROR: vLLM timeout"
-        kill $VLLM_PID 2>/dev/null || true
+        kill $PROVER_VLLM_PID 2>/dev/null || true
+        kill $VERIFIER_VLLM_PID 2>/dev/null || true
         exit 1
     fi
     sleep 5
     WAITED=$((WAITED + 5))
 done
-echo "vLLM server ready!"
+echo "vLLM servers ready!"
 
 # Cleanup trap
 cleanup() {
     echo "Cleaning up..."
-    [ -n "$VLLM_PID" ] && kill $VLLM_PID 2>/dev/null || true
+    [ -n "$PROVER_VLLM_PID" ] && kill $PROVER_VLLM_PID 2>/dev/null || true
+    [ -n "$VERIFIER_VLLM_PID" ] && kill $VERIFIER_VLLM_PID 2>/dev/null || true
     [ -n "$SLURM_JOB_ID" ] && podman-hpc ps -aq --filter "name=ludic-sandbox-${SLURM_JOB_ID}" 2>/dev/null | xargs -r podman-hpc rm -f 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -323,7 +357,8 @@ TRAIN_CMD="$TRAIN_CMD --sneaky-incorrect-threshold $SNEAKY_THRESHOLD"
 TRAIN_CMD="$TRAIN_CMD --score-parity-threshold $SCORE_PARITY"
 TRAIN_CMD="$TRAIN_CMD --output-dir $OUTPUT_DIR"
 TRAIN_CMD="$TRAIN_CMD --host 127.0.0.1"
-TRAIN_CMD="$TRAIN_CMD --port $VLLM_PORT"
+TRAIN_CMD="$TRAIN_CMD --prover-port $PROVER_VLLM_PORT"
+TRAIN_CMD="$TRAIN_CMD --verifier-port $VERIFIER_VLLM_PORT"
 TRAIN_CMD="$TRAIN_CMD --verbose"
 
 # Add WandB configuration when enabled
