@@ -368,14 +368,8 @@ class RoundDataStore:
     ) -> Iterator[PreferencePair]:
         """Get a weighted mixture of pairs from multiple rounds.
 
-        Args:
-            weights: Mapping from round_id to sampling weight. Rounds with weight=0
-                    are excluded from the mixture.
-            n_samples: Number of samples to return, or None for proportional yield
-                      of all pairs according to weights
-
-        Yields:
-            PreferencePair objects sampled according to weights
+        NOTE: This is an eager (in-memory) implementation and may be expensive.
+        Prefer load_pairs_with_strategy(..., n_samples=None) for streaming.
         """
         if not weights:
             return
@@ -402,34 +396,26 @@ class RoundDataStore:
 
         if n_samples is None:
             # Proportional yield: each round contributes pairs proportionally
-            # Calculate how many pairs to yield from each round
             total_pairs = sum(len(pairs) for pairs in round_pairs.values())
 
             for round_id, pairs in round_pairs.items():
                 weight = active_weights.get(round_id, 0)
                 proportion = weight / total_weight
-
-                # Calculate target count based on proportion of total pairs
                 target_count = int(proportion * total_pairs)
 
-                # Yield up to target_count pairs (repeat if needed, or subsample)
                 if target_count <= len(pairs):
-                    # Subsample: randomly select target_count pairs
                     selected = random.sample(pairs, target_count) if target_count > 0 else []
                     for pair in selected:
                         yield pair
                 else:
-                    # Need to repeat some pairs to reach target count
                     for pair in pairs:
                         yield pair
-                    # Fill remainder with random repeats
                     remaining = target_count - len(pairs)
                     for _ in range(remaining):
                         yield random.choice(pairs)
         else:
-            # Sample n_samples according to weights
+            # Sample n_samples according to weights (with replacement)
             for _ in range(n_samples):
-                # Choose round according to weights
                 r = random.random() * total_weight
                 cumulative = 0.0
                 chosen_round = list(round_pairs.keys())[0]
@@ -438,8 +424,6 @@ class RoundDataStore:
                     if r < cumulative:
                         chosen_round = round_id
                         break
-
-                # Choose random pair from chosen round
                 pairs = round_pairs[chosen_round]
                 yield random.choice(pairs)
 
@@ -448,16 +432,18 @@ class RoundDataStore:
         current_round: int,
         strategy: MixtureStrategy,
         n_samples: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> Iterator[Tuple[PreferencePair, float]]:
-        """Load pairs using a mixture strategy.
+        """Load pairs using a mixture strategy (streaming when possible).
 
-        Convenience method that computes weights from a MixtureStrategy
-        and yields (pair, weight) tuples.
+        This is the preferred loader for verifier training. When n_samples is None,
+        pairs are streamed round-by-round without materializing all pairs in RAM.
 
         Args:
             current_round: Current round (0-indexed)
             strategy: MixtureStrategy to compute weights
-            n_samples: Number of samples to yield, or None for all
+            n_samples: Number of samples to yield, or None for all pairs
+            seed: Optional random seed for sampling
 
         Yields:
             (PreferencePair, weight) tuples
@@ -468,22 +454,76 @@ class RoundDataStore:
             current_round=current_round,
         )
 
-        # Convert to dict
-        weights_dict = {i: w for i, w in enumerate(weights_list)}
-
-        # Normalize weights
         total = sum(weights_list)
         if total <= 0:
             return
 
-        normalized = {i: w / total for i, w in weights_dict.items()}
+        normalized = {i: w / total for i, w in enumerate(weights_list)}
+        rng = random.Random(seed) if seed is not None else random
 
-        # Load pairs with weights
-        for pair in self.get_mixture(weights_dict, n_samples=n_samples):
-            # Get weight for this pair's round from env_labels
-            round_id = pair.env_labels.get("round", 0)
-            weight = normalized.get(round_id, 1.0 / (current_round + 1))
-            yield pair, weight
+        if n_samples is None:
+            # Stream all pairs, attach round weight
+            for round_id in range(current_round + 1):
+                weight = normalized.get(round_id, 0.0)
+                if weight <= 0:
+                    continue
+                for pair in self.load_pairs(round_ids=[round_id]):
+                    yield pair, weight
+            return
+
+        # Allocate samples per round proportional to weights
+        weight_items = [(rid, normalized.get(rid, 0.0)) for rid in range(current_round + 1)]
+        weight_items = [(rid, w) for rid, w in weight_items if w > 0]
+        if not weight_items:
+            return
+
+        total_weight = sum(w for _rid, w in weight_items)
+        raw_targets = [w / total_weight * n_samples for _rid, w in weight_items]
+        targets = [int(t) for t in raw_targets]
+        remainder = n_samples - sum(targets)
+        if remainder > 0:
+            # Distribute remainder by largest fractional parts
+            fractions = sorted(
+                enumerate(raw_targets),
+                key=lambda x: x[1] - int(x[1]),
+                reverse=True,
+            )
+            for idx, _val in fractions[:remainder]:
+                targets[idx] += 1
+
+        # Sample per round with single pass reservoir sampling
+        for (round_id, weight), target_count in zip(weight_items, targets):
+            if target_count <= 0:
+                continue
+
+            # Count pairs to decide sampling strategy
+            total_pairs = self.count_pairs(round_id)
+            if total_pairs <= 0:
+                continue
+
+            if target_count >= total_pairs:
+                # Yield all pairs, then sample with replacement for remainder if needed.
+                pairs = list(self.load_pairs(round_ids=[round_id]))
+                for pair in pairs:
+                    yield pair, weight
+                remaining = target_count - len(pairs)
+                for _ in range(remaining):
+                    yield rng.choice(pairs)
+                continue
+
+            # Reservoir sample target_count pairs
+            reservoir: List[PreferencePair] = []
+            seen = 0
+            for pair in self.load_pairs(round_ids=[round_id]):
+                seen += 1
+                if len(reservoir) < target_count:
+                    reservoir.append(pair)
+                else:
+                    j = rng.randint(0, seen - 1)
+                    if j < target_count:
+                        reservoir[j] = pair
+            for pair in reservoir:
+                yield pair, weight
 
     def load_all_pairs_with_weights(
         self,

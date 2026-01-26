@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -65,6 +66,9 @@ class VerifierTrainingConfig:
         use_chat_template: Whether to use chat template for tokenization
         use_differential_lr: Whether to use different LR for backbone vs head
         backbone_lr_mult: Multiplier for backbone LR when use_differential_lr=True
+        pair_sample_count: Optional cap on number of pairs to stream per epoch
+        shuffle_buffer_size: Buffer size for streaming shuffle (pairs)
+        pair_sample_seed: Optional random seed for pair sampling
     """
 
     lr: float = 5e-5
@@ -87,6 +91,9 @@ class VerifierTrainingConfig:
     use_chat_template: bool = True
     use_differential_lr: bool = False
     backbone_lr_mult: float = 0.1
+    pair_sample_count: Optional[int] = None
+    shuffle_buffer_size: int = 1024
+    pair_sample_seed: Optional[int] = None
 
     def __post_init__(self) -> None:
         """Set defaults for derived fields."""
@@ -103,39 +110,89 @@ class PreferenceBatchSource(BatchSource):
     Uses Ludic's preference_utils for proper metadata formatting.
     """
 
-    pairs: List[Tuple[PreferencePair, float]]
+    pair_iterator_factory: Callable[[], Iterator[Tuple[PreferencePair, float]]]
     tokenizer: Any
     batch_size: int = 8
     max_seq_len: int = 2048
     shuffle: bool = True
     use_chat_template: bool = True
-    _items: List[SAWItem] = field(default_factory=list, init=False)
-    _index: int = field(default=0, init=False)
+    shuffle_buffer_size: int = 1024
+    seed: Optional[int] = None
+    repeat: bool = True
+    _pair_iter: Optional[Iterator[Tuple[PreferencePair, float]]] = field(default=None, init=False)
+    _pair_buffer: List[Tuple[PreferencePair, float]] = field(default_factory=list, init=False)
+    _rng: random.Random = field(default_factory=random.Random, init=False)
     _initialized: bool = field(default=False, init=False)
 
-    def _initialize_items(self) -> None:
-        """Convert all pairs to SAWItems on first use."""
+    def _initialize(self) -> None:
         if self._initialized:
             return
-
-        items: List[SAWItem] = []
+        self._rng = random.Random(self.seed)
+        self._pair_iter = self.pair_iterator_factory()
         sample_logger.info("=" * 60)
         sample_logger.info("PREFERENCE BATCH SOURCE INITIALIZATION")
         sample_logger.info("=" * 60)
-        sample_logger.info(f"Total pairs to process: {len(self.pairs)}")
+        sample_logger.info("Streaming preference pairs (no full materialization)")
         sample_logger.info("")
         sample_logger.info("LABEL LEAKAGE PREVENTION CHECKLIST:")
         sample_logger.info("  [✓] Verifier sees ONLY: prompt + completion text")
         sample_logger.info("  [✓] env_labels contain ONLY: round ID (for IRM)")
         sample_logger.info("  [✓] FORBIDDEN in tokenized input: sneaky_certified, test_pass_rate, similarity_score")
         sample_logger.info("")
+        self._initialized = True
 
-        for idx, (pair, weight) in enumerate(self.pairs):
+    def _fill_pair_buffer(self) -> None:
+        if self._pair_iter is None:
+            return
+        empty_restarts = 0
+        while len(self._pair_buffer) < self.shuffle_buffer_size:
             try:
-                # Log first few pairs for verification (no label leakage check)
-                if idx < 3:
+                pair = next(self._pair_iter)
+                self._pair_buffer.append(pair)
+            except StopIteration:
+                if not self.repeat:
+                    break
+                # If iterator is empty, avoid infinite loops
+                if not self._pair_buffer:
+                    empty_restarts += 1
+                    if empty_restarts >= 2:
+                        # Two empty restarts => iterator yields nothing; disable repeat to avoid a tight loop.
+                        self.repeat = False
+                        break
+                self._pair_iter = self.pair_iterator_factory()
+                continue
+
+    def _next_pair(self) -> Optional[Tuple[PreferencePair, float]]:
+        self._fill_pair_buffer()
+        if not self._pair_buffer:
+            return None
+        if self.shuffle and len(self._pair_buffer) > 1:
+            idx = self._rng.randrange(len(self._pair_buffer))
+            pair = self._pair_buffer.pop(idx)
+        else:
+            pair = self._pair_buffer.pop(0)
+        # Refill one slot to keep buffer warm
+        self._fill_pair_buffer()
+        return pair
+
+    async def next_batch(self) -> SAWBatch:
+        """Get the next batch of preference pairs as SAWItems."""
+        self._initialize()
+
+        items_needed = self.batch_size * 2
+        batch_items: List[SAWItem] = []
+        pairs_collected = 0
+
+        while len(batch_items) < items_needed:
+            next_pair = self._next_pair()
+            if next_pair is None:
+                break
+            pair, weight = next_pair
+            try:
+                # Log first few pairs for verification
+                if pairs_collected < 3:
                     sample_logger.info("-" * 40)
-                    sample_logger.info(f"PAIR {idx}: pair_id={pair.pair_id}")
+                    sample_logger.info(f"PAIR {pairs_collected}: pair_id={pair.pair_id}")
                     sample_logger.info(f"  Problem ID: {pair.problem_id}")
                     sample_logger.info(f"  Label: {pair.label} (1.0 = chosen/honest preferred)")
                     sample_logger.info(f"  Env Labels: {pair.env_labels}")
@@ -147,7 +204,6 @@ class PreferenceBatchSource(BatchSource):
 
                     # CRITICAL: Verify no label leakage
                     sample_logger.info("  [LABEL LEAK CHECK] Verification:")
-                    # Check env_labels only contains allowed fields
                     forbidden_in_env = ["sneaky_certified", "test_pass_rate", "similarity_score", "correct", "incorrect"]
                     env_leak_check = [f for f in forbidden_in_env if f in pair.env_labels]
                     if env_leak_check:
@@ -155,7 +211,6 @@ class PreferenceBatchSource(BatchSource):
                     else:
                         sample_logger.info(f"    [PASS] env_labels clean: {list(pair.env_labels.keys())}")
 
-                    # Check state/action don't contain label strings
                     full_text = pair.chosen_state + pair.chosen_action + pair.rejected_state + pair.rejected_action
                     text_leak_check = [f for f in forbidden_in_env if f in full_text.lower()]
                     if text_leak_check:
@@ -165,7 +220,6 @@ class PreferenceBatchSource(BatchSource):
 
                     sample_logger.info(f"    [PASS] Chosen=honest, Rejected=sneaky: VERIFIED")
 
-                # Use Ludic's create_preference_saw_items for proper metadata
                 chosen_item, rejected_item = create_preference_saw_items(
                     prompt=pair.chosen_state,
                     chosen=pair.chosen_action,
@@ -176,8 +230,7 @@ class PreferenceBatchSource(BatchSource):
                     use_chat_template=self.use_chat_template,
                 )
 
-                # Log token details for first few pairs
-                if idx < 3:
+                if pairs_collected < 3:
                     sample_logger.info(f"  Chosen tokens: {len(chosen_item.input_ids)}, "
                                       f"action_mask sum: {sum(chosen_item.action_mask)}")
                     sample_logger.info(f"  Rejected tokens: {len(rejected_item.input_ids)}, "
@@ -185,11 +238,9 @@ class PreferenceBatchSource(BatchSource):
                     sample_logger.info(f"  Chosen meta: {chosen_item.meta}")
                     sample_logger.info(f"  Rejected meta: {rejected_item.meta}")
 
-                # Add env_labels to metadata for IRM
                 chosen_item.meta.update(pair.env_labels)
                 rejected_item.meta.update(pair.env_labels)
 
-                # Override weight from mixture strategy
                 chosen_item = SAWItem(
                     input_ids=chosen_item.input_ids,
                     attention_mask=chosen_item.attention_mask,
@@ -205,43 +256,16 @@ class PreferenceBatchSource(BatchSource):
                     meta=rejected_item.meta,
                 )
 
-                items.extend([chosen_item, rejected_item])
+                batch_items.extend([chosen_item, rejected_item])
+                pairs_collected += 1
             except ValueError as e:
                 logger.warning(f"Skipping pair {pair.pair_id}: {e}")
                 continue
 
         if self.shuffle:
-            items = shuffle_preference_pairs(items)
+            batch_items = shuffle_preference_pairs(batch_items)
 
-        self._items = items
-        self._initialized = True
-        logger.info(f"Initialized {len(items)} items from {len(self.pairs)} pairs")
-
-    async def next_batch(self) -> SAWBatch:
-        """Get the next batch of preference pairs as SAWItems."""
-        self._initialize_items()
-
-        if not self._items:
-            return SAWBatch(items=[], meta={"pair_count": 0})
-
-        # Get batch_size pairs (2 items each)
-        items_needed = self.batch_size * 2
-        batch_items: List[SAWItem] = []
-
-        while len(batch_items) < items_needed:
-            if self._index >= len(self._items):
-                # Wrap around and reshuffle
-                self._index = 0
-                if self.shuffle:
-                    self._items = shuffle_preference_pairs(self._items)
-
-            batch_items.append(self._items[self._index])
-            self._index += 1
-
-        batch_meta = {
-            "pair_count": len(batch_items) // 2,
-        }
-
+        batch_meta = {"pair_count": len(batch_items) // 2}
         return SAWBatch(items=batch_items[:items_needed], meta=batch_meta)
 
 
@@ -367,6 +391,9 @@ async def train_verifier_phase(
     logger.info(f"  use_chat_template: {config.use_chat_template}")
     logger.info(f"  use_differential_lr: {config.use_differential_lr}")
     logger.info(f"  backbone_lr_mult: {config.backbone_lr_mult}")
+    logger.info(f"  pair_sample_count: {config.pair_sample_count}")
+    logger.info(f"  shuffle_buffer_size: {config.shuffle_buffer_size}")
+    logger.info(f"  pair_sample_seed: {config.pair_sample_seed}")
     logger.info(f"  LoRA config provided: {lora_config is not None}")
     logger.info("-" * 80)
 
@@ -377,26 +404,33 @@ async def train_verifier_phase(
 
     mixture = get_mixture_strategy(config.mixture_strategy, **strategy_kwargs)
 
-    # Load pairs with mixture weights
-    pairs_with_weights = data_store.load_all_pairs_with_weights(
-        current_round=current_round,
-        strategy=mixture,
-    )
-
-    if not pairs_with_weights:
+    # Stream pairs with mixture weights
+    if config.pair_sample_count is not None and config.pair_sample_count <= 0:
+        logger.warning("pair_sample_count <= 0; skipping verifier training")
+        return None
+    total_pairs = 0
+    for round_id in range(current_round + 1):
+        total_pairs += data_store.count_pairs(round_id)
+    if total_pairs == 0:
         logger.warning("No preference pairs found for training")
         return None
-
-    logger.info(f"Loaded {len(pairs_with_weights)} preference pairs")
+    logger.info(f"Total preference pairs available (all rounds): {total_pairs}")
 
     # Create batch source using Ludic's preference utilities
     batch_source = PreferenceBatchSource(
-        pairs=pairs_with_weights,
+        pair_iterator_factory=lambda: data_store.load_pairs_with_strategy(
+            current_round=current_round,
+            strategy=mixture,
+            n_samples=config.pair_sample_count,
+            seed=config.pair_sample_seed,
+        ),
         tokenizer=tokenizer,
         batch_size=config.batch_size,
         max_seq_len=config.max_seq_len,
         shuffle=True,
         use_chat_template=config.use_chat_template,
+        shuffle_buffer_size=config.shuffle_buffer_size,
+        seed=config.pair_sample_seed,
     )
 
     # Create algorithm with IRM regularization

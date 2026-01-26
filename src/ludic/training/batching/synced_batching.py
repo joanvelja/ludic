@@ -1,7 +1,7 @@
 from __future__ import annotations
 import logging
 import time
-from typing import Callable, List, Optional
+from typing import Awaitable, Callable, List, Optional
 
 from ludic.training.types import (
     BatchSource,
@@ -10,7 +10,8 @@ from ludic.training.types import (
     CreditAssigner,
     SampleFilter,
 )
-from .rollout_engine import RolloutEngine
+from ludic.types import Rollout
+from .rollout_engine import RolloutEngine, RolloutPreprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class RolloutBatchSource(BatchSource):
         timeout_s: Optional[float] = None,
         concurrency: int = 8,
         sample_filter: Optional[SampleFilter] = None,
+        rollout_preprocessor: Optional[RolloutPreprocessor] = None,
     ) -> None:
         """
         Args:
@@ -43,6 +45,8 @@ class RolloutBatchSource(BatchSource):
             sample_filter: Optional filter function to drop samples based on metadata.
                 Returns True to KEEP a sample, False to DROP it.
                 Use ludic.training.filters for common predicates.
+            rollout_preprocessor: Optional async hook to preprocess rollouts
+                before credit assignment (e.g., attach verifier scores).
         """
         self._engine = orchestrator
         self._credit_assigner = credit_assigner
@@ -51,6 +55,7 @@ class RolloutBatchSource(BatchSource):
         self._timeout_s = timeout_s
         self._concurrency = concurrency
         self._sample_filter = sample_filter
+        self._rollout_preprocessor = rollout_preprocessor
 
     async def next_batch(self) -> SAWBatch:
         """
@@ -70,6 +75,7 @@ class RolloutBatchSource(BatchSource):
             timeout_s=self._timeout_s,
             concurrency=self._concurrency,
             sample_filter=self._sample_filter,
+            rollout_preprocessor=self._rollout_preprocessor,
         )
 
         elapsed = time.monotonic() - start_time

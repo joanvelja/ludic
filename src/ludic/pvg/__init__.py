@@ -69,13 +69,13 @@ from ludic.pvg.scoring import (
 from ludic.pvg.minting import (
     MintingConfig,
     MintingResult,
+    clone_honest_rollouts_for_round,
     mint_sneaky_data,
     mint_honest_from_dataset,
     create_few_shot_prompt,
 )
 from ludic.pvg.prover_trainer import (
     ProverTrainingConfig,
-    RolloutBatchSourceForProver,
     train_prover_phase,
 )
 from ludic.pvg.verifier_trainer import (
@@ -83,12 +83,6 @@ from ludic.pvg.verifier_trainer import (
     VerifierTrainingConfig,
     reinitialize_verifier_head,
     train_verifier_phase,
-)
-from ludic.pvg.vllm_setup import (
-    DualVLLMConfig,
-    create_prover_publisher,
-    setup_dual_vllm,
-    shutdown_dual_vllm,
 )
 
 __all__ = [
@@ -152,21 +146,16 @@ __all__ = [
     # Minting
     "MintingConfig",
     "MintingResult",
+    "clone_honest_rollouts_for_round",
     "create_few_shot_prompt",
     "mint_honest_from_dataset",
     "mint_sneaky_data",
     # Prover Training
     "ProverTrainingConfig",
-    "RolloutBatchSourceForProver",
     "train_prover_phase",
     # Verifier Training
     "PreferenceBatchSource",
     "VerifierTrainingConfig",
     "reinitialize_verifier_head",
     "train_verifier_phase",
-    # vLLM Setup
-    "DualVLLMConfig",
-    "create_prover_publisher",
-    "setup_dual_vllm",
-    "shutdown_dual_vllm",
 ]

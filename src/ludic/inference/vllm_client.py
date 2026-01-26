@@ -10,6 +10,7 @@ For dual-server setups (separate policy + RM), use `policy_port` and `scoring_po
 """
 
 import atexit
+import asyncio
 import logging
 import time
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
@@ -129,6 +130,10 @@ class VLLMClient(ChatClient):
         enable_weight_updates: bool = False,
         device: Union[str, torch.device, int] = 0,
         model_name: str = "default",
+        async_conn_limit: int = 100,
+        async_conn_limit_per_host: int = 0,
+        async_timeout_s: float = 30.0,
+        async_keepalive_timeout_s: float = 30.0,
     ) -> None:
 
         # Store configuration parameters
@@ -142,6 +147,10 @@ class VLLMClient(ChatClient):
         self.enable_weight_updates = enable_weight_updates
         self.device = device
         self.model_name = model_name
+        self._async_conn_limit = async_conn_limit
+        self._async_conn_limit_per_host = async_conn_limit_per_host
+        self._async_timeout_s = async_timeout_s
+        self._async_keepalive_timeout_s = async_keepalive_timeout_s
 
         # Determine if we're in dual-server mode
         self._dual_server_mode = self.policy_port != self.scoring_port
@@ -168,6 +177,7 @@ class VLLMClient(ChatClient):
 
         # Cached aiohttp session for async HTTP calls (lazy-initialized)
         self._async_session: Optional[aiohttp.ClientSession] = None
+        self._async_session_lock = asyncio.Lock()
 
         # Verify policy server is reachable
         check_server_health(
@@ -230,8 +240,21 @@ class VLLMClient(ChatClient):
 
     async def _get_async_session(self) -> aiohttp.ClientSession:
         """Get or create a cached aiohttp ClientSession (lazy init, auto-recreate if closed)."""
-        if self._async_session is None or self._async_session.closed:
-            self._async_session = aiohttp.ClientSession()
+        if self._async_session is not None and not self._async_session.closed:
+            return self._async_session
+        async with self._async_session_lock:
+            if self._async_session is not None and not self._async_session.closed:
+                return self._async_session
+            connector = aiohttp.TCPConnector(
+                limit=self._async_conn_limit,
+                limit_per_host=self._async_conn_limit_per_host,
+                keepalive_timeout=self._async_keepalive_timeout_s,
+            )
+            timeout = aiohttp.ClientTimeout(total=self._async_timeout_s)
+            self._async_session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+            )
         return self._async_session
 
     async def close_async_session(self) -> None:
@@ -239,6 +262,31 @@ class VLLMClient(ChatClient):
         if self._async_session and not self._async_session.closed:
             await self._async_session.close()
         self._async_session = None
+
+    def close(self) -> None:
+        """Close sync session and NCCL communicators."""
+        self.close_communicator()
+        if self._session is not None:
+            self._session.close()
+
+    async def aclose(self) -> None:
+        """Close async resources and sync session."""
+        try:
+            close_fn = getattr(self._async_client, "close", None)
+            if close_fn is not None:
+                maybe = close_fn()
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+        except Exception:
+            pass
+        await self.close_async_session()
+        self.close()
+
+    async def __aenter__(self) -> "VLLMClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.aclose()
 
     # ─────────────────────────────────────────────────────────────────
     # ChatClient.complete

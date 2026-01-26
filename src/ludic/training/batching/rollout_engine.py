@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TypeAlias
 
 from ludic.envs.env import LudicEnv
 from ludic.interaction.base import InteractionProtocol
@@ -24,6 +25,13 @@ from ludic.training.types import (
     SampleFilter,
 )
 
+# Explicit alias for rollout preprocessing hook.
+RolloutPreprocessor: TypeAlias = Callable[[List[Rollout]], Awaitable[List[Rollout]]]
+
+_TRACE_MISSING_COUNT = 0
+_TRACE_MISSING_LOG_EVERY = 50
+
+log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Factory aliases
 # ---------------------------------------------------------------------------
@@ -73,6 +81,15 @@ def _require_token_trace(
 ) -> TokenTrace:
     trace = step.trace
     if trace is None:
+        global _TRACE_MISSING_COUNT
+        _TRACE_MISSING_COUNT += 1
+        if _TRACE_MISSING_COUNT <= 5 or _TRACE_MISSING_COUNT % _TRACE_MISSING_LOG_EVERY == 0:
+            log.warning(
+                "Missing token trace count=%s (latest rollout=%s step=%s).",
+                _TRACE_MISSING_COUNT,
+                rollout_id,
+                step_index,
+            )
         raise ValueError(
             f"Missing rollout-time token trace for rollout {rollout_id}, step {step_index}. "
             "Online RL batching requires Step.trace with prompt/completion token IDs "
@@ -394,6 +411,7 @@ class RolloutEngine:
         timeout_s: Optional[float] = None,
         concurrency: int = 8,
         sample_filter: Optional[SampleFilter] = None,
+        rollout_preprocessor: Optional[RolloutPreprocessor] = None,
     ) -> SAWBatch:
         """
         High-level entrypoint for RL-style training:
@@ -411,6 +429,10 @@ class RolloutEngine:
         - If sample_filter is provided, it's applied after SAWItems are created.
         - Filter returns True to KEEP a sample, False to DROP it.
         - Use ludic.training.filters for common predicates.
+
+        Rollout preprocessing:
+        - If rollout_preprocessor is provided, it's awaited after rollouts are generated
+          and before credit assignment. This is useful for attaching external scores.
         """
         rollouts = await self.generate_rollouts(
             requests=requests,
@@ -418,6 +440,8 @@ class RolloutEngine:
             timeout_s=timeout_s,
             concurrency=concurrency,
         )
+        if rollout_preprocessor is not None:
+            rollouts = await rollout_preprocessor(rollouts)
         weights = credit_assigner.compute(rollouts)
 
         items_with_lengths: List[Tuple[SAWItem, int, int]] = []

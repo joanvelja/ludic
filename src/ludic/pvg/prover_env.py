@@ -10,7 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from ludic.context import FullDialog
+
 from ludic.types import Info, Observation, StepOutcome
+from ludic.envs.env import LudicEnv
 
 
 @dataclass
@@ -30,7 +33,7 @@ class PVGEnvConfig:
     )
 
 
-class PVGProverEnv:
+class PVGProverEnv(LudicEnv[str, str, str]):
     """Wrapper around SneakyCodeExecEnv for PVG prover training.
 
     This environment wrapper:
@@ -77,6 +80,40 @@ class PVGProverEnv:
         self._inner = inner_env
         self._config = config or PVGEnvConfig()
         self._problem_id = problem_id
+        self._agent_id = getattr(inner_env, "_agent_id", "agent_0")
+
+    @property
+    def agent_ids(self) -> List[str]:
+        if hasattr(self._inner, "agent_ids"):
+            return list(self._inner.agent_ids)
+        return [self._agent_id]
+
+    @property
+    def active_agents(self) -> List[str]:
+        if hasattr(self._inner, "active_agents"):
+            return list(self._inner.active_agents)
+        return [self._agent_id]
+
+    def reset(self, *, seed: Optional[int] = None) -> Dict[str, Tuple[Observation, Info]]:
+        if hasattr(self._inner, "reset"):
+            return self._inner.reset(seed=seed)
+        raise RuntimeError(
+            "PVGProverEnv.reset() called, but inner env exposes async env_reset(); "
+            "use env_reset() instead."
+        )
+
+    def step(self, actions: Dict[str, str]) -> Dict[str, StepOutcome]:
+        if hasattr(self._inner, "step"):
+            return self._inner.step(actions)
+        raise RuntimeError(
+            "PVGProverEnv.step() called, but inner env exposes async env_step(); "
+            "use env_step() instead."
+        )
+
+    def current_obs(self) -> Dict[str, Observation]:
+        if hasattr(self._inner, "current_obs"):
+            return self._inner.current_obs()
+        return {self._agent_id: self.env_current_obs()}
 
     @property
     def suggested_sysprompt(self) -> Optional[str]:
@@ -160,6 +197,17 @@ class PVGProverEnv:
             info=info,
             trace=outcome.trace,
         )
+
+
+class PVGPromptContext(FullDialog):
+    """Context that overrides the env prompt with a custom prompt."""
+
+    def __init__(self, *, system_prompt: str, prompt: str) -> None:
+        super().__init__(system_prompt=system_prompt)
+        self._prompt_override = prompt
+
+    def on_env_reset(self, obs: Observation, info: Info) -> None:
+        super().on_env_reset(self._prompt_override, info)
 
 
 def extract_raw_signals(outcome: StepOutcome) -> Dict[str, Any]:

@@ -7,12 +7,18 @@ using a reward model verifier, with caching and batching optimizations.
 from __future__ import annotations
 
 import hashlib
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
+
+from ludic.inference.reward_types import PoolingType, ScoringRequest
+from ludic.inference.vllm_client import VLLMClient
 
 __all__ = [
     "RewardModelClient",
     "VerifierScorer",
+    "VLLMRewardModelClient",
     "MockRewardModelClient",
     "compute_cache_key",
 ]
@@ -42,7 +48,7 @@ class RewardModelClient(Protocol):
         ...
 
 
-def compute_cache_key(solution: str, problem: str) -> str:
+def compute_cache_key(solution: str, problem: str, namespace: Optional[str] = None) -> str:
     """Compute a deterministic cache key for a (solution, problem) pair.
 
     Args:
@@ -52,7 +58,8 @@ def compute_cache_key(solution: str, problem: str) -> str:
     Returns:
         16-character hex digest for cache lookup
     """
-    content = f"{problem}\n---\n{solution}"
+    prefix = f"{namespace}\n---\n" if namespace else ""
+    content = f"{prefix}{problem}\n---\n{solution}"
     return hashlib.sha256(content.encode()).hexdigest()[:16]
 
 
@@ -67,6 +74,9 @@ class VerifierScorer:
         client: Reward model client for inference
         batch_size: Maximum batch size for inference calls (default: 32)
         cache_enabled: Whether to cache scores (default: True)
+        cache_max_size: Optional max cache size (LRU eviction). None = unbounded.
+        cache_ttl_s: Optional TTL (seconds) for cached entries. None = no TTL.
+        cache_namespace: Optional namespace to separate cache keys (e.g., model version).
         prompt_template: Template for formatting (problem, solution) into prompt.
             Must contain {problem} and {solution} placeholders.
 
@@ -92,19 +102,38 @@ class VerifierScorer:
     client: RewardModelClient
     batch_size: int = 32
     cache_enabled: bool = True
+    cache_max_size: Optional[int] = None
+    cache_ttl_s: Optional[float] = None
+    cache_namespace: Optional[str] = None
     prompt_template: str = (
         "Problem:\n{problem}\n\n"
         "Solution:\n{solution}\n\n"
         "Is this solution helpful and correct?"
     )
 
-    # Private cache: cache_key -> score
-    _cache: Dict[str, float] = field(default_factory=dict, repr=False)
+    # Private cache: cache_key -> (score, timestamp_s)
+    _cache: "OrderedDict[str, Tuple[float, float]]" = field(
+        default_factory=OrderedDict, repr=False
+    )
+    _cache_hits: int = field(default=0, repr=False)
+    _cache_misses: int = field(default=0, repr=False)
 
     def __post_init__(self) -> None:
         """Validate configuration."""
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.cache_max_size is not None and self.cache_max_size <= 0:
+            raise ValueError(
+                f"cache_max_size must be positive or None, got {self.cache_max_size}"
+            )
+        if self.cache_ttl_s is not None and self.cache_ttl_s <= 0:
+            raise ValueError(
+                f"cache_ttl_s must be positive or None, got {self.cache_ttl_s}"
+            )
+        if self.cache_namespace is None:
+            self.cache_namespace = hashlib.sha256(
+                self.prompt_template.encode()
+            ).hexdigest()[:8]
 
     async def score_batch(
         self,
@@ -138,11 +167,15 @@ class VerifierScorer:
         uncached_solutions: List[str] = []
         uncached_problems: List[str] = []
 
+        now = time.monotonic()
         for i, (sol, prob) in enumerate(zip(solutions, problems)):
-            cache_key = compute_cache_key(sol, prob)
-            if self.cache_enabled and cache_key in self._cache:
-                scores[i] = self._cache[cache_key]
+            cache_key = compute_cache_key(sol, prob, namespace=self.cache_namespace)
+            cached = self._get_cached(cache_key, now=now)
+            if self.cache_enabled and cached is not None:
+                self._cache_hits += 1
+                scores[i] = cached
             else:
+                self._cache_misses += 1
                 uncached_indices.append(i)
                 uncached_solutions.append(sol)
                 uncached_problems.append(prob)
@@ -159,8 +192,8 @@ class VerifierScorer:
             ):
                 scores[idx] = score
                 if self.cache_enabled:
-                    cache_key = compute_cache_key(sol, prob)
-                    self._cache[cache_key] = score
+                    cache_key = compute_cache_key(sol, prob, namespace=self.cache_namespace)
+                    self._set_cached(cache_key, score, now=now)
 
         # Type narrowing: all scores are now filled (use 'is not None' to preserve 0.0 scores)
         return [s for s in scores if s is not None]  # type: ignore[misc]
@@ -214,6 +247,63 @@ class VerifierScorer:
             Number of cached (solution, problem) pairs
         """
         return len(self._cache)
+
+    def cache_stats(self) -> Dict[str, int]:
+        """Return cache hit/miss stats and size."""
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "size": len(self._cache),
+        }
+
+    def _get_cached(self, cache_key: str, *, now: float) -> Optional[float]:
+        """Lookup cached score, honoring TTL and LRU order."""
+        if not self.cache_enabled:
+            return None
+        if cache_key not in self._cache:
+            return None
+        score, timestamp = self._cache[cache_key]
+        if self.cache_ttl_s is not None and (now - timestamp) > self.cache_ttl_s:
+            del self._cache[cache_key]
+            return None
+        # LRU refresh
+        self._cache.move_to_end(cache_key)
+        return score
+
+    def _set_cached(self, cache_key: str, score: float, *, now: float) -> None:
+        """Insert into cache with LRU eviction."""
+        self._cache[cache_key] = (score, now)
+        self._cache.move_to_end(cache_key)
+        if self.cache_max_size is not None:
+            while len(self._cache) > self.cache_max_size:
+                self._cache.popitem(last=False)
+
+
+class VLLMRewardModelClient:
+    """Reward model client backed by a vLLM reward server.
+
+    Wraps a VLLMClient and uses its /score endpoint for batch scoring.
+    """
+
+    def __init__(self, client: VLLMClient, *, model: str) -> None:
+        self._client = client
+        self._model = model
+
+    async def score(
+        self,
+        prompts: List[str],
+        _completions: List[str],
+    ) -> List[float]:
+        # completions are ignored; prompts already include solution text.
+        request = ScoringRequest.from_list(
+            model=self._model,
+            inputs=prompts,
+            pooling_type=PoolingType.LAST,
+            normalize=True,
+            n_labels=1,
+        )
+        response, _ = await self._client.score(request)
+        return response.scores
 
 
 @dataclass
